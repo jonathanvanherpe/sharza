@@ -17,7 +17,7 @@ more than one network at the same time.
 | Supervisor unit | `sharzad.service` |
 | Worker units | `sharzad@bt.service`, `sharzad@ed2k.service`, `sharzad@g2.service` |
 | VPN namespace unit | `sharzad-vpn-netns.service` |
-| Config | `/etc/sharza/sharza.toml`, `~/.config/sharza/sharza.toml` |
+| Config | `/etc/sharza/sharza.json`, `~/.config/sharza/sharza.json` |
 | State | `/var/lib/sharzad`, `~/.local/state/sharzad` |
 | RPC socket | `/run/sharzad/rpc.sock` |
 | Netns | `/run/netns/sharza-vpn` |
@@ -36,7 +36,7 @@ shares no code with Shareaza or its forks.
    modern equivalent.
 3. **Headless-first.** The daemon is the product; the UI is a client of it.
    Nothing requires a GUI, a terminal, or a display server.
-4. **Native Linux.** systemd, netns, TOML config, distro packaging. No
+4. **Native Linux.** systemd, netns, JSON config, distro packaging. No
    cross-platform abstraction layer.
 
 ## Process model

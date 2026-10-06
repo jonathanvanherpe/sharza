@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -686,4 +687,148 @@ func TestStopLeavesNoOrphanWorkers(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
+}
+
+// TestStopLeavesNoOrphanWorkerDescendants is the test that can actually fail
+// when Stop's process-group handling breaks.
+//
+// TestStopLeavesNoOrphanWorkers checks that the workers themselves are gone,
+// but the real worker is a leaf: no grandchildren, so signalling the worker's
+// pid and signalling its process group are indistinguishable. That test passes
+// whether Stop uses kill(-pid) or kill(pid), which was confirmed by mutating
+// Stop to signal single pids and watching it stay green. A test that cannot
+// detect the bug it names is worse than no test, because it reads as coverage.
+//
+// This one runs a worker that grows a grandchild inheriting the worker's
+// process group, which is the shape a real engine takes once P2 gives it a VPN
+// helper. Signal the group and both die; signal the pid and the grandchild
+// survives with the engine's traffic and no control plane.
+func TestStopLeavesNoOrphanWorkerDescendants(t *testing.T) {
+	bin := buildForker(t)
+
+	cfg := config.Default()
+	cfg.StateDir = t.TempDir()
+	// One role is enough and keeps the failure legible: the invariant is
+	// about descendants, not about how many workers there are.
+	cfg.WorkerRoles = []role.Role{role.BT}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	// The forker reports the pids of the worker the supervisor spawns. It has
+	// to be the supervisor's own worker: a copy started by the test would be a
+	// process Stop knows nothing about, so it would survive a correct
+	// implementation and the test would fail for the wrong reason.
+	pidfile := filepath.Join(t.TempDir(), "forker.pids")
+	t.Setenv("SHARZA_TEST_PIDFILE", pidfile)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	reported := map[role.Role]int{}
+	sup, err := StartWorkers(ctx, cfg, func(r role.Role, pid int, _ bool) {
+		mu.Lock()
+		reported[r] = pid
+		mu.Unlock()
+	}, bin)
+	if err != nil {
+		t.Fatalf("StartWorkers: %v", err)
+	}
+
+	workerPID, grandchildPID := waitForForkerPids(t, pidfile)
+
+	// The supervisor's own view of the worker must match, or the pids in the
+	// file belong to something else and the assertion below proves nothing.
+	mu.Lock()
+	supervisorPID := reported[role.BT]
+	mu.Unlock()
+	if supervisorPID != workerPID {
+		t.Fatalf("supervisor reports worker pid %d but the pidfile says %d; "+
+			"the test is measuring the wrong process", supervisorPID, workerPID)
+	}
+
+	if !processAlive(grandchildPID) {
+		t.Fatalf("grandchild pid %d is already dead; the test would be vacuous", grandchildPID)
+	}
+
+	sup.Stop()
+
+	// Both, not just the worker: a surviving grandchild is the exact failure
+	// mode this exists to catch.
+	for name, pid := range map[string]int{"worker": workerPID, "grandchild": grandchildPID} {
+		if !waitUntilDead(t, pid, 10*time.Second) {
+			t.Errorf("%s pid %d outlived Stop: Stop signalled a single pid instead of "+
+				"the worker's process group, so descendants survive and keep engine "+
+				"traffic alive with no control plane", name, pid)
+		}
+	}
+}
+
+// buildForker compiles the fake worker that grows a grandchild.
+func buildForker(t *testing.T) string {
+	t.Helper()
+	toolchain := goTool(t)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir, err := os.MkdirTemp("", "sharza-forker-")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	out := filepath.Join(dir, "forker")
+	cmd := exec.Command(toolchain, "build", "-o", out, "./testdata/forker")
+	cmd.Dir = wd
+	var log bytes.Buffer
+	cmd.Stdout = &log
+	cmd.Stderr = &log
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("build forker: %v\n%s", err, log.String())
+	}
+	return out
+}
+
+// waitForForkerPids reads the pids the spawned worker reported.
+func waitForForkerPids(t *testing.T, pidfile string) (worker, grandchild int) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if data, err := os.ReadFile(pidfile); err == nil && len(data) > 0 {
+			line := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
+			fields := strings.Fields(line)
+			if len(fields) != 3 || fields[0] != "worker" {
+				t.Fatalf("unexpected pidfile line %q, want \"worker <pid> <grandchild-pid>\"", line)
+			}
+			worker, err = strconv.Atoi(fields[1])
+			if err != nil {
+				t.Fatalf("worker pid %q: %v", fields[1], err)
+			}
+			grandchild, err = strconv.Atoi(fields[2])
+			if err != nil {
+				t.Fatalf("grandchild pid %q: %v", fields[2], err)
+			}
+			return worker, grandchild
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the forked worker never reported its pids; nothing to assert against")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitUntilDead(t *testing.T, pid int, within time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for processAlive(pid) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return true
 }

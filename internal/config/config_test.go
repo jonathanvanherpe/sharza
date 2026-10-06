@@ -116,11 +116,30 @@ func TestWorkerRestartDelayAccepted(t *testing.T) {
 	t.Parallel()
 	// Empty means "use the built-in default", which must not be a parse
 	// failure: the supervisor resolves the default itself.
-	for _, ok := range []string{"", "2s", "500ms", "1m30s", "0s"} {
+	for _, ok := range []string{"", "2s", "500ms", "1m30s", "1ns"} {
 		c := &Config{StateDir: t.TempDir(), WorkerRestartDelay: ok}
 		c.applyDefaults()
 		if err := c.Validate(); err != nil {
 			t.Errorf("worker_restart_delay %q rejected: %v", ok, err)
+		}
+	}
+}
+
+// A zero or negative delay parses fine and is still wrong: it configures the
+// immediate respawn that the delay exists to prevent, turning a worker that
+// fails at startup into a busy loop. Rejecting it is not a style preference.
+func TestWorkerRestartDelayMustBePositive(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"0s", "0", "-1s", "-500ms"} {
+		c := &Config{StateDir: t.TempDir(), WorkerRestartDelay: bad}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("worker_restart_delay %q was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "worker_restart_delay") {
+			t.Errorf("worker_restart_delay %q error does not name the field: %v", bad, err)
 		}
 	}
 }

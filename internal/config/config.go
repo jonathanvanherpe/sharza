@@ -145,10 +145,21 @@ func (c *Config) Validate() error {
 	// Caught here rather than at the first worker death: a restart delay that
 	// does not parse is a daemon that restarts workers at a rate the operator
 	// never chose, and it is much cheaper to say so at startup.
+	//
+	// Non-positive is rejected too, and not on taste: the whole point of the
+	// delay is that a worker failing at startup does not spin the CPU, so
+	// "0s" configures the exact behaviour the default exists to prevent. An
+	// empty setting is fine and keeps meaning "use the default".
 	if c.WorkerRestartDelay != "" {
-		if _, err := time.ParseDuration(c.WorkerRestartDelay); err != nil {
+		d, err := time.ParseDuration(c.WorkerRestartDelay)
+		if err != nil {
 			return fmt.Errorf("worker_restart_delay %q is not a duration such as \"2s\" or \"500ms\": %w",
 				c.WorkerRestartDelay, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("worker_restart_delay %q is %s; it must be positive, "+
+				"since the delay is what stops a worker that fails at startup from spinning the CPU",
+				c.WorkerRestartDelay, d)
 		}
 	}
 	return nil
