@@ -6,8 +6,8 @@
     "read": { "*": "allow" },
     "glob": { "*": "allow" },
     "grep": { "*": "allow" },
-    "webfetch": { "*": "allow" },
-    "websearch": { "*": "allow" },
+    "webfetch": "allow",
+    "websearch": "allow",
     "todowrite": "allow",
     "external_directory": {
       "*": "deny",
