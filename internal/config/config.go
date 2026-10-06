@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jonathanvanherpe/sharza/internal/role"
 )
@@ -139,6 +140,15 @@ func (c *Config) Validate() error {
 	for _, r := range c.WorkerRoles {
 		if !role.IsWorker(r) {
 			return fmt.Errorf("worker_roles contains %q, which is not a worker role", r)
+		}
+	}
+	// Caught here rather than at the first worker death: a restart delay that
+	// does not parse is a daemon that restarts workers at a rate the operator
+	// never chose, and it is much cheaper to say so at startup.
+	if c.WorkerRestartDelay != "" {
+		if _, err := time.ParseDuration(c.WorkerRestartDelay); err != nil {
+			return fmt.Errorf("worker_restart_delay %q is not a duration such as \"2s\" or \"500ms\": %w",
+				c.WorkerRestartDelay, err)
 		}
 	}
 	return nil

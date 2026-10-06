@@ -58,12 +58,17 @@ func StartWorkers(
 		return nil, err
 	}
 
+	delay, err := restartDelay(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Supervisor{
 		svc:     svc,
 		bin:     bin,
 		cfgPath: cfgPathOf(cfg),
 		roles:   cfg.WorkerRoles,
-		delay:   WorkerRestartDelay,
+		delay:   delay,
 		workers: map[role.Role]*managed{},
 	}
 
@@ -80,6 +85,25 @@ func StartWorkers(
 // may have been started with defaults, in which case there is no file and the
 // worker resolves the same defaults itself.
 func cfgPathOf(cfg *config.Config) string { return cfg.ConfigPath }
+
+// restartDelay resolves how long to wait before respawning a dead worker.
+//
+// An empty setting means the built-in default, which is what a supervisor
+// started without a config file gets. An unparseable setting is an error
+// rather than a fallback: silently substituting the default would hand the
+// operator a restart rate they did not ask for, and the only symptom would be
+// workers respawning on a schedule nobody chose.
+func restartDelay(cfg *config.Config) (time.Duration, error) {
+	if cfg.WorkerRestartDelay == "" {
+		return WorkerRestartDelay, nil
+	}
+	d, err := time.ParseDuration(cfg.WorkerRestartDelay)
+	if err != nil {
+		return 0, fmt.Errorf("worker_restart_delay %q is not a duration: %w",
+			cfg.WorkerRestartDelay, err)
+	}
+	return d, nil
+}
 
 // spawn starts one worker and arranges for it to be restarted if it exits.
 func (s *Supervisor) spawn(ctx context.Context, r role.Role) error {

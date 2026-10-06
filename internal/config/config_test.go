@@ -90,6 +90,56 @@ func TestWorkerRoleValidation(t *testing.T) {
 	}
 }
 
+// worker_restart_delay is advertised in the config and read by the
+// supervisor, so an unparseable value is a startup error rather than a silent
+// fallback: a supervisor that ignores the delay restarts workers on a schedule
+// the operator never chose, and the only symptom is a crash loop.
+func TestWorkerRestartDelayMustBeADuration(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"100", "abc", "2", "1s5", " 2s", "2 s", "2s!"} {
+		c := &Config{StateDir: t.TempDir(), WorkerRestartDelay: bad}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("worker_restart_delay %q was accepted, want rejection", bad)
+			continue
+		}
+		// The message has to name the field, or an operator reads "invalid
+		// duration" and looks in the wrong place.
+		if !strings.Contains(err.Error(), "worker_restart_delay") {
+			t.Errorf("worker_restart_delay %q error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+func TestWorkerRestartDelayAccepted(t *testing.T) {
+	t.Parallel()
+	// Empty means "use the built-in default", which must not be a parse
+	// failure: the supervisor resolves the default itself.
+	for _, ok := range []string{"", "2s", "500ms", "1m30s", "0s"} {
+		c := &Config{StateDir: t.TempDir(), WorkerRestartDelay: ok}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("worker_restart_delay %q rejected: %v", ok, err)
+		}
+	}
+}
+
+// A bad delay must stop the daemon, not be discovered at the first worker
+// death, which is when an operator least expects a complaint about their
+// config file.
+func TestLoadRejectsUnparseableWorkerRestartDelay(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{"state_dir": "/tmp/x", "web_listen": "127.0.0.1:1", "worker_restart_delay": "100"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Error("Load accepted a worker_restart_delay of \"100\", want error")
+	}
+}
+
 func TestLoadMissingFileIsAnError(t *testing.T) {
 	t.Parallel()
 	// Silently falling back to defaults after the user named a specific
