@@ -1,0 +1,30 @@
+# Build output
+/sharzad
+/sharza-ctl
+/dist/
+
+# Go
+*.test
+*.out
+/vendor/
+
+# Runtime state. The daemon writes under a user data dir by default, but a
+# developer running from the repo must never commit a state file: it holds the
+# user's real download queue and search history.
+/state/
+*.sock
+*.db
+*.db-wal
+*.db-shm
+
+# IDE state. JetBrains .gitignore, because GoLand opens the project on
+# directory mtime changes and would otherwise commit its workspace layout.
+/.idea/
+/.vscode/
+*.iml
+
+# Local agentic harness state: task history, logs, and whatever an agent
+# decided to leave lying around.
+/harness/.state/
+/harness/logs/
+/harness/node_modules/

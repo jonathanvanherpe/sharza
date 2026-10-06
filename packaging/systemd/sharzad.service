@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Sharza supervisor. Runs as a user service: the daemon needs no privileges,
+# because its state directory and control socket live under the user's own
+# data dir.
+#
+# Install with:
+#   systemctl --user enable --now sharzad.service
+
+[Unit]
+Description=Sharza supervisor (multi-protocol P2P client)
+Documentation=https://cv.freebase.be
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sharzad --role=supervisor
+
+# The supervisor respawns its workers, so systemd must not race it to
+# restart them. KillMode=control-group stops the whole worker tree when the
+# supervisor goes down, rather than leaving orphaned workers holding the
+# control socket.
+KillMode=control-group
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The daemon needs to write its state dir and nothing else, and it
+# has no reason to own new privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/sharza
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

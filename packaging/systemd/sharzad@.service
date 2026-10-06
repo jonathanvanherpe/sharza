@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# One protocol worker, as a systemd template so a worker can be inspected,
+# restarted and given its own resource limits independently.
+#
+# In normal operation the supervisor spawns workers directly and this unit is
+# not used; it exists for running a single engine in isolation while
+# debugging.
+#
+# Instantiate with:
+#   systemctl --user start sharzad@bt.service
+
+[Unit]
+Description=Sharza %i worker
+PartOf=sharzad.service
+After=sharzad.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sharzad --role=%i
+
+# A worker owns its own network namespace in later phases, which needs
+# privileges the supervisor deliberately does not have. Granting them only
+# here keeps the supervisor's attack surface smaller.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+KillMode=mixed
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/sharza
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

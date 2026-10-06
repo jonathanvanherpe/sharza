@@ -1,0 +1,126 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "permission": {
+    "edit": { "*": "allow" },
+    "read": { "*": "allow" },
+    "glob": { "*": "allow" },
+    "grep": { "*": "allow" },
+    "webfetch": { "*": "allow" },
+    "websearch": { "*": "allow" },
+    "todowrite": "allow",
+    "external_directory": {
+      "*": "deny",
+      "/home/jonne/Projects/sharza/**": "allow",
+      "/home/jonne/Projects/sharza-references/**": "allow",
+      "/home/jonne/sdk/**": "allow",
+      "/home/jonne/go/**": "allow",
+      "/tmp/**": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "sudo *": "deny",
+      "sudo": "deny",
+      "rm -rf /": "deny",
+      "rm -rf /*": "deny",
+      "rm -rf ~": "deny",
+      "rm -rf ~/*": "deny",
+      "rm -rf /home/*": "deny",
+      "rm -rf /etc*": "deny",
+      "rm -rf /usr*": "deny",
+      "rm -rf /var*": "deny",
+      "rm -rf /home/jonne/Projects/sharza": "deny",
+      "rm -rf /home/jonne/Projects/sharza-references": "deny",
+      "git push --force*": "deny",
+      "git push -f*": "deny",
+      "git push --delete*": "deny",
+      "git push origin main*": "deny",
+      "git push origin master*": "deny",
+      "git push": "allow",
+      "git reset --hard*": "deny",
+      "git checkout main": "deny",
+      "git checkout master": "deny",
+      "git switch main": "deny",
+      "git switch master": "deny",
+      "git clean -fdx*": "deny",
+      "dd if=*": "deny",
+      "dd of=/dev/*": "deny",
+      "mkfs*": "deny",
+      "chmod -R 777 /": "deny",
+      "chown -R * /": "deny",
+      ":(){*": "deny",
+      "shutdown*": "deny",
+      "reboot*": "deny",
+      "halt*": "deny",
+      "poweroff*": "deny",
+      "init 0*": "deny",
+      "*>/dev/sd*": "deny",
+      "*> /dev/sd*": "deny",
+      "curl* | sh": "deny",
+      "curl* | bash": "deny",
+      "wget* | sh": "deny",
+      "wget* | bash": "deny",
+      "curl* | sudo*": "deny",
+      "* | sudo*": "deny",
+      "systemctl stop*": "ask",
+      "systemctl restart*": "ask",
+      "systemctl disable*": "ask"
+    }
+  },
+  "agent": {
+    "protocol-eng": {
+      "model": "opencode/big-pickle",
+      "mode": "subagent",
+      "description": "Implements wire protocols (eDonkey2000, Kad, Gnutella/G2). Use for framing, codecs, state machines, obfuscation, block-level protocol interaction.",
+      "permission": {
+        "edit": { "*": "allow" },
+        "bash": {
+          "*": "allow",
+          "sudo *": "deny",
+          "rm -rf /": "deny",
+          "git push --force*": "deny",
+          "git push origin main*": "deny",
+          "git reset --hard*": "deny"
+        }
+      }
+    },
+    "test-eng": {
+      "model": "opencode/big-pickle",
+      "mode": "subagent",
+      "description": "Writes tests, fuzz targets and differential harnesses against oracles (amuled, gtk-gnutella, qBittorrent). Use for verification work.",
+      "permission": {
+        "edit": { "*": "allow" }
+      }
+    },
+    "reviewer": {
+      "model": "opencode/big-pickle",
+      "mode": "subagent",
+      "description": "Reviews changes for correctness, licence hygiene, SPDX headers, cgo leakage into the daemon, and protocol-spec fidelity. Read-only.",
+      "permission": {
+        "edit": "deny",
+        "bash": {
+          "*": "deny",
+          "git *": "allow",
+          "go *": "allow",
+          "rg *": "allow",
+          "grep *": "allow",
+          "cat *": "allow",
+          "ls *": "allow",
+          "find *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "wc *": "allow"
+        }
+      }
+    },
+    "docs": {
+      "model": "opencode/big-pickle",
+      "mode": "subagent",
+      "description": "Keeps docs/ARCHITECTURE.md and docs/ROADMAP.md in sync with the code. Use after a design change, never to restate the code.",
+      "permission": {
+        "edit": { "*": "allow" },
+        "external_directory": "deny"
+      }
+    }
+  }
+}

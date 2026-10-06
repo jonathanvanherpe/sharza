@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sharza</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #12141a;
+    --panel: #1b1e26;
+    --line: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #949bad;
+    --ok: #4ec9a0;
+    --bad: #e0666b;
+    --warn: #d8b25a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #e2e5ea;
+      --text: #1a1c20;
+      --muted: #62687a;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
+  .ver { color: var(--muted); font-size: 12px; }
+  main { padding: 24px; max-width: 900px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  td, th {
+    text-align: left;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--line);
+    font-weight: 400;
+  }
+  th { color: var(--muted); font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  .up { color: var(--ok); }
+  .down { color: var(--bad); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  #error { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sharza</h1>
+  <span class="ver" id="version">&mdash;</span>
+</header>
+<main>
+  <div class="panel">
+    <h2>Supervisor</h2>
+    <div id="error"></div>
+    <table id="summary"></table>
+  </div>
+  <div class="panel">
+    <h2>Workers</h2>
+    <table>
+      <thead><tr><th>role</th><th>pid</th><th>state</th><th>restarts</th><th>uptime</th></tr></thead>
+      <tbody id="workers"></tbody>
+    </table>
+    <p class="note">
+      Liveness only. A worker listed as up has not been health-probed at the
+      protocol level yet.
+    </p>
+  </div>
+  <div class="panel">
+    <h2>Jobs</h2>
+    <div id="jobs">no jobs yet</div>
+    <p class="note">No protocol engine is wired up in P0, so jobs will not progress.</p>
+  </div>
+</main>
+<script>
+const esc = s => String(s).replace(/[&<>"]/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function refresh() {
+  const errBox = document.getElementById('error');
+  try {
+    const [st, jobs] = await Promise.all([
+      fetch('/api/status').then(r => r.json()),
+      fetch('/api/jobs').then(r => r.json()),
+    ]);
+
+    document.getElementById('version').textContent = st.version + ' (' + st.commit + ')';
+    errBox.textContent = st.error || '';
+
+    document.getElementById('summary').innerHTML = `
+      <tr><th>role</th><td>${esc(st.role)}</td></tr>
+      <tr><th>pid</th><td>${esc(st.pid)}</td></tr>
+      <tr><th>uptime</th><td>${esc(Math.round(st.uptime_seconds))}s</td></tr>
+      <tr><th>schema</th><td>v${esc(st.schema_version)}</td></tr>
+      <tr><th>jobs</th><td>${esc(st.jobs)}</td></tr>`;
+
+    document.getElementById('workers').innerHTML = st.workers.map(w => `
+      <tr>
+        <td>${esc(w.role)}</td>
+        <td>${esc(w.pid || '—')}</td>
+        <td class="${w.alive ? 'up' : 'down'}">${w.alive ? 'up' : 'down'}</td>
+        <td>${esc(w.rests)}</td>
+        <td>${w.started_at && w.started_at !== '0001-01-01T00:00:00Z'
+              ? esc(Math.round((Date.now() - Date.parse(w.started_at)) / 1000)) + 's'
+              : '—'}</td>
+      </tr>`).join('');
+
+    document.getElementById('jobs').innerHTML = jobs.length
+      ? `<table><thead><tr><th>id</th><th>name</th><th>state</th><th>progress</th><th>verified</th></tr></thead><tbody>` +
+        jobs.map(j => `<tr>
+            <td>${esc(j.id)}</td>
+            <td>${esc(j.name)}</td>
+            <td>${esc(j.state)}</td>
+            <td>${esc(j.complete)} / ${esc(j.size)}</td>
+            <td class="${j.verified ? 'up' : 'down'}">${j.verified ? 'yes' : 'no'}</td>
+          </tr>`).join('') + '</tbody></table>'
+      : 'no jobs yet';
+  } catch (e) {
+    errBox.textContent = 'cannot reach the daemon: ' + e;
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
