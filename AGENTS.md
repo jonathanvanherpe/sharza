@@ -7,23 +7,53 @@ namespace-based VPN isolation.
 Read `docs/ARCHITECTURE.md` before changing anything structural. Read
 `docs/ROADMAP.md` to find out what to work on next.
 
+Read `docs/handoff.md` for what the last cycle left undecided. It records open
+questions and the reasoning behind recent decisions, so it is the fastest way
+to find out what is deliberately unfinished rather than accidentally broken.
+
 ## Building
 
-Go 1.27+ at `~/sdk/go` (the `go` symlink points at the active release).
+Go 1.27+ at `~/sdk/go`.
 
 ```sh
-go build ./...
-go test ./...
+~/sdk/go/bin/go build ./...
+~/sdk/go/bin/go test ./...
 ```
+
+**`go` is not on `PATH` in a non-interactive shell.** The toolchain is only
+exported by an interactive `zshrc`, so a bare `go` fails in a script, a
+systemd unit or an agent's subprocess. Use the absolute path, or resolve it
+first. This is worth stating plainly because the failure looks like a build
+error rather than a missing PATH, and a test suite that cannot find the
+compiler skips itself — and a skip reads as a pass in a CI log.
 
 ## The build is agentic
 
 This project is developed largely by autonomous agents. There is a harness in
-`harness/` that picks the next roadmap item, runs an agent against it, verifies
-the result and opens a merge request.
+`harness/` that picks the next roadmap item, runs an agent against it, and
+verifies the result independently before committing anything.
+
+```sh
+node harness/sharza-dev.mjs --dry-run   # plan only
+node harness/sharza-dev.mjs --once      # one full cycle
+node harness/sharza-dev.mjs --status    # past cycles and model cooldowns
+```
+
+The harness is strictly one-shot. It has no scheduler, no loop and no timer,
+so it will not start anything on its own.
 
 **Agents never merge to `main`.** Every cycle lands on an
-`agent/<task-id>` branch with a merge request. The maintainer merges.
+`agent/<task-id>` branch and the maintainer merges.
+
+There is no git remote configured yet, so a cycle commits locally and cannot
+open a merge request. The harness says so rather than pretending otherwise.
+
+**The agent's own report is not evidence.** The harness re-runs build, vet,
+test, the cgo-free build and the SPDX check itself, and refuses to commit when
+they fail. When you add a test that guards an invariant, break the code on
+purpose and confirm the test fails before you believe it: a test that passes
+whether or not the code is correct is worse than no test, because it reads as
+coverage.
 
 If you are an agent: run `go build ./...`, `go vet ./...`, `go test ./...` and
 the SPDX header check before you consider anything done. Read
