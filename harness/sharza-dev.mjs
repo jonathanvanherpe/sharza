@@ -34,12 +34,83 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STATE_DIR = path.join(REPO, "harness", ".state");
 const STATE_FILE = path.join(STATE_DIR, "state.json");
 
-// Verify gate. A cycle that fails here does not commit.
-const VERIFY_COMMANDS = [
-  { cmd: "go", args: ["build", "./..."], label: "build" },
-  { cmd: "go", args: ["vet", "./..."], label: "vet" },
-  { cmd: "go", args: ["test", "./..."], label: "test" },
-];
+/**
+ * Locate the Go toolchain.
+ *
+ * `go` is not on PATH in a non-interactive shell here: the toolchain lives in
+ * ~/sdk/go/bin and is only exported by an interactive zshrc. A harness that
+ * shells out to a bare `go` fails its own gate for a reason that has nothing
+ * to do with the code under test, which is exactly the kind of false failure
+ * that trains a human to ignore the gate.
+ */
+function resolveGo() {
+  const home = process.env.HOME ?? "";
+  const candidates = [
+    process.env.GO,
+    process.env.GOROOT ? path.join(process.env.GOROOT, "bin", "go") : null,
+    path.join(home, "sdk", "go", "bin", "go"),
+    "/usr/local/go/bin/go",
+    "/usr/bin/go",
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate, ["version"], { stdio: "ignore", timeout: 20_000 });
+      return candidate;
+    } catch {
+      // Keep looking.
+    }
+  }
+  try {
+    // Last resort: maybe it is on PATH after all.
+    execFileSync("go", ["version"], { stdio: "ignore", timeout: 20_000 });
+    return "go";
+  } catch {
+    return null;
+  }
+}
+
+const GO = resolveGo();
+
+/**
+ * The verify gate. A cycle that fails here does not commit.
+ *
+ * SPDX and the cgo-free cross-compile are included because both are cheap and
+ * both are easy to regress silently: a `require` line looks like a normal
+ * edit, and `runtime/cgo` only shows up in a dependency listing nobody reads.
+ */
+const VERIFY_COMMANDS = GO
+  ? [
+      { cmd: GO, args: ["build", "./..."], label: "build" },
+      { cmd: GO, args: ["vet", "./..."], label: "vet" },
+      { cmd: GO, args: ["test", "./...", "-count=1"], label: "test" },
+      {
+        cmd: GO,
+        args: ["build", "./..."],
+        label: "build (CGO_ENABLED=0)",
+        env: { CGO_ENABLED: "0" },
+      },
+      {
+        cmd: "sh",
+        args: [
+          "-c",
+          'missing=$(find . -name "*.go" -not -path "./harness/*" -print0 | xargs -0 -I{} ' +
+            'head -1 "{}" | grep -L "SPDX-License-Identifier: GPL-3.0-or-later" | head -5); ' +
+            'if [ -n "$missing" ]; then echo "missing or wrong SPDX header:"; echo "$missing"; exit 1; fi; ' +
+            'echo "all .go files carry the SPDX header"',
+        ],
+        label: "SPDX headers",
+      },
+    ]
+  : [];
+
+if (!GO) {
+  console.error(
+    "FATAL: no Go toolchain found. Looked at $GO, $GOROOT/bin, ~/sdk/go/bin, " +
+      "/usr/local/go/bin and /usr/bin. Install Go or set $GO.",
+  );
+  process.exit(1);
+}
 
 const GIT_TIMEOUT = 120_000;
 
@@ -63,6 +134,16 @@ function git(args, opts = {}) {
     timeout: GIT_TIMEOUT,
     ...opts,
   }).trim();
+}
+
+/** Run git, returning whether it succeeded instead of throwing. */
+function gitSucceeds(args) {
+  try {
+    execFileSync("git", args, { cwd: REPO, stdio: "ignore", timeout: GIT_TIMEOUT });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function taskId() {
@@ -174,9 +255,14 @@ function lastAssistantText(stdout) {
 
 async function verifyGate() {
   const results = [];
-  for (const { cmd, args, label } of VERIFY_COMMANDS) {
+  for (const { cmd, args, label, env } of VERIFY_COMMANDS) {
     try {
-      await exec(cmd, args, { cwd: REPO, timeout: 600_000 });
+      await exec(cmd, args, {
+        cwd: REPO,
+        timeout: 900_000,
+        maxBuffer: 64 * 1024 * 1024,
+        ...(env ? { env: { ...process.env, ...env } } : {}),
+      });
       results.push({ label, ok: true });
     } catch (err) {
       results.push({
@@ -251,13 +337,23 @@ async function main(argv) {
     return 0;
   }
 
-  // 2. Branch from main. Refuse to build on anything else: a cycle must be
-  //    rebased onto current main, or the MR diff grows without bound.
-  git(["fetch", "origin", "main"], { stdio: "ignore" });
-  const base = git(["rev-parse", "origin/main"]).length > 0
-    ? git(["rev-parse", "origin/main"])
-    : git(["rev-parse", "HEAD"]);
-  git(["checkout", "-b", branch, base]);
+  // 2. Branch. A cycle must start from current main, or the MR diff grows
+  //    without bound.
+  //
+  //    A missing remote is not an error: the repo may simply be local-only.
+  //    Creating one is a maintainer decision, not something the harness
+  //    should do behind the user's back, so it degrades to local HEAD and
+  //    reports that nothing was pushed.
+  const hasRemote = gitSucceeds(["remote", "get-url", "origin"]);
+  let base;
+  if (hasRemote) {
+    git(["fetch", "--quiet", "origin", "main"]);
+    base = git(["rev-parse", "origin/main"]);
+  } else {
+    base = git(["rev-parse", "HEAD"]);
+    console.log("no git remote configured; branching from local HEAD");
+  }
+  git(["checkout", "-B", branch, base]);
 
   // 3. Route and run.
   const exclude = await cooledDown();
@@ -300,13 +396,29 @@ async function main(argv) {
       verify.map((v) => `  ${v.ok ? "pass" : "FAIL"}  ${v.label}`).join("\n"),
   );
 
-  const changed = git(["status", "--porcelain"], { allowFailure: true });
+  const changed = git(["status", "--porcelain"]);
   const haveChanges = Boolean(changed);
 
-  if (failed.length > 0 || !haveChanges) {
-    const why = failed.length > 0
-      ? `verify failed: ${failed.map((f) => f.label).join(", ")}`
-      : "no file changes were produced";
+  // A crashed agent is not a successful cycle even if its leftover changes
+  // happen to compile. A quota failure or a timeout partway through leaves a
+  // coherent-looking, incomplete commit: the worst possible outcome, because
+  // it passes every automated check while missing the point of the brief.
+  const agentFailed = !run.ok;
+  const reasons = [];
+  if (agentFailed) {
+    reasons.push(
+      `agent exited ${run.exitCode ?? "by signal"}${run.stderr ? `: ${run.stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`,
+    );
+  }
+  if (failed.length > 0) {
+    reasons.push(`verify failed: ${failed.map((f) => f.label).join(", ")}`);
+  }
+  if (!haveChanges) {
+    reasons.push("no file changes were produced");
+  }
+
+  if (reasons.length > 0) {
+    const why = reasons.join("; ");
     console.log(`\nnot committing: ${why}`);
 
     await notify(
@@ -343,32 +455,41 @@ async function main(argv) {
       `Verification: ${verify.map((v) => v.label).join(", ")} passed.\n\n` +
       `See docs/handoff.md for what was and was not exercised.`,
   ]);
-  git(["push", "-q", "-u", "origin", branch]);
 
+  let pushed = false;
+  if (hasRemote) {
+    git(["push", "-q", "-u", "origin", branch]);
+    pushed = true;
+  }
+
+  const landed = pushed ? "pushed" : "committed locally (no git remote configured)";
   const state_ = loadState();
   saveState({
     ...state_,
     cycles: state.cycles + 1,
     lastTask: task,
-    lastResult: `branch ${branch} pushed`,
+    lastResult: `branch ${branch} ${landed}`,
     history: [
       ...(state_.history ?? []),
       {
         at: new Date().toISOString(),
         branch,
         task: task.split("\n")[0],
-        result: "pushed",
+        result: landed,
       },
     ].slice(-50),
   });
 
   await notify(
     `Cycle ${id} ready for review.\nBranch: ${branch}\nTask: ${task.split("\n")[0]}\n\n` +
-      `Merge when you have read the diff.`,
+      (pushed
+        ? "Merge when you have read the diff."
+        : "Committed locally only. No git remote is configured, so there is nothing " +
+          "to review on a server yet."),
     { title: "Sharza harness", priority: "default", tags: ["rocket"] },
   );
 
-  console.log(`\npushed ${branch} (agent exit ${run.exitCode}, ${run.durationMs}ms)`);
+  console.log(`\n${landed} (agent exit ${run.exitCode}, ${run.durationMs}ms)`);
   console.log("waiting for the maintainer to merge; the harness will not merge to main");
 
   // Back to main so the next cycle starts clean.
@@ -376,5 +497,18 @@ async function main(argv) {
   return 0;
 }
 
-const code = await main(process.argv.slice(2));
-process.exit(code ?? 0);
+/**
+ * Entry point.
+ *
+ * Guarded so that importing this module does not start a cycle. An unguarded
+ * `main()` at the bottom of the file means `import("./sharza-dev.mjs")` spins
+ * up a real agent run with the importing process's argv, which is how you end
+ * up debugging a two-hour build that nobody asked for.
+ */
+const invokedDirectly =
+  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) {
+  const code = await main(process.argv.slice(2));
+  process.exit(code ?? 0);
+}
