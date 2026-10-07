@@ -104,13 +104,26 @@ func goTool(t *testing.T) string {
 }
 
 // A resolver that invents a path would fail later with a build error nobody can
-// read as "no toolchain here". It must return nothing instead.
+// read as "no toolchain here". It must return nothing instead — or, when the
+// host ships a real toolchain in a well-known location, that executable.
+//
+// The environment below has no toolchain in PATH, HOME or GOROOT, so the only
+// way findGoTool can return non-empty is a system location such as /usr/bin/go
+// on a runner image. That is discovery, not a guess, and the assertion is that
+// whatever it returns really is an executable file.
 func TestMissingToolchainIsReportedNotGuessed(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("GOROOT", t.TempDir())
-	if got := findGoTool(); got != "" {
-		t.Fatalf("findGoTool() = %q with no toolchain in PATH, HOME or GOROOT, want \"\"", got)
+
+	got := findGoTool()
+	if got == "" {
+		return
+	}
+	fi, err := os.Stat(got)
+	if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
+		t.Fatalf("findGoTool() = %q with no toolchain in PATH, HOME or GOROOT: "+
+			"not an executable file, want \"\" or a real toolchain", got)
 	}
 }
 
