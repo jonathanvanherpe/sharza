@@ -180,6 +180,12 @@ func TestLoadEmptyPathYieldsDefaults(t *testing.T) {
 	if c.ConfigPath != "" {
 		t.Errorf("ConfigPath = %q, want empty for built-in defaults", c.ConfigPath)
 	}
+	// The default web listen sits one above the Gnutella/Gnutella2 port
+	// (6346) and stays on the loopback interface. Pinning it here means a
+	// rename cannot silently move the UI port again.
+	if c.WebListen != "127.0.0.1:6347" {
+		t.Errorf("default web_listen = %q, want 127.0.0.1:6347", c.WebListen)
+	}
 }
 
 func TestLoadReadsConfigAndRecordsPath(t *testing.T) {

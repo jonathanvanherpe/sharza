@@ -34,6 +34,12 @@ type Config struct {
 	// WebListen is the local web UI bind address. It must be a loopback
 	// address: the web UI has no authentication of its own and relies on
 	// the loopback interface being unreachable from the network.
+	//
+	// The default, 127.0.0.1:6347, is one above the Gnutella and
+	// Gnutella2 default port (6346) so the UI port is easy to remember
+	// next to the network ports. The web listener lives on the host
+	// loopback, never inside a worker namespace, so the two never
+	// collide.
 	WebListen string `json:"web_listen"`
 
 	// WorkerRoles lists the worker roles to spawn.
@@ -62,7 +68,7 @@ func Default() *Config {
 	stateDir := filepath.Join(base, DefaultStateDirName)
 	c := &Config{
 		StateDir:  stateDir,
-		WebListen: "127.0.0.1:8710",
+		WebListen: "127.0.0.1:6347",
 	}
 	c.applyDefaults()
 	return c
@@ -76,7 +82,7 @@ func (c *Config) applyDefaults() {
 		c.SocketPath = filepath.Join(c.StateDir, rpcSocketName)
 	}
 	if c.WebListen == "" {
-		c.WebListen = "127.0.0.1:8710"
+		c.WebListen = "127.0.0.1:6347"
 	}
 	if len(c.WorkerRoles) == 0 {
 		c.WorkerRoles = role.WorkerRoles()
