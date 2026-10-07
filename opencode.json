@@ -34,7 +34,6 @@
       "git push --force*": "deny",
       "git push -f*": "deny",
       "git push --delete*": "deny",
-      "git push origin main*": "deny",
       "git push origin master*": "deny",
       "git push": "allow",
       "git reset --hard*": "deny",
