@@ -16,12 +16,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/jonathanvanherpe/sharza/internal/config"
+	"github.com/jonathanvanherpe/sharza/internal/logring"
 	"github.com/jonathanvanherpe/sharza/internal/role"
 	"github.com/jonathanvanherpe/sharza/internal/rpc"
 	"github.com/jonathanvanherpe/sharza/internal/store"
@@ -94,6 +96,12 @@ func runSupervisor(ctx context.Context, cfgPath string, noWorkers bool) error {
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.Serve(ctx) }()
 
+	// The log ring is what the web UI tails. Everything the supervisor
+	// knows about goes through it: worker output, its own startup and
+	// shutdown lines, and the expose warning.
+	ring := logring.New(1000)
+	logOut := io.MultiWriter(os.Stderr, ring)
+
 	var sup *supervisor.Supervisor
 	if !noWorkers {
 		// os.Executable, not os.Args[0]: a worker spawned under a bare
@@ -103,14 +111,16 @@ func runSupervisor(ctx context.Context, cfgPath string, noWorkers bool) error {
 		if err != nil {
 			return fmt.Errorf("locate own executable to spawn workers: %w", err)
 		}
-		sup, err = supervisor.StartWorkers(ctx, cfg, svc.ReportWorker, self)
+		sup, err = supervisor.StartWorkers(ctx, cfg, svc.ReportWorker, self, logOut)
 		if err != nil {
 			return fmt.Errorf("start workers: %w", err)
 		}
 		defer sup.Stop()
+		svc.AttachSupervisor(sup)
 	} else {
 		svc.ReportAllWorkersDown()
 	}
+	svc.AttachLogs(ring)
 
 	httpSrv, err := web.Serve(ctx, cfg.WebListen, cfg.SocketPath)
 	if err != nil {
@@ -118,14 +128,19 @@ func runSupervisor(ctx context.Context, cfgPath string, noWorkers bool) error {
 	}
 	defer httpSrv.Close()
 
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(logOut,
 		"sharzad: supervisor pid=%d socket=%s web=%s state=%s schema=%d workers=%v\n",
 		os.Getpid(), cfg.SocketPath, cfg.WebListen, cfg.StatePath(),
 		mustSchemaVersion(st), cfg.WorkerRoles)
+	if cfg.ExposeWeb {
+		fmt.Fprintf(logOut,
+			"sharzad: WARNING: web UI exposed on %s (web_expose): the P0 UI has no authentication, "+
+				"anyone who can reach this address can control the daemon\n", cfg.WebListen)
+	}
 
 	select {
 	case <-ctx.Done():
-		fmt.Fprintln(os.Stderr, "sharzad: shutting down")
+		fmt.Fprintln(logOut, "sharzad: shutting down")
 		return nil
 	case err := <-srvErr:
 		return err

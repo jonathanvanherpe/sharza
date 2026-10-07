@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/jonathanvanherpe/sharza/internal/logring"
 	"github.com/jonathanvanherpe/sharza/internal/role"
 	"github.com/jonathanvanherpe/sharza/internal/rpc"
 	"github.com/jonathanvanherpe/sharza/internal/store"
@@ -22,6 +24,13 @@ import (
 // Service implements the supervisor's RPC methods over a Store.
 type Service struct {
 	st store.Store
+
+	// sup is nil until AttachSupervisor, which the daemon calls once it has
+	// a worker set. It is read by every status poll, so it is an atomic
+	// pointer rather than a guard.
+	sup atomic.Pointer[Supervisor]
+	// logs is nil until AttachLogs; logsTail then returns an empty list.
+	logs *logring.Ring
 
 	startedAt time.Time
 
@@ -34,6 +43,7 @@ type WorkerStatus struct {
 	Role      role.Role `json:"role"`
 	PID       int       `json:"pid"`
 	Alive     bool      `json:"alive"`
+	Paused    bool      `json:"paused"`
 	StartedAt time.Time `json:"started_at"`
 	Rests     int       `json:"rests"`
 }
@@ -60,6 +70,21 @@ func (s *Service) register(d *rpc.Dispatcher) {
 	d.Register(rpc.MethodJobsPause, s.jobsPause)
 	d.Register(rpc.MethodJobsResume, s.jobsResume)
 	d.Register(rpc.MethodJobsRemove, s.jobsRemove)
+	d.Register(rpc.MethodRolesPause, s.rolesPause)
+	d.Register(rpc.MethodRolesResume, s.rolesResume)
+	d.Register(rpc.MethodLogsTail, s.logsTail)
+}
+
+// AttachSupervisor binds the worker set the daemon started, so status can
+// report pause state and rolesPause/rolesResume have something to act on.
+// It must be called before the RPC server starts serving.
+func (s *Service) AttachSupervisor(sup *Supervisor) {
+	s.sup.Store(sup)
+}
+
+// AttachLogs binds the log ring the daemon writes to, so the UI can tail it.
+func (s *Service) AttachLogs(logs *logring.Ring) {
+	s.logs = logs
 }
 
 // StatusParams is the (empty) parameter set for sharza.status.
@@ -248,6 +273,87 @@ func (s *Service) jobsRemove(_ context.Context, params json.RawMessage) (any, er
 	return JobReply{Job: store.Job{ID: p.ID, State: store.StateRemoved}}, nil
 }
 
+// RoleParam is the parameter set for sharza.roles.pause and sharza.roles.resume.
+type RoleParam struct {
+	Role role.Role `json:"role"`
+}
+
+// RoleReply reports the role's state after a pause/resume.
+type RoleReply struct {
+	Role   role.Role `json:"role"`
+	Paused bool      `json:"paused"`
+}
+
+// ErrNoSupervisor is returned when a roles method is called while nothing is
+// managing the worker processes (it is that state rather than an error code
+// because the service is perfectly healthy without a supervisor).
+var ErrNoSupervisor = errors.New("supervisor not managing workers")
+
+func (s *Service) rolesPause(_ context.Context, params json.RawMessage) (any, error) {
+	sup := s.sup.Load()
+	if sup == nil {
+		return nil, rpc.Errorf(rpc.CodeFailedPrecond, "%v", ErrNoSupervisor)
+	}
+	var p RoleParam
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := sup.PauseRole(p.Role); err != nil {
+		if errors.Is(err, ErrUnknownRole) {
+			return nil, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+		}
+		return nil, fmt.Errorf("pause %s: %w", p.Role, err)
+	}
+	return RoleReply{Role: p.Role, Paused: true}, nil
+}
+
+func (s *Service) rolesResume(ctx context.Context, params json.RawMessage) (any, error) {
+	sup := s.sup.Load()
+	if sup == nil {
+		return nil, rpc.Errorf(rpc.CodeFailedPrecond, "%v", ErrNoSupervisor)
+	}
+	var p RoleParam
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := sup.ResumeRole(ctx, p.Role); err != nil {
+		if errors.Is(err, ErrUnknownRole) {
+			return nil, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
+		}
+		return nil, fmt.Errorf("resume %s: %w", p.Role, err)
+	}
+	return RoleReply{Role: p.Role, Paused: sup.IsRolePaused(p.Role)}, nil
+}
+
+// LogsTailParams is the parameter set for sharza.logs.tail. A zero Limit
+// means the default (200 lines).
+type LogsTailParams struct {
+	Limit int `json:"limit,omitempty"`
+}
+
+// LogsTailReply is the reply to sharza.logs.tail.
+type LogsTailReply struct {
+	Lines []string `json:"lines"`
+}
+
+func (s *Service) logsTail(_ context.Context, params json.RawMessage) (any, error) {
+	var p LogsTailParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if s.logs == nil {
+		return LogsTailReply{}, nil
+	}
+	return LogsTailReply{Lines: s.logs.Lines(limit)}, nil
+}
+
 // ReportWorker records a worker's observed state. Only the supervisor calls it.
 //
 // A role this build does not know about is ignored: a stale report from a
@@ -284,8 +390,10 @@ func (s *Service) ReportAllWorkersDown() {
 func (s *Service) workerSnapshot() []WorkerStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	sup := s.sup.Load()
 	out := make([]WorkerStatus, 0, len(s.workers))
-	for _, w := range s.workers {
+	for r, w := range s.workers {
+		w.Paused = sup != nil && sup.IsRolePaused(r)
 		out = append(out, w)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Role < out[j].Role })

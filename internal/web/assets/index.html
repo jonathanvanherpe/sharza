@@ -41,7 +41,7 @@
   }
   h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
   .ver { color: var(--muted); font-size: 12px; }
-  main { padding: 24px; max-width: 900px; }
+  main { padding: 24px; max-width: 960px; }
   .panel {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -68,8 +68,46 @@
   tr:last-child td { border-bottom: 0; }
   .up { color: var(--ok); }
   .down { color: var(--bad); }
+  .paused { color: var(--warn); }
   .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
   #error { color: var(--bad); }
+  button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 3px 10px;
+    font: 12px ui-monospace, monospace;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { border-color: var(--ok); color: var(--ok); }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 8px;
+    font: 13px ui-monospace, monospace;
+  }
+  input:focus { outline: 1px solid var(--muted); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 200px; }
+  pre#logs {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font: 12px/1.55 ui-monospace, monospace;
+    height: 260px;
+    overflow: auto;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .placeholder { color: var(--muted); font-size: 13px; margin: 0; }
+  .btn-cell { text-align: right; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -83,37 +121,85 @@
     <div id="error"></div>
     <table id="summary"></table>
   </div>
+
   <div class="panel">
-    <h2>Workers</h2>
+    <h2>Networks</h2>
     <table>
-      <thead><tr><th>role</th><th>pid</th><th>state</th><th>restarts</th><th>uptime</th></tr></thead>
-      <tbody id="workers"></tbody>
+      <thead><tr><th>network</th><th>pid</th><th>state</th><th>restarts</th><th>uptime</th><th></th></tr></thead>
+      <tbody id="networks"></tbody>
     </table>
     <p class="note">
-      Liveness only. A worker listed as up has not been health-probed at the
-      protocol level yet.
+      Pausing stops the network's engine process and resumes it on demand. In P0
+      that is a process, not a connected swarm: the engines are stubs until P1.
     </p>
   </div>
+
   <div class="panel">
     <h2>Jobs</h2>
+    <form id="addjob" class="row" style="margin-bottom:12px">
+      <input class="grow" id="job-uris" placeholder="magnet:?xt=urn:btih:... / ed2k://... / urn:bitprint:..." required>
+      <input id="job-name" placeholder="name (optional)">
+      <button class="primary" type="submit">Add</button>
+    </form>
     <div id="jobs">no jobs yet</div>
-    <p class="note">No protocol engine is wired up in P0, so jobs will not progress.</p>
+    <p class="note">The source URIs decide the engine. No engine is wired in P0, so jobs are records, not traffic.</p>
+  </div>
+
+  <div class="panel">
+    <h2>Logs</h2>
+    <pre id="logs">waiting for logs&hellip;</pre>
+  </div>
+
+  <div class="panel">
+    <h2>Transfers</h2>
+    <p class="placeholder">
+      Nothing transferred yet: P0 workers are process stubs. Real downloads and
+      uploads arrive with P1 (BitTorrent engine), then P3 (cross-network
+      swarming). Until then the Jobs table above is a record, not traffic.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>Search</h2>
+    <p class="placeholder">
+      In-network search arrives with the engines: P4 (eDonkey2000/Kad source
+      discovery) and P5 (Gnutella/Gnutella2 query routing). Nothing here in P0.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>Peers</h2>
+    <p class="placeholder">
+      A peer list arrives with the first engine (P1). Workers do not connect to
+      anything in P0.
+    </p>
   </div>
 </main>
 <script>
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || (r.status + ' ' + r.statusText));
+  return body;
+}
+
 async function refresh() {
   const errBox = document.getElementById('error');
+  errBox.textContent = '';
   try {
-    const [st, jobs] = await Promise.all([
-      fetch('/api/status').then(r => r.json()),
-      fetch('/api/jobs').then(r => r.json()),
+    const [st, jobs, logs] = await Promise.all([
+      api('/api/status'),
+      api('/api/jobs'),
+      api('/api/logs?limit=300'),
     ]);
 
-    document.getElementById('version').textContent = st.version + ' (' + st.commit + ')';
-    errBox.textContent = st.error || '';
+    document.getElementById('version').textContent =
+      st.version + ' (' + st.commit + ')';
+
+    const uptime = s => Math.round((Date.now() - Date.parse(s)) / 1000) + 's';
 
     document.getElementById('summary').innerHTML = `
       <tr><th>role</th><td>${esc(st.role)}</td></tr>
@@ -122,31 +208,105 @@ async function refresh() {
       <tr><th>schema</th><td>v${esc(st.schema_version)}</td></tr>
       <tr><th>jobs</th><td>${esc(st.jobs)}</td></tr>`;
 
-    document.getElementById('workers').innerHTML = st.workers.map(w => `
-      <tr>
+    document.getElementById('networks').innerHTML = st.workers.map(w => {
+      const cls = w.paused ? 'paused' : (w.alive ? 'up' : 'down');
+      const state = w.paused ? 'paused' : (w.alive ? 'up' : 'down');
+      const label = w.paused ? 'Resume' : 'Pause';
+      return `<tr>
         <td>${esc(w.role)}</td>
         <td>${esc(w.pid || '—')}</td>
-        <td class="${w.alive ? 'up' : 'down'}">${w.alive ? 'up' : 'down'}</td>
+        <td class="${cls}">${state}</td>
         <td>${esc(w.rests)}</td>
         <td>${w.started_at && w.started_at !== '0001-01-01T00:00:00Z'
-              ? esc(Math.round((Date.now() - Date.parse(w.started_at)) / 1000)) + 's'
-              : '—'}</td>
-      </tr>`).join('');
+              ? esc(uptime(w.started_at)) : '—'}</td>
+        <td class="btn-cell"><button data-act="role" data-role="${esc(w.role)}"
+          data-want="${w.paused ? 'resume' : 'pause'}">${label}</button></td>
+      </tr>`;
+    }).join('');
 
     document.getElementById('jobs').innerHTML = jobs.length
-      ? `<table><thead><tr><th>id</th><th>name</th><th>state</th><th>progress</th><th>verified</th></tr></thead><tbody>` +
-        jobs.map(j => `<tr>
+      ? `<table><thead><tr><th>id</th><th>name</th><th>state</th><th>progress</th><th>verified</th><th></th></tr></thead><tbody>` +
+        jobs.map(j => {
+          const progress = j.size > 0
+            ? `${esc(j.complete)} / ${esc(j.size)}`
+            : `${esc(j.complete)} bytes`;
+          let buttons = '';
+          if (['queued', 'running'].includes(j.state)) {
+            buttons += `<button data-act="job" data-id="${esc(j.id)}" data-want="pause">Pause</button> `;
+          } else if (j.state === 'paused') {
+            buttons += `<button data-act="job" data-id="${esc(j.id)}" data-want="resume">Resume</button> `;
+          }
+          if (j.state !== 'removed') {
+            buttons += `<button class="danger" data-act="job" data-id="${esc(j.id)}" data-want="remove">Remove</button>`;
+          }
+          return `<tr>
             <td>${esc(j.id)}</td>
             <td>${esc(j.name)}</td>
-            <td>${esc(j.state)}</td>
-            <td>${esc(j.complete)} / ${esc(j.size)}</td>
+            <td class="${j.state === 'completed' ? 'up' : j.state === 'failed' ? 'down' : j.state === 'paused' ? 'paused' : ''}">${esc(j.state)}</td>
+            <td>${progress}</td>
             <td class="${j.verified ? 'up' : 'down'}">${j.verified ? 'yes' : 'no'}</td>
-          </tr>`).join('') + '</tbody></table>'
+            <td class="btn-cell">${buttons}</td>
+          </tr>`;
+        }).join('') + '</tbody></table>'
       : 'no jobs yet';
+
+    const pre = document.getElementById('logs');
+    const stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+    pre.textContent = logs.lines.length ? logs.lines.join('\n') : 'no log lines captured yet';
+    if (stick) pre.scrollTop = pre.scrollHeight;
   } catch (e) {
     errBox.textContent = 'cannot reach the daemon: ' + e;
   }
 }
+
+document.addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    if (btn.dataset.act === 'role') {
+      await api('/api/roles/' + encodeURIComponent(btn.dataset.role) + '/' + btn.dataset.want, {
+        method: 'POST',
+      });
+    } else if (btn.dataset.act === 'job') {
+      await api('/api/jobs/' + encodeURIComponent(btn.dataset.id) + '/' + btn.dataset.want, {
+        method: 'POST',
+      });
+    }
+    setTimeout(refresh, 150);
+  } catch (err) {
+    document.getElementById('error').textContent = err.message;
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('addjob').addEventListener('submit', async e => {
+  e.preventDefault();
+  const uris = document.getElementById('job-uris').value
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (!uris.length) return;
+  const addBtn = e.target.querySelector('button');
+  addBtn.disabled = true;
+  try {
+    await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: document.getElementById('job-name').value.trim(),
+        uris,
+      }),
+    });
+    document.getElementById('job-uris').value = '';
+    document.getElementById('job-name').value = '';
+    refresh();
+  } catch (err) {
+    document.getElementById('error').textContent = err.message;
+  } finally {
+    addBtn.disabled = false;
+  }
+});
 
 refresh();
 setInterval(refresh, 3000);

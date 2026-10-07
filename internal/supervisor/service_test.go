@@ -6,11 +6,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jonathanvanherpe/sharza/internal/logring"
 	"github.com/jonathanvanherpe/sharza/internal/role"
 	"github.com/jonathanvanherpe/sharza/internal/rpc"
 	"github.com/jonathanvanherpe/sharza/internal/store"
@@ -323,6 +327,102 @@ func TestWorkerReporting(t *testing.T) {
 				t.Errorf("bt after restart = %+v, want rests=1 pid=9999 alive", w)
 			}
 		}
+	}
+}
+
+func TestLogsTailReturnsRingLines(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	var rep LogsTailReply
+	if err := h.call(rpc.MethodLogsTail, LogsTailParams{Limit: 100}, &rep); err != nil {
+		t.Fatalf("tail with no ring: %v", err)
+	}
+	if len(rep.Lines) != 0 {
+		t.Fatalf("tail with no ring = %v, want empty", rep.Lines)
+	}
+
+	r := logring.New(20)
+	r.Write([]byte("one\ntwo\nthree\n"))
+	h.svc.AttachLogs(r)
+
+	// Tailer and writer agree on the story: lines anywhere in the ring come
+	// back verbatim and in order.
+	if err := h.call(rpc.MethodLogsTail, LogsTailParams{}, &rep); err != nil {
+		t.Fatalf("tail: %v", err)
+	}
+	want := []string{"one", "two", "three"}
+	if len(rep.Lines) != len(want) {
+		t.Fatalf("tail = %v, want %v", rep.Lines, want)
+	}
+	for i := range want {
+		if rep.Lines[i] != want[i] {
+			t.Errorf("tail[%d] = %q, want %q", i, rep.Lines[i], want[i])
+		}
+	}
+}
+
+func TestLogsTailDefaultAndClamp(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	r := logring.New(5000)
+	var b strings.Builder
+	for i := 0; i < 1500; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	r.Write([]byte(b.String()))
+	h.svc.AttachLogs(r)
+
+	// A zero Limit means the default of 200, so the tail cannot exceed the
+	// reply that reports think they asked for.
+	var rep LogsTailReply
+	if err := h.call(rpc.MethodLogsTail, LogsTailParams{}, &rep); err != nil {
+		t.Fatalf("tail default: %v", err)
+	}
+	if len(rep.Lines) != 200 {
+		t.Errorf("default tail = %d lines, want 200", len(rep.Lines))
+	}
+	if rep.Lines[0] != "line 1300" {
+		t.Errorf("default tail starts at %q, want line 1300", rep.Lines[0])
+	}
+
+	// An oversized Limit is clamped, so a client bug cannot demand an
+	// unbounded reply.
+	if err := h.call(rpc.MethodLogsTail, LogsTailParams{Limit: 99999}, &rep); err != nil {
+		t.Fatalf("tail clamp: %v", err)
+	}
+	if len(rep.Lines) > 1000 {
+		t.Errorf("clamped tail = %d lines, want <= 1000", len(rep.Lines))
+	}
+}
+
+func TestRolesPauseWithoutSupervisorFails(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	// The harness never starts a worker set, so the roles methods must say
+	// so instead of pretending a pause happened.
+	for _, m := range []string{rpc.MethodRolesPause, rpc.MethodRolesResume} {
+		err := h.call(m, RoleParam{Role: role.BT}, nil)
+		var re *rpc.Error
+		if !errors.As(err, &re) || re.Code != rpc.CodeFailedPrecond {
+			t.Errorf("%s without supervisor = %v, want FailedPrecond", m, err)
+		}
+	}
+}
+
+func TestRolesPauseRejectsUnknownRole(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	sup := &Supervisor{spawnMu: map[role.Role]*sync.Mutex{}}
+	h.svc.AttachSupervisor(sup)
+
+	err := h.call(rpc.MethodRolesPause, RoleParam{Role: "dht"}, nil)
+	var re *rpc.Error
+	if !errors.As(err, &re) || re.Code != rpc.CodeInvalidParams {
+		t.Errorf("pause unknown role = %v, want InvalidParams", err)
 	}
 }
 

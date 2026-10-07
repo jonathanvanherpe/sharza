@@ -64,6 +64,37 @@ func TestLoopbackWebListenIsAccepted(t *testing.T) {
 	}
 }
 
+// web_expose is the deliberate, off-by-default escape hatch for a desktop or
+// CLI client on another machine. The security control is that it has to be
+// asked for: the refusal test above pins that not asking is refused, and the
+// test below pins that asking works.
+func TestExposedWebListenAcceptsNonLoopback(t *testing.T) {
+	t.Parallel()
+	for _, listen := range []string{
+		"0.0.0.0:6347",
+		":6347",
+		"192.168.1.10:6347",
+		"[::]:6347",
+		"example.org:6347",
+	} {
+		c := &Config{StateDir: t.TempDir(), WebListen: listen, ExposeWeb: true}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("web_listen %q with web_expose rejected: %v", listen, err)
+		}
+	}
+}
+
+// Expose only permits a non-loopback bind; it must not require one.
+func TestExposedWebListenStillAcceptsLoopback(t *testing.T) {
+	t.Parallel()
+	c := &Config{StateDir: t.TempDir(), WebListen: "127.0.0.1:6347", ExposeWeb: true}
+	c.applyDefaults()
+	if err := c.Validate(); err != nil {
+		t.Errorf("loopback web_listen with web_expose rejected: %v", err)
+	}
+}
+
 func TestStateDirMustBeAbsolute(t *testing.T) {
 	t.Parallel()
 	// A relative state dir would resolve against whatever cwd the service

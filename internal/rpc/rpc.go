@@ -98,6 +98,13 @@ const (
 	MethodJobsPause  = "sharza.jobs.pause"
 	MethodJobsResume = "sharza.jobs.resume"
 	MethodJobsRemove = "sharza.jobs.remove"
+
+	// MethodRolesPause and MethodRolesResume toggle a worker role on and
+	// off. MethodLogsTail returns the supervisor's recent log lines for the
+	// web UI to tail.
+	MethodRolesPause  = "sharza.roles.pause"
+	MethodRolesResume = "sharza.roles.resume"
+	MethodLogsTail    = "sharza.logs.tail"
 )
 
 // Dispatcher routes methods to handlers.

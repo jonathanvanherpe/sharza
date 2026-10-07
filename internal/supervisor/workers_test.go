@@ -749,7 +749,7 @@ func TestStopLeavesNoOrphanWorkerDescendants(t *testing.T) {
 		mu.Lock()
 		reported[r] = pid
 		mu.Unlock()
-	}, bin)
+	}, bin, nil)
 	if err != nil {
 		t.Fatalf("StartWorkers: %v", err)
 	}
@@ -849,4 +849,86 @@ func waitUntilDead(t *testing.T, pid int, within time.Duration) bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return true
+}
+
+// rpcRolesCall makes one roles RPC call against a live daemon.
+func rpcRolesCall(t *testing.T, sock, method string, r role.Role) error {
+	t.Helper()
+	c, err := rpc.Dial(sock, 500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return c.Call(ctx, method, RoleParam{Role: r}, nil)
+}
+
+// Pausing a network must stop its worker and keep it stopped across the
+// restart boundary, while the other networks keep running. It is what the web
+// UI's network toggles do, so it is asserted against real processes: a pause
+// that only lasts until the next respawn would show as a toggle that does not
+// stay toggled.
+func TestPausedWorkerStaysDownUntilResumed(t *testing.T) {
+	inst := startInstance(t, fastRestart)
+
+	before := waitStatus(t, inst.sock, startupTimeout, allWorkersAlive)
+	beforeByRole := workersByRole(before)
+	btPID := beforeByRole[role.BT].PID
+
+	if err := rpcRolesCall(t, inst.sock, rpc.MethodRolesPause, role.BT); err != nil {
+		t.Fatalf("pause bt: %v", err)
+	}
+
+	// The kill lands, the worker reports dead, and status must show the
+	// paused flag alongside the dead worker.
+	waitStatus(t, inst.sock, 5*time.Second, func(st Status) bool {
+		w, ok := workersByRole(st)[role.BT]
+		return ok && !w.Alive && w.Paused
+	})
+
+	// Several restart delays (200ms each) go by without the worker coming
+	// back: a pause must hold across the respawn path, not just until the
+	// process exits.
+	delay, err := time.ParseDuration(fastRestart)
+	if err != nil {
+		t.Fatalf("parse %s: %v", fastRestart, err)
+	}
+	time.Sleep(3 * delay)
+
+	st := waitStatus(t, inst.sock, 5*time.Second, func(st Status) bool {
+		w, ok := workersByRole(st)[role.BT]
+		return ok && !w.Alive && w.Paused
+	})
+	by := workersByRole(st)
+
+	// The other two networks must not have noticed the pause.
+	for _, r := range []role.Role{role.ED2K, role.G2} {
+		w, ok := by[r]
+		if !ok {
+			t.Errorf("worker %s missing from status: %+v", r, st.Workers)
+			continue
+		}
+		if w.PID != beforeByRole[r].PID {
+			t.Errorf("%s worker pid = %d, want the original %d: pausing bt touched another network",
+				r, w.PID, beforeByRole[r].PID)
+		}
+		if !w.Alive {
+			t.Errorf("%s worker = %+v, want still alive", r, w)
+		}
+	}
+
+	if err := rpcRolesCall(t, inst.sock, rpc.MethodRolesResume, role.BT); err != nil {
+		t.Fatalf("resume bt: %v", err)
+	}
+
+	// The resumed worker is a fresh process, alive and unpaused.
+	resumed := waitStatus(t, inst.sock, 5*time.Second, func(st Status) bool {
+		w, ok := workersByRole(st)[role.BT]
+		return ok && w.Alive && !w.Paused && w.PID != btPID
+	})
+	resumedBT := workersByRole(resumed)[role.BT]
+	if err := syscall.Kill(resumedBT.PID, 0); err != nil {
+		t.Errorf("resumed bt worker pid %d is not a live process: %v", resumedBT.PID, err)
+	}
 }

@@ -31,16 +31,23 @@ type Config struct {
 	// SocketPath is the control socket.
 	SocketPath string `json:"socket_path"`
 
-	// WebListen is the local web UI bind address. It must be a loopback
-	// address: the web UI has no authentication of its own and relies on
-	// the loopback interface being unreachable from the network.
+	// WebListen is the web UI bind address. By default it must be a
+	// loopback address: the web UI has no authentication of its own and
+	// relies on the loopback interface being unreachable from the network.
 	//
 	// The default, 127.0.0.1:6347, is one above the Gnutella and
 	// Gnutella2 default port (6346) so the UI port is easy to remember
-	// next to the network ports. The web listener lives on the host
-	// loopback, never inside a worker namespace, so the two never
-	// collide.
+	// next to the network ports. The web listener lives on the host, never
+	// inside a worker namespace, so the two never collide.
 	WebListen string `json:"web_listen"`
+
+	// ExposeWeb permits binding the web UI off-host. It is off by default
+	// because the P0 UI has no authentication; the future desktop or CLI
+	// client may connect from another machine, so expose is the deliberate
+	// opt-in escape hatch. With ExposeWeb set, WebListen may name any
+	// address, including 0.0.0.0. A loopback WebListen with ExposeWeb set
+	// is harmless and still valid.
+	ExposeWeb bool `json:"web_expose"`
 
 	// WorkerRoles lists the worker roles to spawn.
 	WorkerRoles []role.Role `json:"worker_roles"`
@@ -140,8 +147,10 @@ func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.StateDir) {
 		return fmt.Errorf("state_dir must be an absolute path, got %q", c.StateDir)
 	}
-	if err := c.checkLoopback(); err != nil {
-		return err
+	if !c.ExposeWeb {
+		if err := c.checkLoopback(); err != nil {
+			return err
+		}
 	}
 	for _, r := range c.WorkerRoles {
 		if !role.IsWorker(r) {
@@ -173,7 +182,8 @@ func (c *Config) Validate() error {
 
 // checkLoopback refuses a web listener reachable off-host. The web UI has no
 // authentication in P0; binding it to 0.0.0.0 would expose full control of the
-// daemon to the network.
+// daemon to the network. Validate skips this check only when the operator
+// explicitly set web_expose.
 func (c *Config) checkLoopback() error {
 	host := c.WebListen
 	if i := strings.LastIndex(host, ":"); i >= 0 {
@@ -184,11 +194,13 @@ func (c *Config) checkLoopback() error {
 	case "127.0.0.1", "::1", "localhost":
 		return nil
 	case "":
-		return fmt.Errorf("web_listen must name a loopback address, got %q", c.WebListen)
+		return fmt.Errorf("web_listen must name a loopback address, got %q "+
+			"(set web_expose: true to bind any address)", c.WebListen)
 	default:
 		return fmt.Errorf(
 			"web_listen %q is not a loopback address: the web UI is unauthenticated in P0, "+
-				"so binding it off-host would expose the daemon", c.WebListen)
+				"so binding it off-host would expose the daemon (set web_expose: true to allow it)",
+			c.WebListen)
 	}
 }
 
