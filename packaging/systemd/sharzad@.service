@@ -17,7 +17,7 @@ After=sharzad.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/sharzad --role=%i
+ExecStart=/usr/bin/sharzad --role=%i
 
 # A worker owns its own network namespace in later phases, which needs
 # privileges the supervisor deliberately does not have. Granting them only

@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./... -count=1
+
+      # The supervisor tests are process-timing tests: a respawn has to be
+      # observed inside 2s. Race-enabled runs are where an unsynchronised
+      # worker state read shows up, so the race pass is not optional here.
+      - name: test (race)
+        run: go test -race ./... -count=1
+
+      - name: cgo-free build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: daemon carries no cgo
+        run: |
+          deps=$(CGO_ENABLED=0 go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$' || true)
+          if [ -n "$deps" ]; then
+            echo "unexpected cgo dependency in sharzad:" >&2
+            echo "$deps" >&2
+            exit 1
+          fi
+          echo "sharzad is cgo-free"
+
+      - name: SPDX headers
+        run: |
+          missing=$(grep -rL 'SPDX-License-Identifier: GPL-3.0-or-later' --include='*.go' . || true)
+          if [ -n "$missing" ]; then
+            echo "missing or wrong SPDX header:" >&2
+            echo "$missing" >&2
+            exit 1
+          fi
+          echo "all .go files carry the SPDX header"

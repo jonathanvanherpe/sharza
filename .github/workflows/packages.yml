@@ -1,0 +1,66 @@
+name: packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0~dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "building version $version from ${GITHUB_SHA::12}"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          COMMIT: ${{ steps.v.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-s -w"
+          ldflags="$ldflags -X github.com/jonathanvanherpe/sharza/internal/version.Version=$VERSION"
+          ldflags="$ldflags -X github.com/jonathanvanherpe/sharza/internal/version.Commit=$COMMIT"
+          go build -trimpath -ldflags "$ldflags" -o dist/sharzad ./cmd/sharzad
+          go build -trimpath -ldflags "$ldflags" -o dist/sharza-ctl ./cmd/sharza-ctl
+
+      - name: Build .deb
+        run: packaging/deb/build-deb.sh "${{ steps.v.outputs.version }}" amd64 dist dist
+
+      - name: Show the package
+        run: |
+          dpkg-deb -I dist/*.deb
+          dpkg-deb -c dist/*.deb
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sharza-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
