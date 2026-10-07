@@ -52,6 +52,20 @@ every process-level test skip, and **a skip reads as a pass in a CI log**. A
 suite that silently stops testing because it cannot find the compiler is
 indistinguishable from a suite that is green.
 
+### The `sharza-ctl` half of the P0 exit gate is now demonstrated
+
+`internal/supervisor/ctl_test.go` builds `cmd/sharza-ctl` once (mirroring
+`buildDaemon`) and runs the real binary against a real supervisor over its UDS.
+`TestSharzaCtlAnswersOverUDS` asserts status (pid, role, schema), `-json
+status`, add, jobs, pause and resume from stdout and the exit code;
+`TestSharzaCtlReportsUnavailableDaemon` asserts the non-zero exit and the
+`is sharzad running?` hint when no daemon is there.
+
+The assertions were checked against a deliberate mutation: making the client
+dial a bogus socket turned `TestSharzaCtlAnswersOverUDS` red (a dial error,
+not a compile error), then was reverted. A CLI test that passes with the socket
+path ignored would have been worse than none.
+
 ## Open questions
 
 ### The process-level orphan test was vacuous, and is now not
@@ -71,12 +85,6 @@ The worker now also asserts that the pid the supervisor *reports* is the pid in
 the fixture's pidfile. An earlier version of this test started its own copy of
 the fake worker to read pids from, and consequently failed against correct code
 for the reason that `Stop` had never heard of it.
-
-### The `sharza-ctl` half of the P0 exit gate is still undemonstrated
-
-`docs/ROADMAP.md` gates P0 on "RPC answers over UDS from `sharza-ctl`". This
-cycle covered the supervisor lifecycle. `sharza-ctl` is not exercised by these
-tests, so that bullet is not yet fully met.
 
 ### The tests build `sharzad` with `go build` per suite, not per test
 

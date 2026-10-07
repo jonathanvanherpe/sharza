@@ -122,6 +122,11 @@ func TestMain(m *testing.M) {
 	if daemonDir != "" {
 		_ = os.RemoveAll(daemonDir)
 	}
+	// ctlDir is owned by ctl_test.go's buildCtl; the shared TestMain is the
+	// only hook that runs after every test in the package.
+	if ctlDir != "" {
+		_ = os.RemoveAll(ctlDir)
+	}
 	os.Exit(code)
 }
 
