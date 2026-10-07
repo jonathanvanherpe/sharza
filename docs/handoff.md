@@ -66,6 +66,35 @@ dial a bogus socket turned `TestSharzaCtlAnswersOverUDS` red (a dial error,
 not a compile error), then was reverted. A CLI test that passes with the socket
 path ignored would have been worse than none.
 
+### The Gnutella handshake brief contradicts the published wire format
+
+The task brief for the P1 Gnutella handshake item specified `PUSH 0x03` and a
+big-endian 4-byte payload length. Both conflict with the published protocol
+(the annotated 0.4 spec at rfc-gnutella.sourceforge.net and the 0.6 RFC
+draft): payload types are `0x00 Ping, 0x01 Pong, 0x02 Bye, 0x40 Push, 0x80
+Query, 0x81 QueryHit`, and every multi-byte message field is little-endian
+("All fields ... are in little-endian byte order unless otherwise specified"),
+IPv4 addresses being the exception.
+
+`internal/engine/gnutella` implements the published values: `MsgPush = 0x40`,
+length decoded little-endian, PONG payload port little-endian with the IPv4
+address big-endian. With the brief's values the engine could not have
+connected to any real node, which is this item's whole acceptance gate, so
+there was no honest way to follow the brief here: real peers (gtk-gnutella,
+LimeWire, Shareaza) speak the spec, not the brief. The brief's
+`x-gnutella-network` header extraction is still implemented (case-insensitive,
+as `Handshake.Network()`), even though the header appears in neither RFC.
+
+A second, subtler divergence: the 0.6 draft would have PONG replies handled by
+the pong-caching scheme (TTL + Hops = 7, and no reply to a PING with TTL 0),
+while the brief pins an observable "PONG for each PING with TTL decremented"
+and a drop-at-zero rule. The brief's contract is implemented, because it is
+what the tests can hold the daemon to on a direct link; it is dead-simple and
+correct for the one-hop case the engine actually has, and the drop-at-zero
+rule is what stops TTL-minus-one replies from being answered in a loop. The
+trade is recorded in `peer.go` and covered by mutation-tested tests (TTL
+decrement, GUID echo, and the TTL-0 drop each go red when removed).
+
 ## Open questions
 
 ### The process-level orphan test was vacuous, and is now not
@@ -100,3 +129,25 @@ at which point differential testing against a known-good client should be
 part of the exit gate rather than an afterthought. With the 2026-10-07
 reorder, P1 is Gnutella/Gnutella2, so gtk-gnutella is the first oracle
 needed.
+
+### The gtk-gnutella oracle check for the P1 handshake was **SKIPPED, not passed**
+
+The engine's `gnutella_peers`/`gnutella_listen` config exists so a two-client
+loop (sharzad vs gtk-gnutella) is a config change away, but the check itself
+did not run: gtk-gnutella is not installed, and this environment has no root
+and denies `sudo`, so `apt-get install` cannot happen here. Nothing above
+claims oracle verification; the handshake and PING/PONG are verified against
+scripted Go peers over real TCP (including the 0.4-refusal path), and the wire
+format follows the published spec so the oracle loop should work when a
+maintainer runs it on a host with root. Do not read this as a pass. The
+engine's behaviour on an unsupported 0.4 CONNECT is a 503 refusal, which is
+deliberate: 0.6 backward compatibility was decided out of scope.
+
+### PONG replies use "request TTL minus one", not the 0.6 pong-caching policy
+
+See the resolved entry above: the brief's observable contract
+(TTL decremented, drop at zero) is what the engine implements, and the tests
+pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
+with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
+before anything resembling routing or horizon logic lands. The mutation tests
+would then need updating in the same change.

@@ -307,3 +307,122 @@ func TestEnsureDirsCreatesBoth(t *testing.T) {
 		}
 	}
 }
+
+// The Gnutella engine is new, so it must be off unless explicitly asked
+// for: a worker that silently does nothing while looking enabled is how
+// a P2P daemon ships a hole.
+func TestGnutellaDefaultsToDisabled(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	if c.GnutellaEnabled {
+		t.Error("Default().GnutellaEnabled = true, want false")
+	}
+	if c.GnutellaListen != "0.0.0.0:6346" {
+		t.Errorf("default gnutella_listen = %q, want 0.0.0.0:6346", c.GnutellaListen)
+	}
+	if len(c.GnutellaPeers) != 0 {
+		t.Errorf("default gnutella_peers = %v, want empty", c.GnutellaPeers)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Default().Validate() = %v, want nil", err)
+	}
+}
+
+func TestGnutellaListenValidation(t *testing.T) {
+	t.Parallel()
+	for _, ok := range []string{
+		"0.0.0.0:6346",
+		"127.0.0.1:0",
+		":6346",
+		"localhost:6346",
+		"[::1]:6346",
+	} {
+		c := &Config{StateDir: t.TempDir(), GnutellaListen: ok}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("gnutella_listen %q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"6346",          // no host part
+		"1.2.3.4",       // no port
+		"1.2.3.4:99999", // port out of range
+		"1.2.3.4:http",  // non-numeric port
+		"1.2.3.4:-5",    // negative port
+	} {
+		c := &Config{StateDir: t.TempDir(), GnutellaListen: bad}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("gnutella_listen %q was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "gnutella_listen") {
+			t.Errorf("gnutella_listen %q error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+// A peer address without a host is unusable: the engine would dial
+// ":6346" and fail forever.
+func TestGnutellaPeersValidation(t *testing.T) {
+	t.Parallel()
+	for _, ok := range []string{"127.0.0.1:6346", "oracle.example.org:6346", "[::1]:6346"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaPeers: []string{ok}}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("gnutella_peers [%q] rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{":6346", "1.2.3.4", "127.0.0.1:70000"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaPeers: []string{bad}}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("gnutella_peers [%q] was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "gnutella_peers") {
+			t.Errorf("gnutella_peers [%q] error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+// Validation runs while the engine is disabled too: flipping
+// gnutella_enabled later must not turn a running daemon's worker into a
+// crash-at-startup loop over a typo.
+func TestGnutellaAddressesValidatedWhileDisabled(t *testing.T) {
+	t.Parallel()
+	c := &Config{StateDir: t.TempDir(), GnutellaListen: "127.0.0.1:notaport", GnutellaPeers: []string{"nohost:6346"}}
+	c.applyDefaults()
+	if err := c.Validate(); err == nil {
+		t.Error("bad gnutella addresses accepted with gnutella_enabled false, want rejection")
+	}
+}
+
+func TestLoadReadsGnutellaSettings(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{
+  "state_dir": "/tmp/sharza-test-state",
+  "gnutella_enabled": true,
+  "gnutella_listen": "127.0.0.1:6348",
+  "gnutella_peers": ["127.0.0.1:6346", "10.0.0.9:6346"]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.GnutellaEnabled {
+		t.Error("gnutella_enabled = false, want true")
+	}
+	if c.GnutellaListen != "127.0.0.1:6348" {
+		t.Errorf("gnutella_listen = %q, want 127.0.0.1:6348", c.GnutellaListen)
+	}
+	if len(c.GnutellaPeers) != 2 || c.GnutellaPeers[1] != "10.0.0.9:6346" {
+		t.Errorf("gnutella_peers = %v, want both addresses", c.GnutellaPeers)
+	}
+}

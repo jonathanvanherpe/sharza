@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jonathanvanherpe/sharza/internal/config"
+	"github.com/jonathanvanherpe/sharza/internal/engine/gnutella"
 	"github.com/jonathanvanherpe/sharza/internal/logring"
 	"github.com/jonathanvanherpe/sharza/internal/role"
 	"github.com/jonathanvanherpe/sharza/internal/rpc"
@@ -161,9 +162,30 @@ func runWorker(ctx context.Context, r role.Role, cfgPath string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "sharzad: %s worker pid=%d\n", r, os.Getpid())
-	<-ctx.Done()
+	if err := runWorkerRole(ctx, r, cfg); err != nil {
+		return fmt.Errorf("%s worker: %w", r, err)
+	}
 	fmt.Fprintf(os.Stderr, "sharzad: %s worker stopped\n", r)
 	return nil
+}
+
+// runWorkerRole runs the network engine for a worker role. Roles without
+// an engine idles until the context ends: alive and quiet is exactly
+// what the supervisor expects of an enabled-but-unimplemented role.
+func runWorkerRole(ctx context.Context, r role.Role, cfg *config.Config) error {
+	if r != role.G2 {
+		<-ctx.Done()
+		return nil
+	}
+	if !cfg.GnutellaEnabled {
+		fmt.Fprintln(os.Stderr, "sharzad: gnutella disabled")
+		<-ctx.Done()
+		return nil
+	}
+	return gnutella.New().Run(ctx, gnutella.Options{
+		Listen: cfg.GnutellaListen,
+		Peers:  cfg.GnutellaPeers,
+	})
 }
 
 func awaitSupervisor(ctx context.Context, cfg *config.Config) error {

@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +61,20 @@ type Config struct {
 	// DownloadDir is where completed files land.
 	DownloadDir string `json:"download_dir"`
 
+	// GnutellaEnabled turns the g2 worker's Gnutella engine on. The
+	// engine is new, so it defaults to off and reports "gnutella
+	// disabled" rather than appearing to work while silent.
+	GnutellaEnabled bool `json:"gnutella_enabled"`
+
+	// GnutellaListen is the address the Gnutella engine accepts
+	// connections on. 6346 is the conventional Gnutella port; the web
+	// UI default sits one above it.
+	GnutellaListen string `json:"gnutella_listen"`
+
+	// GnutellaPeers lists host:port addresses the engine dials and
+	// keeps connected, for pairing with an oracle node or a seeder.
+	GnutellaPeers []string `json:"gnutella_peers"`
+
 	// ConfigPath records where this Config was loaded from, so a worker
 	// can be spawned against the same file. Empty means built-in
 	// defaults. Not serialised: it describes where we came from, not
@@ -96,6 +112,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DownloadDir == "" {
 		c.DownloadDir = filepath.Join(c.StateDir, "downloads")
+	}
+	if c.GnutellaListen == "" {
+		c.GnutellaListen = "0.0.0.0:6346"
 	}
 }
 
@@ -176,6 +195,36 @@ func (c *Config) Validate() error {
 				"since the delay is what stops a worker that fails at startup from spinning the CPU",
 				c.WorkerRestartDelay, d)
 		}
+	}
+	// Gnutella addresses are validated even while the engine is
+	// disabled: flipping gnutella_enabled later must not turn a
+	// long-running daemon into a worker that dies at startup over a
+	// mistyped address.
+	if err := validateAddr("gnutella_listen", c.GnutellaListen, false); err != nil {
+		return err
+	}
+	for i, addr := range c.GnutellaPeers {
+		if err := validateAddr(fmt.Sprintf("gnutella_peers[%d]", i), addr, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAddr checks a host:port value. A port of 0 is allowed (it
+// means "pick one", which tests use); a peer address without a host is
+// unusable, so requireHost rejects it.
+func validateAddr(field, addr string, requireHost bool) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s %q is not host:port: %w", field, addr, err)
+	}
+	if requireHost && host == "" {
+		return fmt.Errorf("%s %q has no host address", field, addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("%s %q has a port of %q, not a number in 0..65535", field, addr, port)
 	}
 	return nil
 }
