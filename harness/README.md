@@ -43,16 +43,26 @@ hardcoding a list, because ids and availability change.
 | tier | tools | candidates |
 | --- | --- | --- |
 | `strong` | yes | `opencode/big-pickle`, then Gemini flash/pro |
-| `fast` | yes | older Gemini flash, free OpenCode models |
+| `fast` | yes | free OpenCode models, then older Gemini flash |
 | `local-weak` | **no** | Ollama models |
+
+Which tier is tried first depends on the brief. `classifyDifficulty()` scores
+each brief as `easy` or `normal` with a bias toward `normal`: an `easy` cycle
+starts at `fast`, a `normal` one starts at `strong`, and both climb only when
+the preferred tier is unreachable. The classifier is deliberately conservative
+and can be overridden with `SHARZA_DIFFICULTY=easy|normal`.
 
 `local-weak` is marked tool-free on purpose. The local models are weak at tool
 use and will report having edited files they never touched. Handing one an
-edit task produces a confident, broken result.
+edit task produces a confident, broken result; it is only ever selected for
+work routed with `needsTools: false`, where it is preferred because it is free.
 
 There is no spending cap. Quota is a rate limit to ride, not a budget to
 enforce; on a 429 or equivalent the model goes into a 30-minute cooldown in
-`harness/.state/cooldowns.json` and the next cycle routes around it.
+`harness/.state/cooldowns.json` and the next cycle routes around it. The cycle
+records that cooldown itself: when a build run fails, `reportCooldown()` scans
+the run's stderr and the tail of stdout (opencode reports provider errors as
+JSON events there) and writes the entry if the failure looks quota-shaped.
 
 ## Permissions
 

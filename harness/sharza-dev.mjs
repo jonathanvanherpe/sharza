@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { notify, sleep } from "./ntfy.mjs";
-import { route, reportCooldown, cooledDown } from "./router.mjs";
+import { route, reportCooldown, cooledDown, classifyDifficulty } from "./router.mjs";
 
 const exec = promisify(execFile);
 
@@ -355,9 +355,12 @@ async function main(argv) {
   }
   git(["checkout", "-B", branch, base]);
 
-  // 3. Route and run.
+  // 3. Route and run. The brief's difficulty decides which tier is tried
+  //    first: easy work starts cheap, normal work starts strong. A model that
+  //    rate-limits is recorded below so the next cycle routes around it.
   const exclude = await cooledDown();
-  const chosen = await route({ needsTools: true, exclude });
+  const difficulty = classifyDifficulty(task);
+  const chosen = await route({ needsTools: true, difficulty, exclude });
   if (!chosen.available) {
     await notify(
       `No reachable model with working tool use. ${chosen.reason}`,
@@ -366,7 +369,7 @@ async function main(argv) {
     console.error(chosen.reason);
     return 1;
   }
-  console.log(`model: ${chosen.model} (${chosen.tier}) - ${chosen.reason}\n`);
+  console.log(`model: ${chosen.model} (${chosen.tier}, ${difficulty} task) - ${chosen.reason}\n`);
 
   const run = await runAgent({
     model: chosen.model,
@@ -409,6 +412,19 @@ async function main(argv) {
     reasons.push(
       `agent exited ${run.exitCode ?? "by signal"}${run.stderr ? `: ${run.stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`,
     );
+
+    // Ride the quota, do not just fail against it: if the run died on a 429
+    // or equivalent, record the model so the next cycle skips it. The tail of
+    // stdout is included because opencode reports provider errors as JSON
+    // events there, not on stderr.
+    const cooled = await reportCooldown(chosen.model, {
+      stderr: run.stderr,
+      stdout: run.stdout.slice(-8_000),
+    });
+    if (cooled) {
+      console.log(`${chosen.model} looks rate-limited; recorded a 30m cooldown`);
+      reasons.push(`cooldown recorded for ${chosen.model}`);
+    }
   }
   if (failed.length > 0) {
     reasons.push(`verify failed: ${failed.map((f) => f.label).join(", ")}`);
