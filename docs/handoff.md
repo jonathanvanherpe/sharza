@@ -94,7 +94,9 @@ the daemon source changes mid-run.
 
 ### No oracle clients yet
 
-No protocol engine exists, so nothing is compared against `amuled` or
-`qBittorrent`. That becomes a real gap the moment P1 lands, at which point
-differential testing against a known-good client should be part of the exit
-gate rather than an afterthought.
+No protocol engine exists, so nothing is compared against `amuled`,
+`qBittorrent` or `gtk-gnutella`. That becomes a real gap the moment P1 lands,
+at which point differential testing against a known-good client should be
+part of the exit gate rather than an afterthought. With the 2026-10-07
+reorder, P1 is Gnutella/Gnutella2, so gtk-gnutella is the first oracle
+needed.

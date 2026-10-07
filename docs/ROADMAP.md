@@ -1,10 +1,16 @@
 # Sharza Roadmap
 
-Phases are ordered by **verifiability**, not by importance. A protocol can
-only be developed safely if there is something to test it against, so the
-networks with live populations and reference clients come first. Gnutella
-ships last despite being the most sentimental part of the project, because
-its protocol can be correct and still have nobody to talk to.
+Phases are ordered by maintainer priority, balanced against verifiability.
+Gnutella/Gnutella2 is deliberately first: it is the project's origin — Sharza
+is the Shareaza successor — and its honest risk, a small live population, is
+accepted rather than a blocker. Stage two and three of the engines follow
+(BitTorrent, then eDonkey2000/Kad), with cross-network swarming once two
+block-mapped engines exist to race against each other.
+
+Every protocol phase still needs something to test against. The references
+are: the g2.doxu.org specification read alongside Shareaza's implementation
+for Gnutella/G2, gtk-gnutella as oracle, qBittorrent or Transmission for
+BitTorrent, and amuled for eDonkey.
 
 Each phase lists an exit gate. A phase is done when its gate passes, not when
 its code compiles.
@@ -21,7 +27,11 @@ Categories held behind a human gate:
 - SQLite schema migrations
 - anything that changes the RPC surface (clients depend on it)
 
-Everything else is safe for the build harness to do unattended.
+Settled decisions from the maintainer (2026-10-07): the BitTorrent engine may
+use `anacrolix/torrent` (MPL-2.0) behind the existing `internal/engine/bt`
+clean boundary — **use a library until it limits what we can do**. Gnutella/G2
+has no usable library, so it is hand-rolled from the G2 spec and Shareaza
+reference from the start.
 
 ---
 
@@ -46,22 +56,33 @@ leaves the supervisor and other workers healthy.
 
 ---
 
-## P1 — BitTorrent
+## P1 — Gnutella and Gnutella2
 
 `human-gate: false`
 
-Real downloads. First protocol with a live population, so it validates the
-whole pipeline end to end early.
+The first real engine, and the project's origin. Reference material is the
+g2.doxu.org specification read alongside Shareaza's implementation.
 
-- `internal/engine/bt` on `anacrolix/torrent`
-- magnet and `.torrent` handling, save/resume, recheck
-- rate limits, per-job and global
-- full job list, add, pause, resume, remove in web UI and CLI
-- differential test against qBittorrent or Transmission on a local swarm
+- Gnutella 0.6: handshake, ping/pong, query routing, push, browse, download
+- Gnutella2: tree packet codec, UDP transceiver, hub topology, query hash
+  tables, `PART` completeness advertisement
+- HTTP transfer layer for G2, and honest reporting of partial availability
+- differential test against gtk-gnutella
+- explicit **unverified job** state where a job is Gnutella-only
+- full job list, add, pause, resume, remove in web UI and CLI against a real
+  engine (this is the first phase the UI controls something real)
 
-**Exit gate:** a torrent downloads to completion with verified pieces,
-survives a daemon restart with no re-download, and completes a differential
-exchange against the oracle.
+**Exit gate:** connects to at least one real Gnutella node, completes a
+search and a download, exchanges blocks with gtk-gnutella, and the
+unverified state is visible in the UI when no verifiable source exists.
+
+**Honest risk:** swarm population may be too small for the last gate to pass.
+That is an accepted outcome, not a blocker.
+
+**Do not build a G2 block mapper.** Shareaza's G2 has no fractional-transfer
+header; see the correction in `docs/ARCHITECTURE.md`. G2 is a whole-file
+source, not a block-mapped engine. Scope creep here would be building a
+LimeWire-only extension no live peer will use.
 
 ---
 
@@ -82,21 +103,23 @@ host interface; the web UI stays reachable throughout both.
 
 ---
 
-## P3 — Cross-network swarming, Level 1
+## P3 — BitTorrent
 
 `human-gate: false`
 
-Parallel race across engines over a shared verified block store. Most of the
-practical value of swarming is here, and it forces the eDonkey engine.
+Second real engine. `internal/engine/bt` wraps `anacrolix/torrent` (MPL-2.0,
+maintainer-approved) behind the existing clean boundary. The choice is
+provisional per the settled policy: use the library until it limits what we
+can do, then fork or hand-roll what it cannot express.
 
-- canonical block map, default 1 MiB
-- block scheduler with lease accounting
-- verified block store, per-network verification
-- range mapping for BitTorrent pieces
-- sample-based source matching, name/size plus head/tail comparison
+- magnet and `.torrent` handling, save/resume, recheck
+- rate limits, per-job and global
+- verified piece checksums against the job's hash
+- differential test against qBittorrent or Transmission on a local swarm
 
-**Exit gate:** one file requested via two networks completes faster than
-either network alone, with no duplicate fetching and every block verified.
+**Exit gate:** a torrent downloads to completion with verified pieces,
+survives a daemon restart with no re-download, and completes a differential
+exchange against the oracle.
 
 ---
 
@@ -119,31 +142,22 @@ against its `.part.met`, and exchanges data with `amuled` on a local netns.
 
 ---
 
-## P5 — Gnutella and Gnutella2
+## P5 — Cross-network swarming, Level 1
 
 `human-gate: false`
 
-Feature-flagged and off by default. Reference material is the g2.doxu.org
-specification read alongside Shareaza's implementation.
+Parallel race across the two block-mapped engines (BitTorrent and
+eDonkey2000) over a shared verified block store. Gnutella/G2 joins as a
+whole-file source. Most of the practical value of swarming is here.
 
-- Gnutella 0.6: handshake, ping/pong, query routing, push, browse, download
-- Gnutella2: tree packet codec, UDP transceiver, hub topology, query hash
-  tables, `PART` completeness advertisement
-- HTTP transfer layer for G2, and honest reporting of partial availability
-- differential test against gtk-gnutella
-- explicit **unverified job** state where a job is Gnutella-only
+- canonical block map, default 1 MiB
+- block scheduler with lease accounting
+- verified block store, per-network verification
+- range mapping for BitTorrent pieces
+- sample-based source matching, name/size plus head/tail comparison
 
-**Exit gate:** connects to at least one real Gnutella node, completes a
-search and a download, exchanges blocks with gtk-gnutella, and the
-unverified state is visible in the UI when no verifiable source exists.
-
-**Honest risk:** swarm population may be too small for the last gate to pass.
-That is an accepted outcome, not a blocker; it is why the phase is flagged.
-
-**Do not build a G2 block mapper.** Shareaza's G2 has no fractional-transfer
-header; see the correction in `docs/ARCHITECTURE.md`. G2 is a whole-file
-source, not a block-mapped engine. Scope creep here would be building a
-LimeWire-only extension no live peer will use.
+**Exit gate:** one file requested via two networks completes faster than
+either network alone, with no duplicate fetching and every block verified.
 
 ---
 
