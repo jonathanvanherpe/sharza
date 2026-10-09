@@ -95,7 +95,93 @@ rule is what stops TTL-minus-one replies from being answered in a loop. The
 trade is recorded in `peer.go` and covered by mutation-tested tests (TTL
 decrement, GUID echo, and the TTL-0 drop each go red when removed).
 
+### Gnutella bootstrap: GWebCache client, and the caches still alive in 2026
+
+P1's loose end was that a daemon only ever dialed what the operator typed.
+`internal/engine/gnutella/webcache.go` now fetches a GWebCache URL and feeds
+the addresses into the same per-peer dial goroutine the configured
+`gnutella_peers` use, so backoff and retry behaviour are identical whichever
+source named the host, and an address named twice (by config and a cache, or
+by two caches) gets exactly one loop. Config is `gnutella_caches`, validated
+like `gnutella_peers`.
+
+**The 2017-era webcache network is still partially alive.** Verified by
+curl on 2026-10-09 (fetch only, no dial — the swarm is near-empty in 2026, so
+the dial side is covered by the httptest-backed
+`TestEngineDialsCacheFetchedPeer` instead). All four answered with host
+lists when the parameterised form was used, and all four were re-checked
+with the `Sharza/<version>` User-Agent the client sends:
+
+| URL that works | bare GET | `?client=0.1.0.0+Sharza&get=1&net=gnutella2` |
+| --- | --- | --- |
+| `http://midian.jayl.de/g2/gwc.php` | XHTML "upgrade your browser" error page | 16 `H|` hosts, `U|` and `I|` lines |
+| `http://cache.jayl.de/g2/gwc.php` | same error page | hosts |
+| `http://gweb3.4octets.co.uk/gwc.php` | same error page | hosts |
+| `http://dkac.trillinux.org/dkac/dkac.php/` | "This is DKAC/Enticing-Enumon" banner | hosts, as lowercase `h|` |
+
+Three findings from that smoke test, all now handled or recorded:
+
+- **The paths matter.** `dkac.trillinux.org` and `gweb3.4octets.co.uk` at
+  their roots are a parked page and a 301 respectively; the working paths
+  are the ones their `U|` lines advertise. Worse, Go's redirect handling
+  follows the 301 to `/gwc.php` *without* re-attaching the query, so
+  configuring the root URL of gweb3 silently yields zero hosts. Configure
+  the direct path.
+- **Line types are not consistently cased.** DKAC serves `h|` where the
+  others serve `H|`, so `parseCacheBody` matches the type
+  case-insensitively (Shareaza matches `i|` case-insensitively too).
+- **`I|` lines are not always three fields.** Beacon Cache sends
+  `I|access|period|33`, which Shareaza reads as the access period. The
+  parser keeps everything between the first and last pipe as Key
+  (`access|period`) and the last field as Value (`33`), so the three-field
+  form from the brief parses as written and nothing is lost on the
+  four-field one.
+
+Two request shapes exist: the older caches serve the bare list on GET,
+while the gweb3/4octets and Beacon families only answer
+`?client=<4>+<ver>&get=1&net=<net>`. The client issues each shape exactly
+once (no retry loop — retries live in the engine's dial loops) and uses
+whichever yields more `H|` lines. The `+` in the client parameter is sent
+literally rather than as `%2B`, because those caches split their query
+strings naively.
+
+The host filter drops malformed/out-of-range `host:port`, unspecified
+addresses (`0.0.0.0`, `::`) and loopback addresses (`127.0.0.1`, `::1`,
+`localhost`). `U|` URLs are parsed and kept but not yet polled, and `I|`
+values (e.g. `AccessPeriod`) are logged and kept but nothing paces on them
+yet.
+
 ## Open questions
+
+### Should the daemon ship default `gnutella_caches`?
+
+The field defaults to empty, so bootstrap only happens when the operator
+lists a cache. The four caches above are known alive as of 2026-10-09 and
+could be the default (zero-config bootstrap, which is the point of the item),
+but defaults that start network traffic are a maintainer decision: they make
+a fresh daemon phone home to third-party 2017-era servers on first start,
+and someone has to own keeping that list honest as those caches die.
+
+### Loopback filtering vs the engine test seam
+
+`FetchHosts` drops loopback addresses as a policy for untrusted cache
+content, but the mandated engine test points a cache at a loopback listener
+(and a test may not reach the network). The compromise is the unexported
+`Options.cacheAllowLoopback` field: production code never sets it, only the
+in-package test does. If that seam is unwelcome, the alternatives are a
+test-only accessor or letting the engine dial loopback from caches at all —
+the second would weaken the filter for no production gain, since no live
+cache has a reason to hand out `127.0.0.1`.
+
+### Bootstrap scope deliberately not taken
+
+Out of scope for this item, each its own piece of work: polling the `U|`
+cache URLs the fetches return, pacing on the `I|` values, persisting fetched
+hosts to the store (a restart re-fetches instead), submitting our own
+address to a cache, the UDP host cache (`uhc:`), and G2 discovery via the
+KHL / `ukhl:` packets. Only `net=gnutella2` is requested from caches that
+need the parameter; whether a second `net=gnutella` fetch is worth it for
+G1-only caches is untested against a real one.
 
 ### The process-level orphan test was vacuous, and is now not
 

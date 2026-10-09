@@ -426,3 +426,62 @@ func TestLoadReadsGnutellaSettings(t *testing.T) {
 		t.Errorf("gnutella_peers = %v, want both addresses", c.GnutellaPeers)
 	}
 }
+
+// A webcache URL that is not an http(s) URL with a host would fail at
+// the engine's first fetch, so it is caught here like gnutella_peers
+// is: even while the engine is disabled.
+func TestGnutellaCachesValidation(t *testing.T) {
+	t.Parallel()
+	if n := len(Default().GnutellaCaches); n != 0 {
+		t.Errorf("default gnutella_caches = %d entries, want none (no surprise network I/O)", n)
+	}
+	for _, ok := range []string{
+		"http://dkac.trillinux.org/",
+		"https://gweb3.4octets.co.uk/gwebcache/gwebcache2.php",
+		"http://midian.jayl.de/g2/gwc.php?foo=bar",
+	} {
+		c := &Config{StateDir: t.TempDir(), GnutellaCaches: []string{ok}}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("gnutella_caches [%q] rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"",
+		"example.org/gwc.php", // no scheme
+		"ftp://example.org/gwc.php",
+		"http://", // no host
+	} {
+		c := &Config{StateDir: t.TempDir(), GnutellaCaches: []string{bad}}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("gnutella_caches [%q] was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "gnutella_caches") {
+			t.Errorf("gnutella_caches [%q] error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+// The JSON key must round-trip: Load uses DisallowUnknownFields, so a
+// stale tag would reject a config file that spells the key correctly.
+func TestLoadReadsGnutellaCaches(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{
+  "state_dir": "/tmp/sharza-test-state",
+  "gnutella_caches": ["http://cache.example.org/gwc.php"]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.GnutellaCaches) != 1 || c.GnutellaCaches[0] != "http://cache.example.org/gwc.php" {
+		t.Errorf("gnutella_caches = %v, want the one URL", c.GnutellaCaches)
+	}
+}

@@ -40,6 +40,21 @@ type Options struct {
 	// Peers lists host:port addresses to dial and keep connected.
 	Peers []string
 
+	// Caches lists GWebCache URLs queried once at Run start. Every
+	// host a cache returns is fed into the same dial machinery as
+	// Peers, so a fresh daemon can find peers without an operator
+	// maintaining a gnutella_peers list by hand. A cache that fails
+	// is logged and skipped; it never stops the engine.
+	Caches []string
+
+	// cacheAllowLoopback relaxes the webcache host filter so that a
+	// loopback address from a cache is kept. Production never sets it:
+	// a cache handing out 127.0.0.1 is either broken or pointing us at
+	// a local service, and the swarm we want is out on the network.
+	// Tests set it to point a cache at a listener on 127.0.0.1, since
+	// a test may not reach anything else.
+	cacheAllowLoopback bool
+
 	// KeepAliveInterval is how often a silent connection receives an
 	// empty PING. Zero means the default 90 s.
 	KeepAliveInterval time.Duration
@@ -95,11 +110,20 @@ type Engine struct {
 	wg    sync.WaitGroup
 
 	peers map[*peerConn]struct{}
+
+	// dialed records every address a dial loop has been started for,
+	// so a host listed by both the config and a webcache (or by two
+	// caches) gets one loop, not two competing connections.
+	dialed map[string]struct{}
 }
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
-	return &Engine{ready: make(chan struct{}), peers: make(map[*peerConn]struct{})}
+	return &Engine{
+		ready:  make(chan struct{}),
+		peers:  make(map[*peerConn]struct{}),
+		dialed: make(map[string]struct{}),
+	}
 }
 
 // Ready is closed once Run has bound the listener. It never closes if
@@ -137,10 +161,17 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	close(e.ready)
 	logf := e.opts.Logf
 
-	logf("listening on %s (%d peer(s) configured)", ln.Addr(), len(e.opts.Peers))
+	logf("listening on %s (%d peer(s), %d cache(s) configured)",
+		ln.Addr(), len(e.opts.Peers), len(e.opts.Caches))
 	for _, addr := range e.opts.Peers {
+		e.startDial(ctx, addr)
+	}
+	// Caches are fetched concurrently with serving: a slow or dead
+	// webcache delays only its own hosts, never the listener, and the
+	// dial loops it discovers are the same ones a configured peer gets.
+	for _, cacheURL := range e.opts.Caches {
 		e.wg.Add(1)
-		go e.dialLoop(ctx, addr)
+		go e.cacheLoop(ctx, cacheURL)
 	}
 
 	// Closing the listener is how Accept is unblocked when the context
@@ -172,12 +203,68 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		}(conn, pc)
 	}
 
-	// The accept loop above adds the last goroutines; by the time it
-	// breaks (listener closed), every handler is counted, so Wait is
-	// safe from Add-after-Wait.
+	// Wait is safe from Add-after-Wait because every goroutine that
+	// can still Add is itself counted: the accept loop's handlers
+	// (added before this point), the dial loops started from Run, and
+	// the cache loops started from Run, whose startDial calls happen
+	// while their own count is still held.
 	e.wg.Wait()
 	logf("stopped")
 	return nil
+}
+
+// startDial starts the per-peer dial loop for addr exactly once.
+// Configured Peers and the hosts a webcache returns go through this one
+// path, so a dead node retries with the same dialBackoff whichever
+// source named it, and the same address never gets two loops fighting
+// over it.
+//
+// Every caller is either Run itself or a cacheLoop goroutine the
+// WaitGroup already counts, so the Add here is safe against Wait: the
+// counter is never zero while a caller is still running.
+func (e *Engine) startDial(ctx context.Context, addr string) {
+	e.mu.Lock()
+	if _, dup := e.dialed[addr]; dup {
+		e.mu.Unlock()
+		return
+	}
+	e.dialed[addr] = struct{}{}
+	e.mu.Unlock()
+
+	e.wg.Add(1)
+	go e.dialLoop(ctx, addr)
+}
+
+// cacheLoop fetches one webcache and hands every host it returns to
+// startDial. A failure is logged and dropped: the client does not retry
+// (the dial loops own retrying), and one bad cache must not stop the
+// engine or the other caches.
+func (e *Engine) cacheLoop(ctx context.Context, cacheURL string) {
+	defer e.wg.Done()
+	logf := e.opts.Logf
+
+	res, err := e.fetchCache(ctx, cacheURL)
+	if err != nil {
+		logf("cache %s: %v", cacheURL, err)
+		return
+	}
+	logf("cache %s: %d host(s), %d url(s)", cacheURL, len(res.Hosts), len(res.URLs))
+	for _, in := range res.Info {
+		// Kept (in res.Info) for pacing; nothing paces on them yet,
+		// so they are logged where an operator can see them.
+		logf("cache %s: %s=%s", cacheURL, in.Key, in.Value)
+	}
+	for _, h := range res.Hosts {
+		e.startDial(ctx, h.Addr)
+	}
+}
+
+// fetchCache is FetchHosts with the engine's loopback policy applied.
+func (e *Engine) fetchCache(ctx context.Context, cacheURL string) (CacheResult, error) {
+	if e.opts.cacheAllowLoopback {
+		return fetchHosts(ctx, cacheURL, true)
+	}
+	return FetchHosts(ctx, cacheURL)
 }
 
 // dialLoop keeps one outbound peer connected. It retries forever at

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,6 +75,11 @@ type Config struct {
 	// GnutellaPeers lists host:port addresses the engine dials and
 	// keeps connected, for pairing with an oracle node or a seeder.
 	GnutellaPeers []string `json:"gnutella_peers"`
+
+	// GnutellaCaches lists GWebCache URLs the engine queries once at
+	// startup for host addresses, so a fresh daemon can bootstrap
+	// without a hand-maintained peer list. Each must be an http(s) URL.
+	GnutellaCaches []string `json:"gnutella_caches"`
 
 	// ConfigPath records where this Config was loaded from, so a worker
 	// can be spawned against the same file. Empty means built-in
@@ -208,6 +214,13 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	// Same reasoning as the addresses above: a mistyped cache URL must
+	// be caught here, not by a worker that dies at its first fetch.
+	for i, cache := range c.GnutellaCaches {
+		if err := validateURL(fmt.Sprintf("gnutella_caches[%d]", i), cache); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -225,6 +238,26 @@ func validateAddr(field, addr string, requireHost bool) error {
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 0 || n > 65535 {
 		return fmt.Errorf("%s %q has a port of %q, not a number in 0..65535", field, addr, port)
+	}
+	return nil
+}
+
+// validateURL checks that a setting is an absolute http(s) URL with a
+// host: the GWebCache client only speaks those two schemes, and a value
+// with no scheme at all is a typo rather than a working cache.
+func validateURL(field, raw string) error {
+	if raw == "" {
+		return fmt.Errorf("%s is empty; each entry must be an http or https URL", field)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q is not a URL: %w", field, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s %q must be an http or https URL, got scheme %q", field, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s %q has no host", field, raw)
 	}
 	return nil
 }
