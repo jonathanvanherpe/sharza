@@ -161,8 +161,18 @@ func (p *peer) connect(r io.Reader) (io.Reader, error) {
 	}
 	if err := p.write(ConnectRequest(
 		Field{"Listen-IP", p.listenIPPort()},
-		Field{"Remote-IP", p.conn.RemoteAddr().String()},
+		Field{"Remote-IP", stripPort(p.conn.RemoteAddr().String())},
 		Field{"User-Agent", version.UserAgent()},
+		// Declare ourselves a leaf. gtk-gnutella classifies an
+		// incoming peer that sends neither X-Ultrapeer nor
+		// X-Ultrapeer-Needed as a "normal node" and refuses it
+		// ("403 Normal nodes refused") once its normal-node slots
+		// are full, which is what the live ultrapeers answered
+		// before these fields were sent. X-Ultrapeer-Needed is the
+		// BearShare-era equivalent and is sent too, as LimeWire
+		// leaves do.
+		Field{"X-Ultrapeer", "False"},
+		Field{"X-Ultrapeer-Needed", "True"},
 		// Offer to decode a compressed stream. The live 2026
 		// gtk-gnutella ultrapeers refuse a leaf that omits this
 		// ("403 Gnet connection not compressed") and compress their

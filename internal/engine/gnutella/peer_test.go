@@ -422,6 +422,19 @@ func TestOutboundDial(t *testing.T) {
 	if got, ok := hs.Get("Listen-IP"); !ok || !strings.Contains(got, ":") {
 		t.Errorf("client Listen-IP = %q (present=%v), want host:port", got, ok)
 	}
+	// A leaf must say so, or gtk-gnutella answers "403 Normal nodes
+	// refused" once its normal-node slots fill up.
+	if got, ok := hs.Get("X-Ultrapeer"); !ok || !strings.EqualFold(got, "false") {
+		t.Errorf("client X-Ultrapeer = %q (present=%v), want False", got, ok)
+	}
+	if got, ok := hs.Get("X-Ultrapeer-Needed"); !ok || !strings.EqualFold(got, "true") {
+		t.Errorf("client X-Ultrapeer-Needed = %q (present=%v), want True", got, ok)
+	}
+	// Remote-IP is an address, not address:port (the accept path
+	// strips the port; the dial path must too).
+	if got, ok := hs.Get("Remote-IP"); !ok || net.ParseIP(got) == nil {
+		t.Errorf("client Remote-IP = %q (present=%v), want a bare IP", got, ok)
+	}
 
 	if _, err := sconn.Write(OKReply(
 		Field{"Listen-IP", "127.0.0.1:6346"},

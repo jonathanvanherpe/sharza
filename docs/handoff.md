@@ -178,13 +178,33 @@ Verified against a live node on 2026-10-10: `sharzad` completed the 0.6
 handshake with `gtk-gnutella/1.3.1-dirty (2026-03-09; ...)` and then decoded
 and answered 1606 QUERY messages from its compressed stream over ~2 minutes
 with no errors -- the inflate path exercised by real traffic, not a scripted
-peer. The other probed ultrapeers refused with `403 Normal nodes refused` /
-`503 No X-Ultrapeer`; see the resolved note below.
+peer.
 
 A side observation, already known: the per-peer dial loop retries every
 `dialBackoff` (5s) forever, and against the tiny live swarm that earned `429
 Banned for 5m` from several nodes inside a minute. Graduated backoff is still
 open.
+
+### A leaf must say it is a leaf: `X-Ultrapeer: False`
+
+Once the gzip issue was gone, the rest of the swarm answered `403 Normal
+nodes refused` / `503 No X-Ultrapeer`. gtk-gnutella classifies an incoming
+peer that sends neither X-Ultrapeer nor X-Ultrapeer-Needed as a "normal
+node" (`nodes.c`, `NODE_A_NO_ULTRA`) and refuses it once its normal-node
+slots are full. The outbound CONNECT now sends `X-Ultrapeer: False` and
+`X-Ultrapeer-Needed: True` (the BearShare-era equivalent, sent together as
+LimeWire leaves do), which is the truthful claim: the engine is a leaf, it
+has no routing responsibilities.
+
+Re-run against the live swarm 2026-10-10: **7 of 7 configured
+gtk-gnutella 1.3.1 ultrapeers completed the handshake, all `compressed=true`
+(gtk-gnutella on Linux x86_64/i686, FreeBSD amd64, Windows x64), no decode
+errors.** Remaining refusals are server-side leaf-slot policy, not missing
+headers: `503 Not Good Leaf` (gtk-gnutella's leaf evaluation), `503 Shielded
+leaf node` (the net=gnutella2 population), `503 Too many leaf connections`,
+and one `429 Banned for 5m` from the 5s dial hammering. `Remote-IP` in the
+outbound CONNECT was also sending `addr:port`; it now strips the port like
+the accept path does.
 
 ## Open questions
 
