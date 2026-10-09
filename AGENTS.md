@@ -42,11 +42,15 @@ node harness/sharza-dev.mjs --status    # past cycles and model cooldowns
 The harness is strictly one-shot. It has no scheduler, no loop and no timer,
 so it will not start anything on its own.
 
-**Agents never merge to `main`.** Every cycle lands on an
-`agent/<task-id>` branch and the maintainer merges.
+**Agents may merge to `main`.** Every cycle lands on an `agent/<task-id>`
+branch; once the verify gate and any live check pass, the cycle may
+fast-forward it into `main` and push (`git merge --ff-only` from `main`,
+or `git push origin <branch>:main`). Fast-forward only — force pushes and
+`git reset --hard` stay blocked, so history is never rewritten.
 
-There is no git remote configured yet, so a cycle commits locally and cannot
-open a merge request. The harness says so rather than pretending otherwise.
+**`origin` is `git@github.com:jonathanvanherpe/sharza.git`.** The harness
+pushes its branch there after verification, and a cycle that ran entirely
+on the machine can do the same; the branch is mergeable as one click.
 
 **The agent's own report is not evidence.** The harness re-runs build, vet,
 test, the cgo-free build and the SPDX check itself, and refuses to commit when
