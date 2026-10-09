@@ -20,6 +20,7 @@ package gnutella
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,7 +34,7 @@ import (
 )
 
 const (
-	// cacheTimeout bounds one FetchHosts call, both requests together.
+	// cacheTimeout bounds one FetchHosts call, all requests together.
 	// The context is the real cancellation path; this exists so a cache
 	// that accepts a connection and then says nothing cannot hold the
 	// bootstrap goroutine (and with it engine shutdown) indefinitely.
@@ -49,19 +50,29 @@ const (
 	// third-party servers) could list tens of thousands of addresses
 	// and turn them into that many dial goroutines retrying every
 	// dialBackoff, each logging a failure. Real caches serve a few
-	// dozen hosts, so 64 never truncates an honest list.
+	// dozen hosts, so 64 never truncates an honest list. The bound is
+	// per response: one cache URL issues one request per request shape
+	// (fetchHosts), so its worst case is maxCacheHosts times the shape
+	// count -- still bounded, and the shapes carry different host
+	// populations that must not evict each other to stay under it.
 	maxCacheHosts = 64
 
 	// cacheClientID is the client= query parameter: a four-part version
 	// and the client name, which is the shape the gweb3/4octets family
 	// requires before it will answer at all.
 	cacheClientID = "0.1.0.0+Sharza"
-
-	// cacheNet is the network the parameterised form is asked for. This
-	// item only boots Gnutella hosts into the existing dial loop; the
-	// G2 KHL is a separate discovery path.
-	cacheNet = "gnutella2"
 )
+
+// cacheNets are the networks the parameterised request form asks for,
+// one request per network. The live 2026 caches answer per network,
+// with different populations behind each name: net=gnutella serves the
+// gtk-gnutella 1.3.1 ultrapeers that complete a handshake with us,
+// net=gnutella2 the Shareaza-family leaves that mostly shield
+// themselves with 503 but still exchange handshake headers. Both feed
+// the same dial loop, so both are fetched and merged; a cache that
+// knows only one errors on the other request, which counts as a failed
+// shape, not a failed cache.
+var cacheNets = []string{"gnutella", "gnutella2"}
 
 // CacheHost is one host:port a cache returned, with the line's third
 // field as Seen. Caches disagree on what that field is (a unix epoch,
@@ -94,9 +105,15 @@ type CacheResult struct {
 //
 // Two request shapes exist in the wild: the older caches serve the bare
 // list on GET, while the gweb3/4octets.co.uk family only answers
-// ?client=<4>+<ver>&get=1&net=<net>. Both are tried, once each, and the
-// response with the more usable H| lines wins; a tie keeps the bare
-// response. That is the whole retry policy: no loop, no second pass.
+// ?client=<4>+<ver>&get=1&net=<net> -- and that family answers per
+// network, with different hosts behind net=gnutella and net=gnutella2.
+// So the bare GET plus one parameterised GET per cacheNets entry are
+// tried, once each, and the parses are merged: hosts keep first-seen
+// order with the freshest Seen per address, URLs and info lines
+// deduplicate. A cache that errors on a shape it does not know (they
+// answer "ERROR Unsupported network" for a foreign net=) contributes
+// nothing from that shape. That is the whole retry policy: no loop, no
+// second pass.
 //
 // Unusable hosts are dropped: malformed or out-of-range host:port,
 // 0.0.0.0 and other unspecified addresses, and loopback addresses. A
@@ -116,25 +133,33 @@ func fetchHosts(ctx context.Context, rawURL string, allowLoopback bool) (CacheRe
 	ctx, cancel := context.WithTimeout(ctx, cacheTimeout)
 	defer cancel()
 
-	bare, bareErr := getCacheBody(ctx, rawURL)
-	param, paramErr := getCacheBody(ctx, paramURL(rawURL))
-
-	switch {
-	case bareErr == nil && paramErr == nil:
-		b := parseCacheBody(bare, allowLoopback)
-		p := parseCacheBody(param, allowLoopback)
-		if len(p.Hosts) > len(b.Hosts) {
-			return p, nil
-		}
-		return b, nil
-	case bareErr == nil:
-		return parseCacheBody(bare, allowLoopback), nil
-	case paramErr == nil:
-		return parseCacheBody(param, allowLoopback), nil
-	default:
-		return CacheResult{}, fmt.Errorf("gnutella: webcache %s: %w (parameterised: %v)",
-			rawURL, bareErr, paramErr)
+	// One request per shape, sequential and shared under one deadline:
+	// the bare list, then one parameterised request per cacheNets
+	// entry. Every successful parse merges into one result, and only a
+	// cache that fails every shape is an error.
+	var (
+		merged CacheResult
+		errs   []error
+		ok     int
+	)
+	reqs := make([]string, 0, 1+len(cacheNets))
+	reqs = append(reqs, rawURL)
+	for _, net := range cacheNets {
+		reqs = append(reqs, paramURL(rawURL, net))
 	}
+	for _, u := range reqs {
+		body, err := getCacheBody(ctx, u)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		ok++
+		mergeCacheResult(&merged, parseCacheBody(body, allowLoopback))
+	}
+	if ok == 0 {
+		return CacheResult{}, fmt.Errorf("gnutella: webcache %s: %w", rawURL, errors.Join(errs...))
+	}
+	return merged, nil
 }
 
 // checkCacheURL rejects anything that is not an absolute http(s) URL
@@ -155,8 +180,9 @@ func checkCacheURL(rawURL string) error {
 }
 
 // paramURL adds the query the gweb3/4octets family requires, preserving
-// any query the operator's URL already carries.
-func paramURL(rawURL string) string {
+// any query the operator's URL already carries. net is the network to
+// ask for; the caches answer with that network's hosts only.
+func paramURL(rawURL, net string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL // unreachable: fetchHosts checked it first
@@ -164,12 +190,58 @@ func paramURL(rawURL string) string {
 	q := u.Query()
 	q.Set("get", "1")
 	q.Set("client", cacheClientID)
-	q.Set("net", cacheNet)
+	q.Set("net", net)
 	// Encode would escape the '+' in client=<ver>+<name> to %2B. The
 	// 2002-era caches split their query strings naively and expect the
 	// literal '+', so send that.
 	u.RawQuery = strings.ReplaceAll(q.Encode(), "%2B", "+")
 	return u.String()
+}
+
+// mergeCacheResult folds src into dst. Hosts keep first-seen order
+// across responses with the freshest Seen kept per address; URLs and
+// info lines deduplicate. Parsing the same body under every request
+// shape (a cache that answers identically to all of them) therefore
+// merges back into a single copy.
+func mergeCacheResult(dst *CacheResult, src CacheResult) {
+	index := make(map[string]int, len(dst.Hosts))
+	for i, h := range dst.Hosts {
+		index[h.Addr] = i
+	}
+	for _, h := range src.Hosts {
+		if i, dup := index[h.Addr]; dup {
+			if h.Seen > dst.Hosts[i].Seen {
+				dst.Hosts[i].Seen = h.Seen
+			}
+			continue
+		}
+		index[h.Addr] = len(dst.Hosts)
+		dst.Hosts = append(dst.Hosts, h)
+	}
+
+	seenURL := make(map[string]bool, len(dst.URLs))
+	for _, u := range dst.URLs {
+		seenURL[u] = true
+	}
+	for _, u := range src.URLs {
+		if seenURL[u] {
+			continue
+		}
+		seenURL[u] = true
+		dst.URLs = append(dst.URLs, u)
+	}
+
+	seenInfo := make(map[CacheInfo]bool, len(dst.Info))
+	for _, in := range dst.Info {
+		seenInfo[in] = true
+	}
+	for _, in := range src.Info {
+		if seenInfo[in] {
+			continue
+		}
+		seenInfo[in] = true
+		dst.Info = append(dst.Info, in)
+	}
 }
 
 // getCacheBody performs exactly one GET and returns its body. One

@@ -151,6 +151,41 @@ addresses (`0.0.0.0`, `::`) and loopback addresses (`127.0.0.1`, `::1`,
 values (e.g. `AccessPeriod`) are logged and kept but nothing paces on them
 yet.
 
+### The live ultrapeers need `Accept-Encoding: deflate`, and the caches answer per network
+
+Dialing the real 2026 swarm (through the GWebCache client above, and
+directly) settled two things a scripted peer could not.
+
+**The ultrapeers are gtk-gnutella 1.3.1 (built 2026-03-09), and they refuse
+an uncompressed leaf link.** A CONNECT with no `Accept-Encoding` draws `403
+Gnet connection not compressed`; adding `Accept-Encoding: deflate` draws
+`200 OK` and a zlib-wrapped (RFC 1950) TX stream installed at handshake
+completion. `peer.go` now offers `deflate`, and `inflate.go` decodes the
+result, sniffing the first two bytes because HTTP's "deflate" is ambiguous
+between the zlib wrapper and a bare RFC 1951 stream. Our own TX stays
+uncompressed: the offer says what we read, not what we write. The mirror
+image is handled too -- a peer that declares `Content-Encoding: deflate` on
+the accept path (in its CONNECT or its confirmation; gtk-gnutella honours
+both) has its stream inflated from the first message on.
+
+**The live caches answer per network.** `net=gnutella` returns the
+gtk-gnutella ultrapeers that complete a handshake; `net=gnutella2` returns
+mostly Shielded Shareaza-family leaves that answer `503 Shielded leaf node`
+and refuse everything unsolicited. The lists are disjoint, so neither can be
+a "winner": both are fetched and merged (`cacheNets`, `mergeCacheResult`).
+
+Verified against a live node on 2026-10-10: `sharzad` completed the 0.6
+handshake with `gtk-gnutella/1.3.1-dirty (2026-03-09; ...)` and then decoded
+and answered 1606 QUERY messages from its compressed stream over ~2 minutes
+with no errors -- the inflate path exercised by real traffic, not a scripted
+peer. The other probed ultrapeers refused with `403 Normal nodes refused` /
+`503 No X-Ultrapeer`; see the resolved note below.
+
+A side observation, already known: the per-peer dial loop retries every
+`dialBackoff` (5s) forever, and against the tiny live swarm that earned `429
+Banned for 5m` from several nodes inside a minute. Graduated backoff is still
+open.
+
 ## Open questions
 
 ### Should the daemon ship default `gnutella_caches`?
@@ -179,9 +214,9 @@ Out of scope for this item, each its own piece of work: polling the `U|`
 cache URLs the fetches return, pacing on the `I|` values, persisting fetched
 hosts to the store (a restart re-fetches instead), submitting our own
 address to a cache, the UDP host cache (`uhc:`), and G2 discovery via the
-KHL / `ukhl:` packets. Only `net=gnutella2` is requested from caches that
-need the parameter; whether a second `net=gnutella` fetch is worth it for
-G1-only caches is untested against a real one.
+KHL / `ukhl:` packets. The `net=gnutella` fetch is now done as well and
+merged with `net=gnutella2` (the two live populations are disjoint; see the
+resolved entry above).
 
 ### The process-level orphan test was vacuous, and is now not
 
@@ -228,6 +263,16 @@ format follows the published spec so the oracle loop should work when a
 maintainer runs it on a host with root. Do not read this as a pass. The
 engine's behaviour on an unsupported 0.4 CONNECT is a 503 refusal, which is
 deliberate: 0.6 backward compatibility was decided out of scope.
+
+**Update 2026-10-10: the oracle was reached over the network, though not as
+the scripted two-client loop.** The engine completed a real 0.6 handshake
+with a live `gtk-gnutella/1.3.1-dirty (2026-03-09)` ultrapeer and decoded the
+QUERY traffic it then sent over the compressed stream (see the resolved entry
+above). That is stronger evidence than a scripted peer for the wire format
+and the compression negotiation, but it is not the controlled differential
+loop this entry describes: it does not exercise a 0.4 refusal from the real
+client, and it depends on a third party's uptime rather than a local binary.
+The loop remains the wanted artifact.
 
 ### PONG replies use "request TTL minus one", not the 0.6 pong-caching policy
 

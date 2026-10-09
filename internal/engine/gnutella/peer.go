@@ -10,7 +10,10 @@ package gnutella
 // One bufio.Reader is shared by the handshake and the message loop. The
 // handshake reader may buffer bytes past the CRLF CRLF terminator, and
 // losing them would corrupt the first message, so the reader lives for
-// the whole connection.
+// the whole connection. When the handshake declares a compressed
+// stream (inflate.go), the message loop reads through a decoder wrapped
+// around that same reader, so the buffered bytes come through it in
+// order.
 
 import (
 	"bufio"
@@ -76,35 +79,41 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	defer stopClose()
 
 	r := bufio.NewReader(conn)
+	next := io.Reader(r)
+	var err error
 	if inbound {
-		if err := p.accept(r); err != nil {
-			return err
-		}
+		next, err = p.accept(r)
 	} else {
-		if err := p.connect(r); err != nil {
-			return err
-		}
+		next, err = p.connect(r)
 	}
-	return p.loop(ctx, r)
+	if err != nil {
+		return err
+	}
+	if c, ok := next.(io.Closer); ok {
+		defer c.Close()
+	}
+	return p.loop(ctx, next)
 }
 
-// accept performs the server side of the 0.6 handshake.
-func (p *peer) accept(r *bufio.Reader) error {
+// accept performs the server side of the 0.6 handshake. It returns the
+// reader the message loop must use: the handshake reader itself, or a
+// decoder when the client declared its stream compressed.
+func (p *peer) accept(r io.Reader) (io.Reader, error) {
 	if err := p.conn.SetReadDeadline(time.Now().Add(handshakeDeadline)); err != nil {
-		return err
+		return nil, err
 	}
 	hs, err := ReadHandshake(r)
 	if err != nil {
 		p.writeError(400, "Bad Request")
-		return fmt.Errorf("handshake: %w", err)
+		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	if !hs.Request {
 		p.writeError(503, "Connect expected")
-		return fmt.Errorf("handshake: got %s where GNUTELLA CONNECT/0.6 was expected", hs.Status())
+		return nil, fmt.Errorf("handshake: got %s where GNUTELLA CONNECT/0.6 was expected", hs.Status())
 	}
 	if !supportsVersion(hs.Version) {
 		p.writeError(503, "Unsupported version "+hs.Version)
-		return fmt.Errorf("handshake: unsupported version %s", hs.Version)
+		return nil, fmt.Errorf("handshake: unsupported version %s", hs.Version)
 	}
 	p.logf("connect request from %s: version=%s network=%q user-agent=%q remote-ip=%q",
 		p.conn.RemoteAddr(), hs.Version, hs.Network(), hs.UserAgent(), hs.RemoteIP())
@@ -114,58 +123,80 @@ func (p *peer) accept(r *bufio.Reader) error {
 		Field{"Remote-IP", stripPort(p.conn.RemoteAddr().String())},
 		Field{"User-Agent", version.UserAgent()},
 	)); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Step 6: the client confirms the 200 before either side sends
-	// binary messages.
+	// binary messages. Both handshake blocks are read plain even when
+	// one of them declares compression: the declaration covers the
+	// message stream that starts after the confirmation.
 	if err := p.conn.SetReadDeadline(time.Now().Add(handshakeDeadline)); err != nil {
-		return err
+		return nil, err
 	}
 	confirm, err := ReadHandshake(r)
 	if err != nil {
-		return fmt.Errorf("client confirmation: %w", err)
+		return nil, fmt.Errorf("client confirmation: %w", err)
 	}
 	if !confirm.IsOK() {
-		return fmt.Errorf("client refused connection: %s", confirm.Status())
+		return nil, fmt.Errorf("client refused connection: %s", confirm.Status())
+	}
+	// A client may declare its compressed stream in the CONNECT or in
+	// the confirmation (gtk-gnutella honours both placements), so both
+	// are checked before the loop starts reading messages.
+	if wantsInflate(hs) || wantsInflate(confirm) {
+		p.logf("handshake complete with %s: stream compressed", p.conn.RemoteAddr())
+		return newInflateReader(r), nil
 	}
 	p.logf("handshake complete with %s", p.conn.RemoteAddr())
-	return nil
+	return r, nil
 }
 
-// connect performs the client side of the 0.6 handshake.
-func (p *peer) connect(r *bufio.Reader) error {
+// connect performs the client side of the 0.6 handshake. Like accept,
+// it returns the reader the message loop must use: the handshake
+// reader itself, or a decoder when the peer declared its stream
+// compressed.
+func (p *peer) connect(r io.Reader) (io.Reader, error) {
 	if err := p.conn.SetWriteDeadline(time.Now().Add(handshakeDeadline)); err != nil {
-		return err
+		return nil, err
 	}
 	if err := p.write(ConnectRequest(
 		Field{"Listen-IP", p.listenIPPort()},
 		Field{"Remote-IP", p.conn.RemoteAddr().String()},
 		Field{"User-Agent", version.UserAgent()},
+		// Offer to decode a compressed stream. The live 2026
+		// gtk-gnutella ultrapeers refuse a leaf that omits this
+		// ("403 Gnet connection not compressed") and compress their
+		// own TX once it is present. It promises nothing about our
+		// TX, which stays plain: it only says what we can read.
+		Field{"Accept-Encoding", "deflate"},
 	)); err != nil {
-		return err
+		return nil, err
 	}
 	if err := p.conn.SetReadDeadline(time.Now().Add(handshakeDeadline)); err != nil {
-		return err
+		return nil, err
 	}
 	hs, err := ReadHandshake(r)
 	if err != nil {
-		return fmt.Errorf("response: %w", err)
+		return nil, fmt.Errorf("response: %w", err)
 	}
 	if !hs.IsOK() {
-		return fmt.Errorf("peer refused connection: %s", hs.Status())
+		return nil, fmt.Errorf("peer refused connection: %s", hs.Status())
 	}
 	// Step 6: confirm, then the peer starts sending binary messages.
 	if err := p.write(OKReply()); err != nil {
-		return err
+		return nil, err
 	}
-	p.logf("connected to %s: version=%s network=%q user-agent=%q",
-		p.conn.RemoteAddr(), hs.Version, hs.Network(), hs.UserAgent())
-	return nil
+	compressed := wantsInflate(hs)
+	p.logf("connected to %s: version=%s network=%q user-agent=%q compressed=%v",
+		p.conn.RemoteAddr(), hs.Version, hs.Network(), hs.UserAgent(), compressed)
+	if compressed {
+		return newInflateReader(r), nil
+	}
+	return r, nil
 }
 
 // loop pumps messages and PINGs until the context or the peer ends.
-func (p *peer) loop(ctx context.Context, r *bufio.Reader) error {
+func (p *peer) loop(ctx context.Context, r io.Reader) error {
 	ticker := time.NewTicker(p.opts.KeepAliveInterval)
 	defer ticker.Stop()
 
@@ -194,8 +225,10 @@ func (p *peer) loop(ctx context.Context, r *bufio.Reader) error {
 }
 
 // readLoop reads messages until the connection fails, the context
-// ends, or IdleTimeout elapses without a complete message.
-func (p *peer) readLoop(ctx context.Context, r *bufio.Reader) error {
+// ends, or IdleTimeout elapses without a complete message. r is the
+// reader the handshake returned: plain, or a decoder when the stream
+// is compressed.
+func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 	for {
 		if err := p.conn.SetReadDeadline(time.Now().Add(p.opts.IdleTimeout)); err != nil {
 			return err
@@ -366,6 +399,7 @@ func stripPort(hostport string) string {
 	}
 	return hostport
 }
+
 // handleQuery responds to an inbound QUERY with a QUERYHIT built from
 // the injectable local catalogue on Options.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {

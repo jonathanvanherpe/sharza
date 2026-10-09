@@ -97,6 +97,14 @@ func (h Handshake) Network() string {
 	return v
 }
 
+// ContentEncoding returns the Content-Encoding header, if any. In the
+// 0.6 handshake this declares how the message stream that follows the
+// handshake is encoded (see wantsInflate in inflate.go).
+func (h Handshake) ContentEncoding() string {
+	v, _ := h.Get("Content-Encoding")
+	return v
+}
+
 // ReadHandshake reads one handshake block from r, up to and including
 // the CRLF CRLF terminator, and parses it. It never reads past the
 // terminator: extra buffered bytes stay in r for the message reader to

@@ -92,13 +92,15 @@ func TestFetchHostsBareList(t *testing.T) {
 	}
 
 	bare, param := rec.counts()
-	if bare != 1 || param != 1 {
-		t.Errorf("requests: %d bare, %d parameterised; want one of each", bare, param)
+	if bare != 1 || param != len(cacheNets) {
+		t.Errorf("requests: %d bare, %d parameterised; want one bare and one per cache net (%d)",
+			bare, param, len(cacheNets))
 	}
 }
 
 // TestFetchHostsParamForm covers the gweb3/4octets family: nothing comes
-// back until the request carries get=1, client and net=gnutella2.
+// back until the request carries get=1, client and a net the cache
+// knows. One request is sent per cacheNets entry.
 func TestFetchHostsParamForm(t *testing.T) {
 	var rec cacheTest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -122,22 +124,29 @@ func TestFetchHostsParamForm(t *testing.T) {
 	}
 
 	bare, param := rec.counts()
-	if bare != 1 || param != 1 {
-		t.Errorf("requests: %d bare, %d parameterised; want one of each", bare, param)
+	if bare != 1 || param != len(cacheNets) {
+		t.Errorf("requests: %d bare, %d parameterised; want one bare and one per cache net (%d)",
+			bare, param, len(cacheNets))
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.paramQrys) != 1 {
-		t.Fatalf("parameterised requests = %v, want one", rec.paramQrys)
+	if len(rec.paramQrys) != len(cacheNets) {
+		t.Fatalf("parameterised requests = %v, want one per cache net", rec.paramQrys)
 	}
-	q := rec.paramQrys[0]
-	for _, want := range []string{"get=1", "net=gnutella2"} {
-		if !strings.Contains(q, want) {
-			t.Errorf("parameterised query %q is missing %s", q, want)
+	var g2 string
+	for _, q := range rec.paramQrys {
+		if !strings.Contains(q, "get=1") {
+			t.Errorf("parameterised query %q is missing get=1", q)
+		}
+		if !strings.Contains(q, "client=") || !strings.Contains(q, "+") {
+			t.Errorf("parameterised query %q has no client=<ver>+<name> parameter", q)
+		}
+		if strings.Contains(q, "net=gnutella2") {
+			g2 = q
 		}
 	}
-	if !strings.Contains(q, "client=") || !strings.Contains(q, "+") {
-		t.Errorf("parameterised query %q has no client=<ver>+<name> parameter", q)
+	if g2 == "" {
+		t.Fatalf("no parameterised request asked for net=gnutella2: %v", rec.paramQrys)
 	}
 }
 
@@ -215,6 +224,45 @@ func TestFetchHostsDeduplicates(t *testing.T) {
 	}
 	if len(res.URLs) != 1 || res.URLs[0] != "http://a.example/gwc.php" {
 		t.Errorf("urls = %v, want the U| line once", res.URLs)
+	}
+}
+
+// TestFetchHostsMergesPerNetResponses covers the 2026 split: the same
+// cache serves one host population on net=gnutella (the gtk-gnutella
+// ultrapeers that complete a handshake) and a different one on
+// net=gnutella2 (the Shielded Shareaza leaves). The merged result must
+// carry both, one entry per address with the freshest Seen, which is
+// why the two requests cannot simply race for a single winner.
+func TestFetchHostsMergesPerNetResponses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("net") {
+		case "gnutella":
+			fmt.Fprint(w, "H|1.1.1.1:6346|100\nH|2.2.2.2:6346|200\n")
+		case "gnutella2":
+			fmt.Fprint(w, "H|2.2.2.2:6346|50\nH|3.3.3.3:6346|300\n")
+		default:
+			// Bare GET: this cache answers per net only.
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	res, err := FetchHosts(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("FetchHosts: %v", err)
+	}
+	want := []CacheHost{
+		{Addr: "1.1.1.1:6346", Seen: 100},
+		{Addr: "2.2.2.2:6346", Seen: 200}, // seen under both nets: freshest kept
+		{Addr: "3.3.3.3:6346", Seen: 300},
+	}
+	if len(res.Hosts) != len(want) {
+		t.Fatalf("hosts = %+v, want %+v (both networks merged)", res.Hosts, want)
+	}
+	for i := range want {
+		if res.Hosts[i] != want[i] {
+			t.Errorf("hosts[%d] = %+v, want %+v", i, res.Hosts[i], want[i])
+		}
 	}
 }
 
