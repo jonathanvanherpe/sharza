@@ -257,12 +257,23 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 // expire one hop sooner, and the hop at which it dies (TTL 0) is where
 // it is dropped. See docs/handoff.md for how this trades against the
 // 0.6 pong-caching scheme.
+//
+// The decrement is clamped to a minimum of 1: a direct/keep-alive PING
+// arrives with TTL=1 and Hops=0, and a PONG with TTL=0 and Hops=0 is an
+// invalid descriptor per the annotated 0.4 spec ("All servents MUST
+// consider that TTL+Hops values between 1 and 7 are valid"). Such a
+// reply would also be dropped by our own readLoop before it is seen,
+// so this is a self-inconsistency as much as a spec violation.
 func (p *peer) handlePing(ping Header) error {
 	payload := p.pongPayload()
+	ttl := ping.TTL - 1
+	if ttl == 0 {
+		ttl = 1
+	}
 	hdr := Header{
 		ID:     ping.ID,
 		Type:   MsgPong,
-		TTL:    ping.TTL - 1,
+		TTL:    ttl,
 		Hops:   0,
 		Length: uint32(len(payload)),
 	}

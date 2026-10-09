@@ -181,6 +181,49 @@ func TestInboundHandshakeThenPingPong(t *testing.T) {
 	}
 }
 
+// TestDirectPingGetsValidPong is the keep-alive edge: a direct PING
+// arrives with TTL=1 and Hops=0, and the ecosystem sends exactly this on
+// liveness links (Shareaza: New(G1_PACKET_PING, 1)). The reply must not
+// be the invalid TTL=0/Hops=0 descriptor the spec forbids, so the TTL
+// decrement is clamped to a floor of 1. A TTL=2 PING follows to prove
+// non-keep-alive pings still decrement normally rather than being
+// flattened to 1.
+func TestDirectPingGetsValidPong(t *testing.T) {
+	eng, _ := startEngine(t, Options{
+		KeepAliveInterval: time.Hour,
+		IdleTimeout:       5 * time.Second,
+	})
+	r, conn := dialEngine(t, eng.Addr().String())
+
+	ping := Header{ID: testID(0xCC), Type: MsgPing, TTL: 1, Hops: 0}
+	sendMsg(t, conn, ping, nil)
+
+	hdr, _ := readMsg(t, r)
+	if hdr.Type != MsgPong {
+		t.Fatalf("reply type = %s, want pong", typeName(hdr.Type))
+	}
+	if hdr.ID != ping.ID {
+		t.Errorf("reply ID = %x, want echo of %x", hdr.ID, ping.ID)
+	}
+	if hdr.TTL != 1 {
+		t.Errorf("reply TTL = %d, want 1 (ping TTL 1 decremented but clamped at the spec floor)", hdr.TTL)
+	}
+	if hdr.Hops != 0 {
+		t.Errorf("reply hops = %d, want 0", hdr.Hops)
+	}
+
+	// TTL 2 must still decrement to 1: the clamp is a floor, not a
+	// flattening of the decrement contract.
+	sendMsg(t, conn, Header{ID: testID(0xCD), Type: MsgPing, TTL: 2}, nil)
+	hdr, _ = readMsg(t, r)
+	if hdr.Type != MsgPong || hdr.ID != testID(0xCD) {
+		t.Fatalf("message = type %s id %x, want pong for id CD", typeName(hdr.Type), hdr.ID)
+	}
+	if hdr.TTL != 1 {
+		t.Errorf("reply TTL = %d, want 1 (ping TTL 2 minus one)", hdr.TTL)
+	}
+}
+
 func TestPingWithZeroTTLIsDropped(t *testing.T) {
 	eng, _ := startEngine(t, Options{
 		KeepAliveInterval: time.Hour,
