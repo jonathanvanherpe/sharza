@@ -242,7 +242,11 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 		p.logf("pong from %s: id=%x ttl=%d hops=%d payload=%d bytes",
 			p.conn.RemoteAddr(), hdr.ID, hdr.TTL, hdr.Hops, len(payload))
 		return nil
-	case MsgQuery, MsgQueryHit, MsgPush:
+	case MsgQuery:
+		return p.handleQuery(hdr, payload)
+	case MsgQueryHit:
+		return p.handleQueryHit(hdr, payload)
+	case MsgPush:
 		p.logf("ignoring %s from %s: routing and transfer are out of scope",
 			typeName(hdr.Type), p.conn.RemoteAddr())
 		return nil
@@ -361,4 +365,65 @@ func stripPort(hostport string) string {
 		return host
 	}
 	return hostport
+}
+// handleQuery responds to an inbound QUERY with a QUERYHIT built from
+// the injectable local catalogue on Options.
+func (p *peer) handleQuery(hdr Header, payload []byte) error {
+	// Decode QUERY to be good citizens (even if we don't filter by search).
+	if _, err := DecodeQuery(payload); err != nil {
+		p.logf("bad query from %s: %v", p.conn.RemoteAddr(), err)
+		// Don't close connection on bad query; just ignore.
+		return nil
+	}
+	// Build QUERYHIT from catalogue.
+	cat := p.opts.Catalogue
+	hits := make([]FileHit, 0, len(cat))
+	for _, fe := range cat {
+		hits = append(hits, FileHit{
+			FileIndex: fe.Index,
+			FileSize:  fe.Size,
+			FileName:  fe.Name,
+		})
+	}
+	// Get our IP to put in QUERYHIT (same logic as PONG).
+	var ip4 [4]byte
+	if ta, ok := p.conn.LocalAddr().(*net.TCPAddr); ok {
+		if ip := ta.IP.To4(); ip != nil {
+			copy(ip4[:], ip)
+		}
+	}
+	qh := QueryHit{
+		HitCount: uint8(len(hits)),
+		Port:     p.listenPort(),
+		IP:       ip4,
+		Speed:    0, // speed not specified; 0 is fine
+		Hits:     hits,
+	}
+	hitPayload := EncodeQueryHit(qh)
+	respHdr := Header{
+		ID:     hdr.ID, // echo descriptor ID
+		Type:   MsgQueryHit,
+		TTL:    hdr.TTL - 1,
+		Hops:   0,
+		Length: uint32(len(hitPayload)),
+	}
+	if respHdr.TTL == 0 {
+		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
+	}
+	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
+	return p.writeMessage(respHdr, hitPayload)
+}
+
+// handleQueryHit surfaces inbound QUERYHITs to Options.OnQueryHit callback.
+func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
+	qh, err := DecodeQueryHit(payload)
+	if err != nil {
+		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
+		return nil
+	}
+	if p.opts.OnQueryHit != nil {
+		p.opts.OnQueryHit(p.conn.RemoteAddr(), qh)
+	}
+	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	return nil
 }
