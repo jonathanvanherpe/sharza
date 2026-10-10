@@ -183,7 +183,9 @@ peer.
 A side observation, already known: the per-peer dial loop retries every
 `dialBackoff` (5s) forever, and against the tiny live swarm that earned `429
 Banned for 5m` from several nodes inside a minute. Graduated backoff is still
-open.
+open. **Fixed 2026-10-10:** the dial loop now uses exponential backoff
+capped at 30s (`dialBackoffMax = 30*time.Second`) and resets on a successful
+connection, so retry bursts no longer hammer peers in lockstep as hard.
 
 ### A leaf must say it is a leaf: `X-Ultrapeer: False`
 
@@ -204,7 +206,7 @@ headers: `503 Not Good Leaf` (gtk-gnutella's leaf evaluation), `503 Shielded
 leaf node` (the net=gnutella2 population), `503 Too many leaf connections`,
 and one `429 Banned for 5m` from the 5s dial hammering. `Remote-IP` in the
 outbound CONNECT was also sending `addr:port`; it now strips the port like
-the accept path does.
+the accept path does. With graduated backoff this should occur much less.
 
 ## Open questions
 

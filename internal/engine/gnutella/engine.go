@@ -18,10 +18,13 @@ import (
 )
 
 // Dial knobs. dialTimeout bounds a single connect attempt; dialBackoff
-// paces retries to a peer we cannot reach or that refuses us.
+// is the base retry delay for failed connections. The dial loop
+// applies exponential backoff with a cap so repeated failures don't
+// hammer peers and trigger "429 Banned" responses.
 const (
-	dialTimeout = 10 * time.Second
-	dialBackoff = 5 * time.Second
+	dialTimeout    = 10 * time.Second
+	dialBackoff    = 5 * time.Second
+	dialBackoffMax = 30 * time.Second
 )
 
 // Options tunes an Engine. Zero values select sane defaults.
@@ -267,17 +270,18 @@ func (e *Engine) fetchCache(ctx context.Context, cacheURL string) (CacheResult, 
 	return FetchHosts(ctx, cacheURL)
 }
 
-// dialLoop keeps one outbound peer connected. It retries forever at
-// dialBackoff intervals until the context ends: a peer that is down at
+// dialLoop keeps one outbound peer connected. It retries forever with
+// exponential backoff capped at dialBackoffMax: a peer that is down at
 // startup may come up later, and a refusal may become an acceptance
 // when the far side frees a slot.
 func (e *Engine) dialLoop(ctx context.Context, addr string) {
 	defer e.wg.Done()
 	logf := e.opts.Logf
+	delay := dialBackoff
 	for {
 		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 		if err != nil {
-			logf("dial %s failed: %v (retrying in %s)", addr, err, dialBackoff)
+			logf("dial %s failed: %v (retrying in %s)", addr, err, delay)
 		} else {
 			pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
 			e.mu.Lock()
@@ -289,11 +293,22 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			delay = dialBackoff
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+				continue
+			}
+		}
+		delay = delay * 2
+		if delay > dialBackoffMax {
+			delay = dialBackoffMax
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(dialBackoff):
+		case <-time.After(delay):
 		}
 	}
 }
