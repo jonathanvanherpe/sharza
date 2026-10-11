@@ -458,15 +458,22 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	return p.writeMessage(respHdr, hitPayload)
 }
 
-// handleQueryHit surfaces inbound QUERYHITs to Options.OnQueryHit callback.
+// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
+// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
+// callback. Delivery is by ID because that is all a QUERYHIT carries: a
+// hit under no in-flight ID is another query's result and the registry
+// drops it, but the callback still sees every hit.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+	if p.opts.searches != nil {
+		p.opts.searches.deliver(hdr.ID, qh)
+	}
 	if p.opts.OnQueryHit != nil {
-		p.opts.OnQueryHit(p.conn.RemoteAddr(), qh)
+		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
 	return nil

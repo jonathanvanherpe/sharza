@@ -208,7 +208,102 @@ and one `429 Banned for 5m` from the 5s dial hammering. `Remote-IP` in the
 outbound CONNECT was also sending `addr:port`; it now strips the port like
 the accept path does. With graduated backoff this should occur much less.
 
+### Gnutella 1 download: the first byte-moving piece of P1
+
+`internal/engine/gnutella/download.go` adds `Downloader`, a per-transfer
+HTTP client for the file a QUERYHIT names. It is a plain GET of
+`http://<source>:<port>/gnutella/<file index>` with the servent request
+headers (`X-Gnutella-Content-Length`, `Accept: */*`, an identifying
+`User-Agent`, `Connection: Keep-Alive`, and `Range: bytes=<offset>-` when a
+partial file is already on disk), and it is stdlib-only, so no licence event.
+`Engine.Downloader(qh, hit)` is the convenience that turns an `OnQueryHit`
+callback's arguments into a transfer; the engine carries no job state for it.
+
+Four decisions worth recording, because they are the ones a later slice will
+revisit:
+
+- **Source address comes from the QUERYHIT**, not from the connection that
+  delivered it. The peer that answered a query need not be the one that can
+  serve the file, and the servent convention puts the downloadable address in
+  the hit.
+- **Resume is detected from the destination file's size**, not from a
+  caller-supplied offset: `Fetch(ctx, dir)` reads the hit's sanitised name in
+  `dir`, and a smaller existing file is continued from its end. A file larger
+  than the hit is refused rather than truncated into a partial.
+- **Size is the only integrity check**, which is all Gnutella 1 offers. Every
+  declared length (HTTP `Content-Length`, `Content-Range`, the response's
+  `X-Gnutella-Content-Length`) and the actual body length are checked against
+  the hit's size, and a mismatch is refused. A refused transfer truncates the
+  destination back to its starting offset, so the valid prefix a later resume
+  would have found is not corrupted by a bad tail.
+- **The file name is sanitised** to one path component (separators removed,
+  control characters dropped, leading dots trimmed) before it is joined with
+  the caller's directory, so a hostile QUERYHIT cannot write outside it.
+
+The whole path is covered by an `httptest` servent over real TCP (full
+download and request headers, 206 resume, size-mismatch refusal, name
+sanitisation, error statuses). Each assertion was mutation-tested: dropping
+the length header, the `Range` header, the `Accept` header, the `Connection`
+header, the declared-size check, the body-length check, and the name
+sanitiser each turned its guarding test red before being reverted.
+
 ## Open questions
+
+### Download client: decisions left open
+
+- **Resume is implicit.** `Fetch(ctx, dir)` continues whatever partial file
+  the sanitised name hits; a caller cannot ask for a specific offset, and two
+  hits with the same name in one directory are one file. If a job store ever
+  maps hits to explicit paths, an offset/destination parameter is the natural
+  extension; a per-transfer offset is deliberately absent here.
+- **HTTP/1.1, not the convention's HTTP/1.0.** `net/http` sends HTTP/1.1.
+  Real Gnutella servents (gtk-gnutella included) answer both, but that is
+  untested here because no oracle client can be installed.
+- **No retry and no re-verification of a resumed prefix.** A resume trusts
+  the bytes already on disk; only size is checked. A corrupt prefix whose
+  length still adds up is accepted, because Gnutella 1 has nothing with which
+  to check it.
+- **`Connection: Keep-Alive` is a request header, not a kept-alive loop.**
+  The transfer closes its body when it finishes and leaves pooling to the
+  transport. A pipeline of many transfers to one peer would want one client
+  and an explicit idle policy; this slice moves one file per `Fetch` call.
+- **The oracle leg of P1's exit gate is still not run.** gtk-gnutella is the
+  differential oracle for the exchange leg, but it cannot be installed here
+  (no root, no sudo), so the download is proven against the scripted servent
+  only. The controlled two-client loop remains the wanted, separately-run
+  artifact, exactly as for the handshake item.
+
+### Requester-side search: what the first real `Search` deliberately leaves open
+
+`Engine.Search` is now real (see the query-routing slice): it registers the
+QUERY's descriptor ID before writing the frame, collects the QUERYHITs that
+echo that ID, waits out `Options.SearchTimeout`, and returns them. Four
+decisions from that slice are worth recording before the next one:
+
+- **The collection window always runs to `SearchTimeout`.** A peer that
+  answers first does not cut short the peers that have not answered yet, so
+  the timeout path returns partial hits and no error by design. A later slice
+  that wants latency over completeness (return on first hit, or per-peer
+  completion) would change the wait, and the partial-hit test with it.
+- **"All-peers-written" means all writes failed.** The brief's
+  "wait on timeout or all-peers-written" is implemented as: skip the wait
+  entirely when no write succeeded (no peer can answer), otherwise wait the
+  full window. A successful write leaves the window open even after every
+  write returns, because the response is still in flight.
+- **The pending entry's `done` channel has no waiter yet.** `close` signals
+  it, but nothing selects on it; the RPC-facing caller that outlives a single
+  `Search` call would be the first real waiter.
+- **The oracle loop for query routing is skipped, not passed.** gtk-gnutella
+  cannot be installed here, so the query/queryhit exchange is proven by the
+  two-engine scripted pair over real TCP in `search_test.go`
+  (`TestSearchReturnsQueryHitWithMatchingDescriptorID`) plus scripted-peer
+  tests for the wrong-ID and timeout paths. Do not read that as oracle
+  verification.
+
+Still out of scope from the brief, each its own slice: QUERY
+forwarding/horizon routing beyond the direct link, push and browse, wiring
+`Search` into the RPC surface (human gate), and the G2 tree codec / UDP
+transceiver / KHL family.
 
 ### Should the daemon ship default `gnutella_caches`?
 
