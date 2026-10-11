@@ -4,8 +4,9 @@ Runs the agentic build loop: pick the next roadmap item, branch, build it with
 an agent, verify independently, and open a branch for review.
 
 **The harness never merges to `main`.** Every cycle ends on an
-`agent/<task-id>` branch. Merging is the maintainer's job. That is the whole
-reason this is a harness and not a bot with write access.
+`agent/<task-id>` branch and opens a pull request against `main` for review.
+Merging is the maintainer's job. That is the whole reason this is a harness
+and not a bot with write access.
 
 ## Usage
 
@@ -30,10 +31,22 @@ State lives in `harness/.state/` and is gitignored.
 4. **Verify.** `go build`, `go vet`, `go test` run **by the harness**, not
    taken from the agent's report. An agent that says it verified something is
    a claim, not evidence.
-5. **Commit and push** only if verification passed and something changed.
+5. **Commit, push, and open a pull request** only if verification passed and
+   something changed. The pull request targets `main`, for the maintainer to
+   review and merge.
 
 A cycle that fails verification does not commit. It pushes nothing, leaves the
 branch for inspection, and notifies.
+
+## Pull requests
+
+After a successful push the harness opens a pull request against `main`
+(`github.mjs`). It needs a GitHub token in `GITHUB_TOKEN` (or `GH_TOKEN`) with
+`pull_requests: write` and `contents: read` on the repository. Without one the
+pull request cannot be created; the cycle still pushes its branch and the
+notification falls back to a compare URL a human can open. The token is read
+from the environment, which the `sharza-dev.service` unit supplies via
+`~/.config/opencode/github.env` (`GITHUB_TOKEN=...`).
 
 ## Model routing
 
@@ -103,3 +116,4 @@ the dependency is approved.
 - `sharza-dev.mjs` — the cycle
 - `router.mjs` — model discovery and routing
 - `ntfy.mjs` — notifications, IPv4-pinned
+- `github.mjs` — opens the pull request, IPv4-pinned

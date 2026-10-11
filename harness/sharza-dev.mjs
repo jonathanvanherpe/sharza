@@ -27,6 +27,7 @@ import path from "node:path";
 
 import { notify, sleep } from "./ntfy.mjs";
 import { route, reportCooldown, cooledDown, classifyDifficulty } from "./router.mjs";
+import { createPullRequest, parseRemote, compareUrl } from "./github.mjs";
 
 const exec = promisify(execFile);
 
@@ -275,6 +276,20 @@ async function verifyGate() {
   return results;
 }
 
+/** The pull request body: the brief, plus the checks the harness itself ran. */
+function buildPrBody({ task, verify }) {
+  const checks = verify.map((v) => `- ${v.ok ? "pass" : "FAIL"}  ${v.label}`).join("\n");
+  return (
+    `Automated cycle from the Sharza harness.\n\n` +
+    `## Task\n\n${task}\n\n` +
+    `## Verification\n\n` +
+    `Run by the harness after the agent stopped, not taken from the agent's\n` +
+    `own report:\n\n${checks}\n\n` +
+    `Read the diff, and \`docs/handoff.md\` on this branch for what the cycle\n` +
+    `did and did not exercise, before merging.\n`
+  );
+}
+
 async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith("--")));
   const valueOf = (name) => {
@@ -478,20 +493,58 @@ async function main(argv) {
     pushed = true;
   }
 
-  const landed = pushed ? "pushed" : "committed locally (no git remote configured)";
+  // 6. Open a pull request. The harness never merges: a cycle that lands is a
+  //    branch plus a PR, and merging is the maintainer's call. Without a
+  //    GITHUB_TOKEN the PR cannot be created, so fall back to a compare URL a
+  //    human can open.
+  let prCreated = false;
+  let prUrl = null;
+  let prError = null;
+  if (pushed) {
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+    const remote = parseRemote(git(["remote", "get-url", "origin"]));
+    if (!remote) {
+      prError = "could not parse the origin remote URL";
+    } else if (!token) {
+      prError = "no GITHUB_TOKEN (or GH_TOKEN) is set";
+    } else {
+      const pr = await createPullRequest({
+        owner: remote.owner,
+        repo: remote.repo,
+        head: branch,
+        base: "main",
+        title: `${id}: ${task.split("\n")[0]}`,
+        body: buildPrBody({ task, verify }),
+        token,
+      });
+      if (pr.ok) {
+        prCreated = true;
+        prUrl = pr.url;
+      } else {
+        prError = pr.error || `HTTP ${pr.status}`;
+      }
+    }
+    if (!prUrl && remote) prUrl = compareUrl({ owner: remote.owner, repo: remote.repo, head: branch });
+  }
+
+  const landed = pushed
+    ? prCreated
+      ? "pushed, pull request opened"
+      : `pushed, no pull request (${prError})`
+    : "committed locally (no git remote configured)";
   const state_ = loadState();
   saveState({
     ...state_,
     cycles: state.cycles + 1,
     lastTask: task,
-    lastResult: `branch ${branch} ${landed}`,
+    lastResult: `branch ${branch} ${landed}${prUrl ? ` - ${prUrl}` : ""}`,
     history: [
       ...(state_.history ?? []),
       {
         at: new Date().toISOString(),
         branch,
         task: task.split("\n")[0],
-        result: landed,
+        result: prUrl ? `${landed} - ${prUrl}` : landed,
       },
     ].slice(-50),
   });
@@ -499,14 +552,17 @@ async function main(argv) {
   await notify(
     `Cycle ${id} ready for review.\nBranch: ${branch}\nTask: ${task.split("\n")[0]}\n\n` +
       (pushed
-        ? "Merge when you have read the diff."
+        ? prCreated
+          ? `Pull request: ${prUrl}\nReview it, then merge.`
+          : `Could not open a PR (${prError}).\nOpen one here: ${prUrl}`
         : "Committed locally only. No git remote is configured, so there is nothing " +
           "to review on a server yet."),
-    { title: "Sharza harness", priority: "default", tags: ["rocket"] },
+    { title: "Sharza harness", priority: "default", tags: ["rocket"], url: prUrl || undefined },
   );
 
   console.log(`\n${landed} (agent exit ${run.exitCode}, ${run.durationMs}ms)`);
-  console.log("waiting for the maintainer to merge; the harness will not merge to main");
+  if (prUrl) console.log(prCreated ? `pull request: ${prUrl}` : `open a pull request: ${prUrl}`);
+  console.log("waiting for the maintainer to review and merge; the harness will not merge to main");
 
   // Back to main so the next cycle starts clean.
   git(["checkout", "-q", "main"]);

@@ -40,17 +40,20 @@ node harness/sharza-dev.mjs --status    # past cycles and model cooldowns
 ```
 
 The harness is strictly one-shot. It has no scheduler, no loop and no timer,
-so it will not start anything on its own.
+so it will not start anything on its own. On this host it is run continuously
+by `sharza-dev.service`, a systemd user unit that repeats `--once`; the loop
+lives in the unit, never in the harness.
 
-**Agents may merge to `main`.** Every cycle lands on an `agent/<task-id>`
-branch; once the verify gate and any live check pass, the cycle may
-fast-forward it into `main` and push (`git merge --ff-only` from `main`,
-or `git push origin <branch>:main`). Fast-forward only — force pushes and
-`git reset --hard` stay blocked, so history is never rewritten.
+**The harness opens a pull request; it does not merge.** Every cycle lands on
+an `agent/<task-id>` branch, is verified, is pushed, and opens a pull request
+against `main` for review. Merging is the maintainer's call, and only after
+reading the diff. Opening the PR needs a `GITHUB_TOKEN` with
+`pull_requests: write`; without one the cycle still pushes the branch and the
+notification falls back to a compare URL. Force pushes and `git reset --hard`
+stay blocked, so history is never rewritten.
 
 **`origin` is `git@github.com:jonathanvanherpe/sharza.git`.** The harness
-pushes its branch there after verification, and a cycle that ran entirely
-on the machine can do the same; the branch is mergeable as one click.
+pushes its branch and opens its pull request there after verification.
 
 **The agent's own report is not evidence.** The harness re-runs build, vet,
 test, the cgo-free build and the SPDX check itself, and refuses to commit when
