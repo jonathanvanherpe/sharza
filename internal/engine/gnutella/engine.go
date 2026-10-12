@@ -57,6 +57,14 @@ type Options struct {
 	// is logged and skipped; it never stops the engine.
 	Caches []string
 
+	// UKHL lists Gnutella2 host-cache endpoints, host:port addresses of
+	// G2 hubs. Each is asked once at Run start, over UDP, for the hosts
+	// it knows (a KHLR request and a KHLA answer); every host an answer
+	// names goes to the same dial machinery as Peers and Caches. A hub
+	// that never answers costs only the reply window and never stops
+	// the engine.
+	UKHL []string
+
 	// cacheAllowLoopback relaxes the webcache host filter so that a
 	// loopback address from a cache is kept. Production never sets it:
 	// a cache handing out 127.0.0.1 is either broken or pointing us at
@@ -64,6 +72,11 @@ type Options struct {
 	// Tests set it to point a cache at a listener on 127.0.0.1, since
 	// a test may not reach anything else.
 	cacheAllowLoopback bool
+
+	// khlAllowLoopback is the same seam for the ukhl: exchange: a KHL
+	// answer naming a loopback host is dropped in production and kept
+	// in tests, which may only reach loopback.
+	khlAllowLoopback bool
 
 	// KeepAliveInterval is how often a silent connection receives an
 	// empty PING. Zero means the default 90 s.
@@ -194,8 +207,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	close(e.ready)
 	logf := e.opts.Logf
 
-	logf("listening on %s (%d peer(s), %d cache(s) configured)",
-		ln.Addr(), len(e.opts.Peers), len(e.opts.Caches))
+	logf("listening on %s (%d peer(s), %d cache(s), %d ukhl endpoint(s) configured)",
+		ln.Addr(), len(e.opts.Peers), len(e.opts.Caches), len(e.opts.UKHL))
 	for _, addr := range e.opts.Peers {
 		e.startDial(ctx, addr)
 	}
@@ -205,6 +218,13 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	for _, cacheURL := range e.opts.Caches {
 		e.wg.Add(1)
 		go e.cacheLoop(ctx, cacheURL)
+	}
+	// The ukhl: exchange is one-shot too and runs alongside serving. The
+	// KHLR it sends is answered to this socket's source address, so an
+	// ephemeral local port is enough; no fixed UDP port is bound.
+	if len(e.opts.UKHL) > 0 {
+		e.wg.Add(1)
+		go e.khlLoop(ctx, e.opts.UKHL)
 	}
 
 	// Closing the listener is how Accept is unblocked when the context
@@ -239,8 +259,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Wait is safe from Add-after-Wait because every goroutine that
 	// can still Add is itself counted: the accept loop's handlers
 	// (added before this point), the dial loops started from Run, and
-	// the cache loops started from Run, whose startDial calls happen
-	// while their own count is still held.
+	// the cache and ukhl loops started from Run, whose startDial calls
+	// happen while their own count is still held.
 	e.wg.Wait()
 	logf("stopped")
 	return nil

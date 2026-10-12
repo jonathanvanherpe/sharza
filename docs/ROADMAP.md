@@ -64,9 +64,10 @@ The first real engine, and the project's origin. Reference material is the
 g2.doxu.org specification read alongside Shareaza's implementation.
 
 - **bootstrap and host discovery — the active item:** a GWebCache client
-  (`gnutella_caches`) feeds the engine's dial loop, so a fresh daemon finds
-  peers without a hand-maintained `gnutella_peers`; the G2 KHL / `ukhl:`
-  host cache is its follow-up
+  (`gnutella_caches`) and the G2 KHL / `ukhl:` host cache both feed the
+  engine's dial loop, so a fresh daemon finds peers without a hand-maintained
+  `gnutella_peers`; next is the G2 UDP transceiver and tree packet use beyond
+  discovery
 - Gnutella 0.6: handshake, ping/pong, query routing, push, browse, download
 - Gnutella2: tree packet codec, UDP transceiver, hub topology, query hash
   tables, `PART` completeness advertisement

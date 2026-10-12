@@ -485,3 +485,52 @@ func TestLoadReadsGnutellaCaches(t *testing.T) {
 		t.Errorf("gnutella_caches = %v, want the one URL", c.GnutellaCaches)
 	}
 }
+
+// ukhl: endpoints are dialled as host:port, so a mistyped one must be
+// caught at validation like gnutella_peers, not by the worker.
+func TestGnutellaUKHLValidation(t *testing.T) {
+	t.Parallel()
+	if n := len(Default().GnutellaUKHL); n != 0 {
+		t.Errorf("default gnutella_ukhl = %d entries, want none", n)
+	}
+	for _, ok := range []string{"10.0.0.9:6346", "ukhl.example.org:6346"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaUKHL: []string{ok}}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("gnutella_ukhl [%q] rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"nohost", ":6346", "10.0.0.9:notaport"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaUKHL: []string{bad}}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("gnutella_ukhl [%q] was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "gnutella_ukhl") {
+			t.Errorf("gnutella_ukhl [%q] error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+// The JSON key must round-trip for gnutella_ukhl too, since
+// DisallowUnknownFields would reject a misspelled tag.
+func TestLoadReadsGnutellaUKHL(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{
+  "state_dir": "/tmp/sharza-test-state",
+  "gnutella_ukhl": ["10.0.0.9:6346"]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.GnutellaUKHL) != 1 || c.GnutellaUKHL[0] != "10.0.0.9:6346" {
+		t.Errorf("gnutella_ukhl = %v, want the one endpoint", c.GnutellaUKHL)
+	}
+}

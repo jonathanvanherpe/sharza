@@ -186,6 +186,7 @@ func runWorkerRole(ctx context.Context, r role.Role, cfg *config.Config) error {
 		Listen: cfg.GnutellaListen,
 		Peers:  cfg.GnutellaPeers,
 		Caches: cfg.GnutellaCaches,
+		UKHL:   cfg.GnutellaUKHL,
 	})
 }
 

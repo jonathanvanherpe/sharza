@@ -247,6 +247,54 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### G2 KHL bootstrap: the `ukhl:` host cache, and reading Shareaza's own writer
+
+The Gnutella2 side now has a second bootstrap path beside `gnutella_caches`:
+`gnutella_ukhl` lists `host:port` addresses of G2 peers to ask for their KHL
+("known hosts list"). The worker sends one `KHLR` per target over a UDP socket
+and feeds the addresses in the reply into the same dial machinery the other
+bootstrap uses; nothing else was changed about G1 framing.
+
+Four wire facts are worth recording, because each is a place a reimplementation
+goes wrong, and all four were taken from Shareaza read as a reference (no code
+copied):
+
+- **The SGP datagram header is 8 bytes, not 9.** `SGP_HEADER` packs a 3-byte
+  tag, one flags byte, a little-endian `uint16` sequence, then a 1-based part
+  number and a total part count. A 9-byte header leaves every field shifted by
+  one and every datagram unparseable. Small requests are sent as one
+  uncompressed part (tag `GND`; both `SGP` and `GND` are accepted on receive),
+  and multi-part replies are reassembled keyed by source and sequence.
+- **The G2 length field is up to three bytes, and byte 0 encodes its width.**
+  The top two bits are the length-byte count (1..3, never 0), the next three
+  are the type-name length minus one, and the low bits are flags (`0x04`
+  compound, `0x02` big-endian). The length follows the header as raw bytes and
+  is little-endian unless the big-endian flag says otherwise. Compound payloads
+  are sub-packets, and a `0x00` byte ends the child list.
+- **An address on the wire is the four octets in dotted order, then a
+  big-endian port.** Shareaza writes `S_addr` with `WriteLongLE` and the port
+  with `WriteShortBE(htons(port))`; on a little-endian host the first four
+  bytes therefore read as the dotted quad. Reading the address as a
+  little-endian integer, or the port as little-endian, is silently wrong and
+  only shows up as a dial timeout.
+- **The real `KHLA` from Shareaza's `OnKHLR` is mostly flat entries.** The bulk
+  of a live answer is 10-byte `CH` records (address, port, 4-byte timestamp)
+  plus a trailing `TS` and `YOURIP`, not the nested form the spec sketch
+  suggests. Cached hosts are compound only when they carry a vendor, and that
+  form puts a `0x00` separator before the raw address. The parser uses an `NA`
+  sub-packet when present, otherwise the bytes after the last whole sub-packet
+  (skipping one leading zero). It deliberately does **not** blind-scan the tail
+  of the payload for ten bytes that look like an address: that matches
+  timestamps and vendor strings and invents hosts.
+
+The parsing is covered by a hand-assembled golden packet and the vendor form,
+and the loop is closed end to end by `TestEngineDialsKHLFetchedPeer` (a fake
+UDP hub answers the engine's `KHLR` with a `KHLA` naming a second engine's
+loopback address, which the first engine must then dial). Three deliberate
+mutations — swapping the port to little-endian, reversing the octets, and
+reading the length with the wrong width — each turned the relevant test red
+before being reverted.
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -314,6 +362,9 @@ but defaults that start network traffic are a maintainer decision: they make
 a fresh daemon phone home to third-party 2017-era servers on first start,
 and someone has to own keeping that list honest as those caches die.
 
+The same question now applies to `gnutella_ukhl`, which is likewise empty by
+default for the same reason.
+
 ### Loopback filtering vs the engine test seam
 
 `FetchHosts` drops loopback addresses as a policy for untrusted cache
@@ -332,6 +383,8 @@ cache URLs the fetches return, pacing on the `I|` values, persisting fetched
 hosts to the store (a restart re-fetches instead), submitting our own
 address to a cache, the UDP host cache (`uhc:`), and G2 discovery via the
 KHL / `ukhl:` packets. The `net=gnutella` fetch is now done as well and
+the KHL `ukhl:` path is done (see above); the `uhc:` UDP host cache, cache
+registration, and persisting fetched hosts remain open.
 merged with `net=gnutella2` (the two live populations are disjoint; see the
 resolved entry above).
 
