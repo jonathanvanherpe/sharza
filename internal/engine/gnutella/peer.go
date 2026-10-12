@@ -274,9 +274,12 @@ func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 	}
 }
 
-// handle processes one message. Routing and file transfer are out of
-// scope for this item, so Query, QueryHit and Push are acknowledged in
-// the log and ignored.
+// handle processes one message. The pusher's pump duties are all here:
+// PINGs get PONGs and QUERYs get catalogue hits, while an inbound
+// QueryHit is delivered to whoever asked and an inbound Push (a request
+// to serve a file of ours) remains out of scope, so it is acknowledged
+// in the log and ignored. The client side of push - routing Engine.Push's
+// PUSH out and accepting the dial-back - lives in engine.go.
 func (p *peer) handle(hdr Header, payload []byte) error {
 	switch hdr.Type {
 	case MsgPing:
@@ -463,11 +466,19 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 // callback. Delivery is by ID because that is all a QUERYHIT carries: a
 // hit under no in-flight ID is another query's result and the registry
 // drops it, but the callback still sees every hit.
+//
+// A 0.6-form hit names the servent that answered in its trailing
+// identifier; the connection it arrived on is recorded as the route for
+// that servent, so a later Engine.Push sends its PUSH back the way the
+// QUERYHIT came.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	if qh.ServentID != [idSize]byte{} && p.opts.pushRoutes != nil {
+		p.opts.pushRoutes.store(qh.ServentID, p)
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)

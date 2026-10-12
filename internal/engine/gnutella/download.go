@@ -76,7 +76,18 @@ type Downloader struct {
 	Hit FileHit
 
 	// Client performs the GET. Nil selects defaultDownloadClient.
+	// Ignored when Conn is set: a supplied connection is what the
+	// push path must speak over, whatever client was configured.
 	Client *http.Client
+
+	// Conn, when non-nil, is a connection the caller already opened to
+	// the serving peer: the pushed-back connection of a firewalled
+	// transfer. Fetch then never dials the advertised (unreachable)
+	// address; it consumes the GIV greeting the peer opens with (0.6
+	// draft 4.2) and runs the one GET over the supplied connection,
+	// which is closed when the transfer ends. Nil dials d.QH's
+	// advertised address as usual.
+	Conn net.Conn
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
@@ -130,11 +141,13 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		return DownloadResult{}, errors.New("gnutella: download: no destination directory")
 	}
 	size := int64(d.Hit.FileSize)
-	if d.QH.Port == 0 {
-		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source port")
-	}
-	if net.IP(d.QH.IP[:]).IsUnspecified() {
-		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source address")
+	if d.Conn == nil {
+		if d.QH.Port == 0 {
+			return DownloadResult{}, errors.New("gnutella: download: queryhit has no source port")
+		}
+		if net.IP(d.QH.IP[:]).IsUnspecified() {
+			return DownloadResult{}, errors.New("gnutella: download: queryhit has no source address")
+		}
 	}
 
 	name := sanitizeFileName(d.Hit.FileName)
@@ -186,12 +199,46 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	}
 
 	client := d.Client
+	if d.Conn != nil {
+		// A pushed-back connection greets with a GIV line before any
+		// HTTP response; consume it here so http.Client never tries to
+		// parse it as a status line. Its content is deliberately
+		// ignored, as the 0.6 draft directs ("SHOULD ignore the File
+		// Index and File Name").
+		giv, err := readPushGIV(d.Conn)
+		if err != nil {
+			_ = d.Conn.Close()
+			return DownloadResult{}, err
+		}
+		d.logf()("pushed connection greeted with %q", giv)
+		// One-shot transport over the supplied connection: the dial
+		// context ignores its address argument and hands back the
+		// connection the push already opened.
+		client = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return d.Conn, nil
+				},
+				ResponseHeaderTimeout: downloadHeaderTimeout,
+				DisableCompression:    true,
+			},
+		}
+	}
 	if client == nil {
 		client = defaultDownloadClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if d.Conn != nil {
+			_ = d.Conn.Close()
+		}
 		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
+	}
+	// The pushed connection serves exactly one transfer: close it once
+	// the body is drained (deferred later), never hand it to the idle
+	// pool.
+	if d.Conn != nil {
+		defer d.Conn.Close()
 	}
 	defer resp.Body.Close()
 
@@ -262,8 +309,41 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	if err := f.Sync(); err != nil {
 		return DownloadResult{}, fmt.Errorf("gnutella: sync %s: %w", dest, err)
 	}
+	if d.Conn != nil {
+		// The real source of a pushed transfer is the address the
+		// connection came from, not the (unreachable) advertised one.
+		src = d.Conn.RemoteAddr().String()
+	}
 	d.logf()("downloaded %s from %s: %d bytes at offset %d", name, src, n, start)
 	return DownloadResult{Path: dest, Bytes: n, Offset: start}, nil
+}
+
+// readPushGIV consumes the greeting a firewalled servent sends
+// immediately after dialing back (0.6 draft 4.2, of the form
+// "GIV <file index hex>:<servent id hex>/<file name>"). The receiver
+// ignores its content and only needs the line out of the way before
+// HTTP response parsing begins, so the read is bounded and line-shaped;
+// a peer that cannot deliver a greeting has nothing to serve.
+const maxPushGIVLength = 64 * 1024
+
+func readPushGIV(c net.Conn) (string, error) {
+	if err := c.SetReadDeadline(time.Now().Add(downloadHeaderTimeout)); err != nil {
+		return "", fmt.Errorf("gnutella: push: GIV deadline: %w", err)
+	}
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+	line := make([]byte, 0, 128)
+	one := make([]byte, 1)
+	for len(line) <= maxPushGIVLength {
+		if _, err := io.ReadFull(c, one); err != nil {
+			return "", fmt.Errorf("gnutella: push: reading GIV: %w", err)
+		}
+		if one[0] == '\n' {
+			// strip a trailing CR from a CRLF greeting
+			return strings.TrimSuffix(string(line), "\r"), nil
+		}
+		line = append(line, one[0])
+	}
+	return "", fmt.Errorf("gnutella: push: GIV line exceeds %d bytes", maxPushGIVLength)
 }
 
 // checkDeclaredSize verifies the lengths a peer declared in a 200

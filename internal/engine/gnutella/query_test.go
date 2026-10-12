@@ -95,6 +95,147 @@ func TestDecodeQueryHitMalformed(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeQueryHit06Form(t *testing.T) {
+	// 0.6 form: the responding servent's identifier is appended in
+	// the last 16 bytes of the message.
+	var sid [idSize]byte
+	for i := range sid {
+		sid[i] = byte(i + 1)
+	}
+	qh := QueryHit{
+		HitCount:  1,
+		Port:      6346,
+		IP:        [4]byte{127, 0, 0, 1},
+		Speed:     10000,
+		Hits:      []FileHit{{FileIndex: 1, FileSize: 12345, FileName: "file.mp3"}},
+		ServentID: sid,
+	}
+	enc := EncodeQueryHit(qh)
+	want := 11 + 8 + len("file.mp3") + 1 + idSize
+	if len(enc) != want {
+		t.Fatalf("length: got %d want %d", len(enc), want)
+	}
+	dec, err := DecodeQueryHit(enc)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if dec.ServentID != sid {
+		t.Errorf("servent id: got %x want %x", dec.ServentID, sid)
+	}
+	if dec.Port != qh.Port || dec.IP != qh.IP || dec.Speed != qh.Speed {
+		t.Errorf("header mismatch: %+v", dec)
+	}
+	if len(dec.Hits) != 1 || dec.Hits[0].FileName != "file.mp3" {
+		t.Errorf("hit mismatch: %+v", dec.Hits)
+	}
+}
+
+func TestDecodeQueryHitSkipsTrailerBeforeServentID(t *testing.T) {
+	// A real 0.6 QUERYHIT may carry an EQHD extension block between
+	// the result set and the trailing servent identifier. The decoder
+	// must skip the trailer and take the servent id from the last 16
+	// bytes.
+	qh := QueryHit{
+		HitCount:  1,
+		Port:      6346,
+		IP:        [4]byte{10, 1, 2, 3},
+		Speed:     10000,
+		Hits:      []FileHit{{FileIndex: 7, FileSize: 999, FileName: "a.mp3"}},
+		ServentID: [idSize]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00},
+	}
+	enc := EncodeQueryHit(qh)
+	// EQHD shape: payload-length byte followed by the payload,
+	// wedged between the result set and the servent id.
+	trailer := []byte{0x03, 0x01, 0x02, 0x03}
+	msg := make([]byte, 0, len(enc)+len(trailer))
+	msg = append(msg, enc[:len(enc)-idSize]...)
+	msg = append(msg, trailer...)
+	msg = append(msg, enc[len(enc)-idSize:]...)
+
+	dec, err := DecodeQueryHit(msg)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if dec.ServentID != qh.ServentID {
+		t.Errorf("servent id: got %x want %x", dec.ServentID, qh.ServentID)
+	}
+	if len(dec.Hits) != 1 || dec.Hits[0].FileIndex != 7 || dec.Hits[0].FileName != "a.mp3" {
+		t.Errorf("hit mismatch: %+v", dec.Hits)
+	}
+}
+
+func TestDecodeQueryHit04FormHasNoServentID(t *testing.T) {
+	// A pure 0.4 QUERYHIT ends exactly at the last hit's NUL, so the
+	// servent id must stay zero, and with it zero the encode must not
+	// gain any trailing bytes.
+	qh := QueryHit{
+		HitCount:  1,
+		Port:      6346,
+		IP:        [4]byte{192, 168, 0, 4},
+		Speed:     1000,
+		Hits:      []FileHit{{FileIndex: 3, FileSize: 100, FileName: "x.bin"}},
+		ServentID: [idSize]byte{},
+	}
+	enc := EncodeQueryHit(qh)
+	dec, err := DecodeQueryHit(enc)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if dec.ServentID != [idSize]byte{} {
+		t.Errorf("servent id: got %x want zero", dec.ServentID)
+	}
+	if len(enc) != 11+8+len("x.bin")+1 {
+		t.Errorf("0.4 form gained trailing bytes: %d", len(enc))
+	}
+}
+
+func TestQueryHitFirewalled(t *testing.T) {
+	firewalled := []QueryHit{
+		{Port: 0, IP: [4]byte{192, 168, 0, 4}},      // zero port
+		{Port: 6346, IP: [4]byte{0, 0, 0, 0}},       // unspecified ip
+		{Port: 0, IP: [4]byte{0, 0, 0, 0}},          // both
+	}
+	open := []QueryHit{
+		{Port: 6346, IP: [4]byte{192, 168, 0, 4}},
+		{Port: 1, IP: [4]byte{127, 0, 0, 1}},
+	}
+	for i, qh := range firewalled {
+		if !qh.Firewalled() {
+			t.Errorf("case %d: %+v should be firewalled", i, qh)
+		}
+	}
+	for i, qh := range open {
+		if qh.Firewalled() {
+			t.Errorf("case %d: %+v should not be firewalled", i, qh)
+		}
+	}
+}
+
+func TestDecodeQueryHitTruncated06TailLeavesServentIDZero(t *testing.T) {
+	// A truncated 0.6 tail (fewer than 16 trailing bytes) is
+	// ignorable: the result set decodes and the servent id stays zero.
+	qh := QueryHit{
+		HitCount:  1,
+		Port:      6346,
+		IP:        [4]byte{10, 0, 0, 1},
+		Speed:     1000,
+		Hits:      []FileHit{{FileIndex: 1, FileSize: 50, FileName: "y"}},
+		ServentID: [idSize]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+	}
+	enc := EncodeQueryHit(qh)
+	trunc := enc[:len(enc)-10] // cut the trailer, leave 6 id bytes
+	dec, err := DecodeQueryHit(trunc)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if dec.ServentID != [idSize]byte{} {
+		t.Errorf("servent id: got %x want zero", dec.ServentID)
+	}
+	if len(dec.Hits) != 1 || dec.Hits[0].FileName != "y" {
+		t.Errorf("hit mismatch: %+v", dec.Hits)
+	}
+}
+
 func FuzzDecodeQuery(f *testing.F) {
 	// seed with valid messages
 	q := Query{MinSpeed: 0, Search: "test"}

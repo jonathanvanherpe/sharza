@@ -247,6 +247,62 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Gnutella 1 push: fetching from a firewalled servent
+
+`internal/engine/gnutella/push.go` adds the `Push` codec and
+`Engine.Push(ctx, qh, hit, dir)`, the client half of the firewalled
+exchange: a QUERYHIT whose source cannot be dialed (unspecified IPv4 or a
+zero port, per `QueryHit.Firewalled`) is fetched by routing a PUSH back to
+the servent that answered and accepting the connection that servent opens
+in return.
+
+**The brief's QUERYHIT layout is wrong, and the code follows the spec.**
+The brief said a 0.6 QUERYHIT prefixes the hit list with a 16-byte servent
+identifier and a 1-byte client locale. The published 0.6 draft (section
+2.2.6) and two reference clients put the servent identifier in the *last*
+16 bytes of the message, after the result set and any EQHD trailer, and
+there is no client-locale byte anywhere:
+
+- the 0.6 draft's field table ends with "Servent Identifier ... at the end
+  of the QueryHit";
+- gtk-gnutella `qhit.c` writes the servent GUID after the hits, and
+  `g1_queryhit_length` counts a trailing `GUID_RAW_SIZE`;
+- Shareaza `QueryHit.cpp::FromG1Packet` reads hits immediately after the
+  11-byte header, with nothing in front of them.
+
+`DecodeQueryHit` therefore reads the servent id from the last 16 bytes
+(after skipping any trailer), `EncodeQueryHit` appends it only when
+non-zero so the 0.4 form stays byte-identical, and `Firewalled()` is
+unspecified-IP-or-zero-port. A QUERYHIT built the brief's way would decode
+to the same hits and simply lose the identifier, which is the honest
+failure: the prefix form is not on the wire, so nothing can honestly send
+it.
+
+**The PUSH payload** is the fixed 26 bytes the brief and the draft agree
+on: 16-byte servent id, 4-byte little-endian file index, 4-byte
+big-endian IPv4, 2-byte little-endian port, no GGEP. `Engine.Push`
+advertises the address the delivering link is reachable at (the same
+derivation the PONG path uses) and the engine's push-accept port, a
+separate IPv4 listener bound on an ephemeral port at `Run` and closed at
+shutdown.
+
+**The dial-back greets with GIV, which is read and discarded.** 0.6 draft
+section 4.2 has the firewalled servent send `GIV <index>:<servent id>/<name>`
+before the GET and directs the receiver to ignore its content (the
+receiver asks for the file it wants). `Downloader.Conn` consumes that one
+line and then runs the ordinary GET over the supplied connection; without
+the read, `net/http` parses the greeting as an HTTP status line.
+Gnutella has no field tying a dial-back to the PUSH that caused it, so push
+transfers are serialised by a mutex and an accepted connection is, by
+construction, the answer to the push just sent; an accepted connection
+nobody claims within `pushClaimTimeout` is closed.
+
+The codec, the trailing-servent-id decode, the GIV consumption, the
+advertised address and the route recording were each mutation-tested
+(file-index endianness, reading the id from the wrong end, skipping the
+GIV read, zeroing the advertised IP, and dropping the route store each
+turned a guarding test red before being reverted).
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -272,6 +328,27 @@ sanitiser each turned its guarding test red before being reverted.
   (no root, no sudo), so the download is proven against the scripted servent
   only. The controlled two-client loop remains the wanted, separately-run
   artifact, exactly as for the handshake item.
+
+### Push client: decisions left open
+
+- **A dial-back is not correlated with its PUSH.** Push transfers are
+  serialised so the next accepted connection is the one just asked for,
+  and the GIV's own index and servent id are ignored, as the draft directs
+  the receiver to. Two concurrent pushes to different firewalled servents
+  would need the GIV parsed (or a listener per push) to stay honest;
+  deferred until something actually wants two at once.
+- **No reconnect on a dropped push transfer.** The draft recommends the
+  file-providing servent re-dial after a lost connection; this side does
+  not retry, matching the direct download's no-retry stance. A retry needs
+  another PUSH, which is a scheduler concern (the engine is job-free).
+- **A dial-back that never sends GIV waits out `downloadHeaderTimeout`**
+  before failing as malformed. That is the honest reading of the draft
+  ("should immediately send"), but a tolerant fallback (send the GET
+  anyway) is a deliberate non-choice here.
+- **The oracle leg for push is skipped, not passed.** gtk-gnutella cannot
+  be installed here, so the push exchange is proven against a scripted
+  servent over real TCP only, exactly as for the handshake and download
+  legs.
 
 ### Requester-side search: what the first real `Search` deliberately leaves open
 

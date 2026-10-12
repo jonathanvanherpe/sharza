@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -23,13 +24,23 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name. A 0.6 QUERYHIT appends the responding servent's
+// 16-byte identifier as the *last* 16 bytes of the message (after any
+// EQHD trailer); see DecodeQueryHit and docs/handoff.md for why it is
+// not where the task brief put it.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	// ServentID is the responding servent's identifier, carried in
+	// the last 16 bytes of a 0.6-form QUERYHIT. It is what a PUSH
+	// message is addressed to, so a firewalled hit is unfirewalled by
+	// pushing it. Zero when the hit is the pure 0.4 form, which has
+	// no identifier.
+	ServentID [idSize]byte
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +114,12 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// A 0.6-form QUERYHIT carries the responding servent's identifier
+	// in the last 16 bytes; the pure 0.4 form has none, so the 0.4
+	// output stays byte-identical when ServentID is zero.
+	if qh.ServentID != [idSize]byte{} {
+		out = append(out, qh.ServentID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +161,21 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// 0.6 form: the responding servent's identifier sits in the last
+	// 16 bytes of the message, after the result set and any EQHD
+	// trailer. The trailer is skipped, not parsed; a truncated tail
+	// (fewer than 16 trailing bytes) simply leaves ServentID zero,
+	// which cannot happen in the plain 0.4 form because that message
+	// ends exactly at the last hit's NUL.
+	if len(payload) >= pos+idSize {
+		copy(qh.ServentID[:], payload[len(payload)-idSize:])
+	}
 	return qh, nil
+}
+
+// Firewalled reports whether the hit's source cannot be dialed
+// directly: an unspecified IP or a zero port. A firewalled hit can
+// only be fetched by pushing the responding servent (Engine.Push).
+func (q QueryHit) Firewalled() bool {
+	return net.IP(q.IP[:]).IsUnspecified() || q.Port == 0
 }

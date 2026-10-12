@@ -93,6 +93,11 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushRoutes maps the servent identifiers heard in QUERYHITs to the
+	// peer that delivered each, so a PUSH for a firewalled hit goes back
+	// the way its QUERYHIT came. Run sets it; callers do not.
+	pushRoutes *pushRouteTable
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +145,20 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushLn accepts the dial-backs firewalled servents open after a
+	// PUSH; pushConns carries each accepted connection to the
+	// Engine.Push call waiting for it. Push transfers are serialised by
+	// pushMu, because nothing in the 0.6 flow ties a dial-back to the
+	// PUSH that caused it.
+	pushLn    net.Listener
+	pushConns chan net.Conn
+	pushMu    sync.Mutex
+
+	// pushRoutes maps the servent identifiers heard in QUERYHITs to the
+	// peer that delivered each, so a PUSH for a firewalled hit goes back
+	// the way its QUERYHIT came.
+	pushRoutes *pushRouteTable
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -149,10 +168,12 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:      make(chan struct{}),
+		peers:      make(map[*peerConn]struct{}),
+		dialed:     make(map[string]struct{}),
+		searches:   newSearchRegistry(),
+		pushRoutes: newPushRouteTable(),
+		pushConns:  make(chan net.Conn),
 	}
 }
 
@@ -183,6 +204,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// Same for the push-route table: a 0.6 QUERYHIT names its servent,
+	// and a later PUSH for that servent must go back over the very
+	// connection that delivered it.
+	e.opts.pushRoutes = e.pushRoutes
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -191,11 +216,28 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	}
 	e.ln = ln
 	e.laddr = ln.Addr()
+
+	// Push-accept listener: the address a firewalled servent is told to
+	// dial back on after receiving a PUSH. Bound for the engine's
+	// lifetime on an ephemeral port and advertised per-PUSH by
+	// Engine.Push. IPv4 on the wildcard address, because the 0.6 PUSH
+	// carries a 4-byte IP field: only an IPv4 dial-back can be asked
+	// for, whatever address the QUERYHIT-delivering link is reachable
+	// at.
+	pln, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("gnutella: push listen: %w", err)
+	}
+	e.pushLn = pln
+	e.wg.Add(1)
+	go e.pushAcceptLoop(ctx, pln)
+
 	close(e.ready)
 	logf := e.opts.Logf
 
-	logf("listening on %s (%d peer(s), %d cache(s) configured)",
-		ln.Addr(), len(e.opts.Peers), len(e.opts.Caches))
+	logf("listening on %s (push-accept %s, %d peer(s), %d cache(s) configured)",
+		ln.Addr(), pln.Addr(), len(e.opts.Peers), len(e.opts.Caches))
 	for _, addr := range e.opts.Peers {
 		e.startDial(ctx, addr)
 	}
@@ -208,9 +250,12 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	}
 
 	// Closing the listener is how Accept is unblocked when the context
-	// ends; connections themselves are closed by each serveConn.
+	// ends; connections themselves are closed by each serveConn. The
+	// push-accept listener closes the same way.
 	stopClose := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stopClose()
+	stopPush := context.AfterFunc(ctx, func() { _ = pln.Close() })
+	defer stopPush()
 
 	for {
 		conn, err := ln.Accept()
@@ -364,6 +409,123 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
 	return d
+}
+
+// Push fetches one hit from a firewalled servent through its dial-back.
+// A firewalled QUERYHIT advertises an unreachable source (an
+// unspecified IP or a zero port; see QueryHit.Firewalled), so the file
+// must be coaxed out: Push routes a PUSH to the peer that delivered the
+// hit, naming the file index and the address the servent should connect
+// back to - the engine's push-accept listener. The dial-back greets
+// with a GIV line that is deliberately ignored (0.6 draft 4.2), and the
+// transfer then proceeds over that connection exactly like a direct
+// download, with the same declared-size checks, through the
+// Downloader's Conn path.
+//
+// Push transfers are serialised by a mutex: nothing in the 0.6 flow
+// ties a dial-back to the PUSH that caused it (the GIV's file index and
+// servent identifier are ignored by design), so at most one push is in
+// flight at a time and every accepted connection is, by construction,
+// the response to the one just asked for.
+func (e *Engine) Push(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	if !qh.Firewalled() {
+		return DownloadResult{}, errors.New("gnutella: push: hit is not firewalled; download directly")
+	}
+	if qh.ServentID == [idSize]byte{} {
+		return DownloadResult{}, errors.New("gnutella: push: hit carries no servent identifier")
+	}
+	route, ok := e.pushRoutes.lookup(qh.ServentID)
+	if !ok {
+		return DownloadResult{}, fmt.Errorf("gnutella: push: no route to servent %x", qh.ServentID)
+	}
+
+	e.pushMu.Lock()
+	defer e.pushMu.Unlock()
+
+	e.mu.Lock()
+	logf := e.opts.Logf
+	e.mu.Unlock()
+
+	// Advertise the address this connection is reachable at, the same
+	// derivation pongPayload uses for PONGs.
+	var ip4 [4]byte
+	if ta, ok := route.conn.LocalAddr().(*net.TCPAddr); ok {
+		if ip := ta.IP.To4(); ip != nil {
+			copy(ip4[:], ip)
+		}
+	}
+	payload := EncodePush(Push{
+		ServentID: qh.ServentID,
+		FileIndex: hit.FileIndex,
+		IP:        ip4,
+		Port:      e.pushPort(),
+	})
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    keepAliveTTL,
+		Hops:   0,
+		Length: uint32(len(payload)),
+	}
+	if err := route.writeMessage(hdr, payload); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push to servent %x: %w", qh.ServentID, err)
+	}
+	logf("push: asked servent %x to push %q to %s:%d",
+		qh.ServentID, hit.FileName, net.IP(ip4[:]), e.pushPort())
+
+	select {
+	case conn := <-e.pushConns:
+		d := NewDownloader(qh, hit)
+		d.Conn = conn
+		d.Logf = logf
+		return d.Fetch(ctx, dir)
+	case <-ctx.Done():
+		return DownloadResult{}, ctx.Err()
+	}
+}
+
+// pushPort is the port the engine accepts pushed connections on, as
+// advertised in PUSH messages. Zero before Run binds the listener.
+func (e *Engine) pushPort() uint16 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pushLn == nil {
+		return 0
+	}
+	ta, ok := e.pushLn.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0
+	}
+	return uint16(ta.Port)
+}
+
+// pushAcceptLoop accepts dial-backs from firewalled servents and hands
+// each connection to the Engine.Push call waiting for it. A connection
+// that sits unclaimed past pushClaimTimeout is not a dial-back (no push
+// is in flight, or the one that was waiting has given up) and is closed
+// rather than queued, so an unsolicited connect cannot pin the loop.
+func (e *Engine) pushAcceptLoop(ctx context.Context, ln net.Listener) {
+	defer e.wg.Done()
+	logf := e.opts.Logf
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logf("push accept: %v", err)
+			return
+		}
+		select {
+		case e.pushConns <- conn:
+			// Handed to the Engine.Push that is waiting for it.
+		case <-time.After(pushClaimTimeout):
+			_ = conn.Close()
+		case <-ctx.Done():
+			_ = conn.Close()
+			return
+		}
+	}
 }
 
 // Search sends one QUERY to every live peer, collects the QUERYHITs that

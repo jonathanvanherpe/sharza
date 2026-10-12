@@ -368,6 +368,29 @@ func TestInboundUnsupportedVersionGets503(t *testing.T) {
 	}
 }
 
+// TestInboundPushIsIgnored: a PUSH arriving at us is a request to serve
+// a file, and serving push requests is out of scope. It must be ignored
+// without treating it as a protocol violation, so the connection stays
+// usable for the next message. The engine's own push *client* (a PUSH it
+// sends) is covered by push_test.go.
+func TestInboundPushIsIgnored(t *testing.T) {
+	eng, _ := startEngine(t, Options{
+		KeepAliveInterval: time.Hour,
+		IdleTimeout:       5 * time.Second,
+	})
+	r, conn := dialEngine(t, eng.Addr().String())
+
+	sendMsg(t, conn, Header{ID: testID(0x50), Type: MsgPush, TTL: 5, Length: pushPayloadSize}, make([]byte, pushPayloadSize))
+	// A live PING after it must still be answered, proving the PUSH was
+	// ignored rather than closing the connection.
+	ping := Header{ID: testID(0x51), Type: MsgPing, TTL: 3}
+	sendMsg(t, conn, ping, nil)
+	hdr, _ := readMsg(t, r)
+	if hdr.Type != MsgPong || hdr.ID != ping.ID {
+		t.Fatalf("after a Push: got type %s id %x, want pong for %x", typeName(hdr.Type), hdr.ID, ping.ID)
+	}
+}
+
 // TestOutboundDial exercises the client side: the engine dials a peer
 // address, completes the 0.6 exchange, and answers PINGs with PONGs.
 func TestOutboundDial(t *testing.T) {

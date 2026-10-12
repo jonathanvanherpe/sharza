@@ -8,10 +8,12 @@ package gnutella
 // would take; nothing here reaches the network.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -414,6 +416,178 @@ func TestParseContentRange(t *testing.T) {
 		if err == nil {
 			t.Errorf("parseContentRange(%q) succeeded, want error", tc.in)
 		}
+	}
+}
+
+// servePushedHit stands in for a firewalled servent. It listens on
+// 127.0.0.1 and, per accepted connection, greets with the GIV line a
+// pushing servent opens with (0.6 draft 4.2, of the form
+// "GIV <file index hex>:<servent id>/<file name>"), reads the
+// requester's request head, and hands it to h to write a byte-exact
+// response. greet may be empty to simulate a peer that never greets.
+// Returns the listen address.
+func servePushedHit(t *testing.T, greet string, h func(w io.Writer, r *http.Request)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if greet == "" {
+					// A peer that never greets: close the door so the
+					// client's GIV read fails promptly, which is what
+					// TestDownloadPushedConnRequiresGIV wants.
+					return
+				}
+				_, _ = io.WriteString(c, greet)
+				req, err := http.ReadRequest(bufio.NewReader(c))
+				if err != nil {
+					return
+				}
+				h(c, req)
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// pushedRequest is what the Downloader asked the pushed servent for.
+type pushedRequest struct {
+	path, xgcl, rng, ua string
+}
+
+func TestDownloadOverPushedConn(t *testing.T) {
+	const (
+		index = 11
+		size  = 777
+	)
+	content := testContent(size)
+
+	sid := testServentID(0x40)
+	greet := fmt.Sprintf("GIV %d:%x/pushed.mp3\r\n", index, sid)
+	gotCh := make(chan pushedRequest, 1)
+	addr := servePushedHit(t, greet, func(w io.Writer, r *http.Request) {
+		gotCh <- pushedRequest{r.URL.Path, r.Header.Get("X-Gnutella-Content-Length"), r.Header.Get("Range"), r.Header.Get("User-Agent")}
+		if r.URL.Path != fmt.Sprintf("/gnutella/%d", index) {
+			_, _ = io.WriteString(w, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		}
+		fmt.Fprintf(w, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Gnutella-Content-Length: %d\r\nConnection: close\r\n\r\n", size, size)
+		_, _ = w.Write(content)
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial pushed conn: %v", err)
+	}
+	// A firewalled hit: the advertised source cannot be dialed (its
+	// address is unspecified and its port is zero), yet Fetch must
+	// transfer over the supplied connection.
+	hit := FileHit{FileIndex: index, FileSize: size, FileName: "pushed.mp3"}
+	qh := QueryHit{Port: 0, Hits: []FileHit{hit}}
+	dir := t.TempDir()
+	d := NewDownloader(qh, hit)
+	d.Conn = conn
+	res, err := d.Fetch(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Fetch over pushed conn: %v", err)
+	}
+
+	select {
+	case got := <-gotCh:
+		if got.path != fmt.Sprintf("/gnutella/%d", index) {
+			t.Errorf("request path = %q, want /gnutella/%d", got.path, index)
+		}
+		if got.xgcl != strconv.Itoa(size) {
+			t.Errorf("X-Gnutella-Content-Length = %q, want %d", got.xgcl, size)
+		}
+		if got.rng != "" {
+			t.Errorf("Range = %q, want none on a fresh push transfer", got.rng)
+		}
+		if got.ua == "" {
+			t.Error("User-Agent is empty; the pushed servent must identify the client")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pushed servent never saw a request")
+	}
+
+	if res.Bytes != size || res.Offset != 0 {
+		t.Errorf("result = %+v, want %d bytes at offset 0", res, size)
+	}
+	onDisk, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if !bytes.Equal(onDisk, content) {
+		t.Errorf("pushed file (%d bytes) does not match served content", len(onDisk))
+	}
+
+	// The pushed connection serves exactly one transfer: Fetch must
+	// have closed it. A closed conn refuses even a read deadline;
+	// otherwise a read after Fetch must fail with net.ErrClosed, not
+	// merely stall.
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		return // already closed: single-transfer confirmed
+	}
+	var one [1]byte
+	if _, err := conn.Read(one[:]); err == nil || !errors.Is(err, net.ErrClosed) {
+		t.Errorf("read after Fetch: err = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestDownloadOverPushedConnSizeMismatch(t *testing.T) {
+	const (
+		index = 12
+		size  = 500
+	)
+	content := testContent(size)
+
+	// Close-delimited body one byte short of the declared size: no
+	// Content-Length, so only the body count can expose the lie.
+	addr := servePushedHit(t, "GIV 12:00/pushed.bin\r\n", func(w io.Writer, r *http.Request) {
+		_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+		_, _ = w.Write(content[:size-1])
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial pushed conn: %v", err)
+	}
+	hit := FileHit{FileIndex: index, FileSize: size, FileName: "pushed.bin"}
+	qh := QueryHit{Port: 0, Hits: []FileHit{hit}}
+	d := NewDownloader(qh, hit)
+	d.Conn = conn
+	_, err = d.Fetch(context.Background(), t.TempDir())
+	if !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("Fetch error = %v, want ErrSizeMismatch over the pushed conn", err)
+	}
+}
+
+func TestDownloadPushedConnRequiresGIV(t *testing.T) {
+	// A peer that accepts the push and then closes without greeting is
+	// not a servent: Fetch must refuse rather than hang an HTTP parse
+	// on silence.
+	addr := servePushedHit(t, "", func(w io.Writer, r *http.Request) {})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial pushed conn: %v", err)
+	}
+	hit := FileHit{FileIndex: 1, FileSize: 10, FileName: "x.bin"}
+	qh := QueryHit{Port: 0, Hits: []FileHit{hit}}
+	d := NewDownloader(qh, hit)
+	d.Conn = conn
+	_, err = d.Fetch(context.Background(), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "GIV") {
+		t.Fatalf("Fetch error = %v, want a GIV-related refusal", err)
 	}
 }
 
