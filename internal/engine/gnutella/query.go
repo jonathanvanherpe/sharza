@@ -14,10 +14,19 @@ const (
 )
 
 // Query represents a Gnutella QUERY message (0x80).
-// Payload: 2-byte minimum speed (LE), NUL-terminated search criteria.
+// Payload: 2-byte minimum speed (LE), NUL-terminated search criteria, then
+// an optional extension section.
 type Query struct {
 	MinSpeed uint16 // minimum download speed in KB/s, little-endian
 	Search   string // search criteria, NUL-terminated in wire
+
+	// Extensions is the raw extension section that follows the criteria's
+	// NUL terminator, verbatim. The spec allows GGEP, HUGE and XML blocks
+	// (0x1C-separated, GGEP last); this engine only ever writes a GGEP
+	// block, and leaves the section opaque so a plain query with no
+	// extensions stays byte-for-byte identical. Use DecodeGGEP to parse it
+	// when it is known to be GGEP.
+	Extensions []byte
 }
 
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
@@ -52,13 +61,16 @@ func EncodeQuery(q Query) []byte {
 	if s == "" || s[len(s)-1] != '\x00' {
 		s = s + "\x00"
 	}
-	out := make([]byte, 2+len(s))
+	out := make([]byte, 2+len(s)+len(q.Extensions))
 	binary.LittleEndian.PutUint16(out[0:2], q.MinSpeed)
 	copy(out[2:], []byte(s))
+	copy(out[2+len(s):], q.Extensions)
 	return out
 }
 
-// DecodeQuery decodes a Query from payload.
+// DecodeQuery decodes a Query from payload. Bytes after the criteria's NUL
+// terminator, if any, are the extension section and are preserved verbatim
+// in Query.Extensions; a plain query therefore decodes exactly as before.
 func DecodeQuery(payload []byte) (Query, error) {
 	if len(payload) < queryHeaderMin {
 		return Query{}, fmt.Errorf("%w: payload too short", ErrQueryBadFormat)
@@ -77,6 +89,9 @@ func DecodeQuery(payload []byte) (Query, error) {
 		return Query{}, fmt.Errorf("%w: missing NUL terminator", ErrQueryBadFormat)
 	}
 	q.Search = string(searchBytes[:idx]) // exclude NUL
+	if rest := searchBytes[idx+1:]; len(rest) > 0 {
+		q.Extensions = append([]byte(nil), rest...)
+	}
 	return q, nil
 }
 

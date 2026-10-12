@@ -247,6 +247,26 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### The browse brief's GGEP description contradicts the published format
+
+The P1 browse slice brief described a GGEP block as "ID, flags byte, `0x40`
+encoding-length and `0x20` data-length flags, little-endian length encoding,
+`0x00` block terminator". The published format disagrees on every one of
+those details, and (as with the handshake brief's PUSH/length errors) the
+spec is what is implemented in `internal/engine/gnutella/ggep.go`:
+
+| Brief | Published format (gtk-gnutella `ggep.h`, Shareaza `GGEP.cpp`, LimeWire `GGEP.java`) |
+| --- | --- |
+| `0x40` "encoding-length" flag | `0x40` = COBS-encoded payload |
+| `0x20` "data-length" flag | `0x20` = deflated payload |
+| little-endian length encoding | big-endian base-64: 1-3 bytes, most significant 6-bit group first, terminated by a byte with `0x40` set |
+| `0x00` block terminator | none; the block ends at the extension with `0x80` set (the spec says the extension block "SHOULD NOT be followed by a null byte") |
+
+The three references agree with each other on every field, so the agreement
+is the spec. The codec implements the plain subset `BH` needs: a lone `BH`
+marker is exactly `C3 82 42 48 40`. COBS/deflate payloads are rejected at
+decode rather than returned still encoded (see Open questions).
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -399,3 +419,41 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### The live browse oracle drew no QUERYHIT, and is skipped, not passed
+
+The browse slice's oracle leg was attempted on 2026-10-12 exactly as the
+handshake/download legs were: dial the live `net=gnutella` ultrapeers from a
+GWebCache fetch, complete the 0.6 handshake, send the browse QUERY, and see
+what answers. Of seven cache hosts, three completed the handshake and the
+rest refused with the usual 2026 leaf-slot policy (`503 Not Good Leaf`,
+`503 Shielded leaf node`, dial timeouts, `no route to host`). The browse
+QUERY to the three connected peers drew **zero QUERYHITs**, so there is no
+live-node evidence for the browse exchange: the requester side is proven by
+the two-engine pair and the scripted BH-asserting peer over real TCP in
+`browse_test.go`, and `gtk-gnutella` still cannot be installed here (no
+root). Do not read this as oracle verification. The wanted artifact remains
+the controlled two-client loop run by a maintainer on a host with root, or a
+live node that happens to have a leaf slot and shared files.
+
+Open sub-questions from the slice, each its own piece of work:
+
+- **The responder is BH-agnostic.** `handleQuery` answers *any* QUERY with
+  the whole catalogue and never looks at `Query.Extensions`, so a plain
+  keyword search and a browse QUERY get the same answer from this engine.
+  That is enough for the two-engine pair but not a real browse discipline;
+  honouring BH (and filtering by criteria) is a later slice.
+- **The GGEP codec rejects COBS/deflate.** Only the plain `BH` subset is
+  implemented; an extension declaring either encoding is refused, not decoded,
+  so no caller can read compressed bytes as data. Supporting COBS/deflate is
+  the obvious extension when an inbound QUERY/QUERYHIT parser needs real-world
+  blocks.
+- **The QUERY extension section is opaque.** `Query.Extensions` preserves the
+  raw bytes after the criteria NUL; the QUERY codec does not split GGEP from
+  HUGE/XML or handle the `0x1C` separator the spec allows. A query carrying a
+  non-GGEP block round-trips only as raw bytes, which is all browse needs.
+- **The browse ask has no explicit "answer me" check.** `Browse` returns
+  whatever QUERYHITs echo its descriptor ID; it does not verify the answers
+  advertise BH or come from the asked host. That is the same trust model as
+  `Search` and is deliberate, but a later slice may want to distinguish a
+  browse-able host from one that merely answered an empty query.

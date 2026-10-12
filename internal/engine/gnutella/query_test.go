@@ -3,6 +3,7 @@
 package gnutella
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -21,6 +22,56 @@ func TestEncodeDecodeQueryRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeQueryPlainUnchanged pins the no-extension wire form: the
+// extension section is append-only, so an ordinary query encodes exactly as
+// it did before the codec learned about GGEP.
+func TestEncodeQueryPlainUnchanged(t *testing.T) {
+	cases := []struct {
+		q    Query
+		want []byte
+	}{
+		{Query{MinSpeed: 0, Search: ""}, []byte{0x00, 0x00, 0x00}},
+		{Query{MinSpeed: 0x2710, Search: "test"}, []byte{0x10, 0x27, 't', 'e', 's', 't', 0x00}},
+	}
+	for _, c := range cases {
+		got := EncodeQuery(c.q)
+		if !bytes.Equal(got, c.want) {
+			t.Errorf("EncodeQuery(%+v) = % X, want % X", c.q, got, c.want)
+		}
+	}
+}
+
+// TestEncodeDecodeQueryExtensionsRoundTrip is the browse wire shape: empty
+// criteria, NUL, then a GGEP block. The extension bytes must survive a
+// decode and the criteria must still be the empty string.
+func TestEncodeDecodeQueryExtensionsRoundTrip(t *testing.T) {
+	ext := EncodeGGEP([]GGEPExtension{{ID: "BH"}})
+	q := Query{MinSpeed: 0, Search: "", Extensions: ext}
+	enc := EncodeQuery(q)
+	// speed(2) | NUL criteria | GGEP
+	want := append([]byte{0x00, 0x00, 0x00}, ext...)
+	if !bytes.Equal(enc, want) {
+		t.Fatalf("EncodeQuery = % X, want % X", enc, want)
+	}
+	dec, err := DecodeQuery(enc)
+	if err != nil {
+		t.Fatalf("DecodeQuery: %v", err)
+	}
+	if dec.MinSpeed != 0 || dec.Search != "" {
+		t.Errorf("decoded %+v, want empty criteria and speed 0", dec)
+	}
+	if !bytes.Equal(dec.Extensions, ext) {
+		t.Errorf("extensions = % X, want % X", dec.Extensions, ext)
+	}
+	exts, err := DecodeGGEP(dec.Extensions)
+	if err != nil {
+		t.Fatalf("DecodeGGEP: %v", err)
+	}
+	if len(exts) != 1 || exts[0].ID != "BH" || len(exts[0].Data) != 0 {
+		t.Errorf("extensions = %+v, want the single BH marker", exts)
+	}
+}
+
 func TestDecodeQueryMalformed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -28,7 +79,7 @@ func TestDecodeQueryMalformed(t *testing.T) {
 	}{
 		{"too short", []byte{0x01}},
 		{"no nul", []byte{0x10, 0x27, 0x74, 0x65, 0x73, 0x74}}, // speed 0x2710, "test"
-		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},      // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
+		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},   // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
 	}
 	for _, c := range cases {
 		if c.name == "empty search with nul?" {
