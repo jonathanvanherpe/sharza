@@ -6,6 +6,67 @@ blocker.
 
 ## Resolved in this cycle
 
+### The G2 tree packet codec: the brief's format is not the published one
+
+The first slice of P1's Gnutella2 half is `internal/engine/gnutella/g2/packet.go`,
+with `packet_test.go` and `fuzz_test.go`. It is the framing every remaining G2
+item is built on: parse one packet to a tree, emit any tree back to bytes. No
+network, no oracle and no cgo.
+
+**The brief described a format that neither the spec nor the reference uses.**
+It asked for "hashed 4-char type codes", a parent flag in the top bit of a
+big-endian 32-bit length, and 4-byte-aligned children. The published
+g2.doxu.org "Packet Structure" page and Shareaza's `G2Packet.cpp`
+(`RG2Packet::WritePacket`/`ToBuffer`/`ReadBuffer`) both use the control-byte
+framing instead:
+
+- one control byte: bits 7-6 the length-field width, bits 5-3 the name width
+  minus one, bit 2 the compound flag, bit 1 the big-endian flag, bit 0 reserved;
+- then the length field (zero to three bytes, big- or little-endian);
+- then the name, 1 to 8 raw bytes (not hashed, not fixed at 4);
+- then the body: child packets packed with no alignment, optionally followed by
+  a zero control byte and a payload.
+
+The published format is implemented, exactly as the Gnutella 1 handshake brief
+deviation was handled. A codec built to the brief's description could not
+decode a single real G2 packet, which is this item's whole purpose.
+
+**Verification actually performed** (all with `~/sdk/go/bin/go`):
+
+- `go build ./...`, `go vet ./...`, `go test ./... -count=1`: pass. The new
+  package is `ok .../gnutella/g2`.
+- `go test ./internal/engine/gnutella/g2/ -fuzz=FuzzG2ParsePacket
+  -fuzztime=30s`: pass, 1,126,369 executions, no panic and no round-trip
+  mismatch. The fuzzer only ever reached the parser through it, and `Marshal`
+  of every accepted packet re-parsed equal.
+- SPDX first-line check: pass. `CGO_ENABLED=0 go list -deps ./cmd/sharzad` has
+  no `runtime/cgo`, and `CGO_ENABLED=0 go build ./...` passes.
+- **Mutation-tested, each guard then reverted:** removing the body-truncation
+  check panics on the truncated vector; removing the exact-consumption check
+  turns `TestParseMalformedRejected/over-long_input` red; dropping the
+  `ErrBadAlignment` classification turns `.../bad_alignment` red; removing the
+  header-bounds check panics; removing the name guard turns the two bad-name
+  cases red; removing the body-too-long guard turns `.../body_too_long` red.
+- Not run: the scripted-peer exchange. There is no transceiver yet, so no
+  packet is sent or received; the oracle for G2 cannot be gtk-gnutella
+  (Gnutella 1 only). This is by design for a codec slice.
+
+**Decisions worth recording:**
+
+- The emitter always writes at least one length byte, matching Shareaza, so a
+  zero-length packet's control byte is never the zero stream terminator. The
+  parser still accepts a spec-legal zero-width length field.
+- A compound packet's children are followed by an optional zero control byte,
+  and the bytes after it are the parent's payload. This is what
+  `CG2Packet::SkipCompound` does; without it, children-plus-payload would be
+  ambiguous.
+- `Parse` rejects trailing bytes (a single-packet contract, and the test's
+  "over-long" case). `ParseFrom` returns the consumed byte count for a stream
+  reader to advance. The transceiver slice is the first caller.
+- The reserved control-flag bit (0x01) is ignored, as Shareaza ignores it. A
+  non-canonical input is round-tripped to a structurally equal tree, not to
+  identical bytes; the pinned vectors are canonical and are byte-identical.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -399,3 +460,36 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### The rest of the Gnutella2 half, deliberately left out of the codec slice
+
+The G2 tree packet codec is the only G2 work landed. Each of the following is
+out of scope for it and is its own slice, in roughly the order that unblocks
+the next:
+
+- **UDP transceiver.** Datagram framing, the reliable/acknowledge flag, and the
+  buffer a stream reader drives with `ParseFrom`. This is the first caller of
+  the codec and the item most likely to want a multi-packet split helper (see
+  the next question).
+- **Hub topology.** `HUB`, `LEAF`, `HUBSTATUS`, `NH`, `NL` and the neighbour
+  bookkeeping over the transceiver.
+- **Query hash tables.** The `/QHT` reset/patch payload, including the deflate
+  patch path.
+- **`PART` completeness advertisement.** Per the ARCHITECTURE correction, a
+  count of complete bytes only; no block map, no `UFTT`/`UFSet`.
+- **G2 HTTP transfer layer.** The whole-file fetch behind a `QH2` hit, the G2
+  counterpart to the Gnutella 1 `Downloader`.
+- **KHL / `ukhl:` host cache bootstrap.** The G2 discovery packets and the
+  `ukhl:` cache form; the follow-up to the G1 GWebCache item.
+- **Wiring the codec into `Engine`'s dial loop.** The codec currently has no
+  caller; nothing in the engine imports it yet.
+
+### Should `ParseFrom` come with a stream-splitting helper?
+
+`ParseFrom` returns the bytes consumed so a TCP reader can loop, but the
+splitter itself (accumulate a buffer, cut one packet at a time, keep the
+remainder) does not exist. The UDP transceiver parses one datagram, so it may
+not need one; the G2-over-TCP path will. The transceiver slice should decide
+whether the helper lives beside the codec or in the transport, rather than the
+codec guessing now.
+
