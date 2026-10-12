@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -485,5 +486,61 @@ func TestReadHandshakeBuffersPreserveMessageBytes(t *testing.T) {
 	}
 	if hdr.Type != MsgPing || hdr.TTL != 3 {
 		t.Errorf("message after handshake = type %s ttl %d, want ping ttl 3", typeName(hdr.Type), hdr.TTL)
+	}
+}
+
+// TestPushUnclaimedDialBackIsClosedWithinClaimWindow drives a PUSH
+// against a scripted peer but never claims the dial-back, so the pending
+// push's claim window must close the connection the holder opened.
+// Without the timeout the unclaimed inbound connection would sit in the
+// accept loop forever.
+func TestPushUnclaimedDialBackIsClosedWithinClaimWindow(t *testing.T) {
+	const (
+		index = 7
+		size  = 64
+	)
+	serventID := testID(0x2B)
+	eng, _ := startEngine(t, Options{
+		KeepAliveInterval: time.Hour,
+		IdleTimeout:       10 * time.Second,
+		SearchTimeout:     500 * time.Millisecond,
+		PushClaimTimeout:  2 * time.Second,
+	})
+	r, conn := dialEngine(t, eng.Addr().String())
+	waitForPeers(t, eng, 1)
+
+	qh := searchWithFirewalledHit(t, eng, r, conn, serventID, index, size, "unclaimed.bin")
+	if err := eng.RequestPush(qh, qh.Hits[0]); err != nil {
+		t.Fatalf("RequestPush: %v", err)
+	}
+
+	ph, payload := readMsg(t, r)
+	if ph.Type != MsgPush {
+		t.Fatalf("message type = %s, want push", typeName(ph.Type))
+	}
+	push, err := DecodePush(payload)
+	if err != nil {
+		t.Fatalf("DecodePush: %v", err)
+	}
+
+	backAddr := net.JoinHostPort(net.IP(push.IP[:]).String(), strconv.Itoa(int(push.Port)))
+	back, err := net.DialTimeout("tcp", backAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial back to %s: %v", backAddr, err)
+	}
+	defer back.Close()
+
+	// Nobody calls AwaitPush, so the engine side must close. A timeout
+	// here would mean it stayed open, which is the bug this guards.
+	if err := back.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = bufio.NewReader(back).ReadByte()
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatal("unclaimed dial-back still open past the claim window")
+	}
+	if err == nil {
+		t.Fatal("unexpected byte from an unclaimed dial-back")
 	}
 }

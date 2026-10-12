@@ -84,15 +84,23 @@ type Options struct {
 	// the default 5 s.
 	SearchTimeout time.Duration
 
+	// PushClaimTimeout is how long a registered push waits for the
+	// holder's dial-back before it is abandoned and any offered
+	// connection is closed. Zero means the default 30 s.
+	PushClaimTimeout time.Duration
+
 	// OnQueryHit is called for every QUERYHIT received from a peer,
 	// with the descriptor ID the hit echoed. The id lets a caller match
 	// the hit to the Search that asked for it; Engine.Search collects
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
-	// searches is the engine's in-flight search registry. Run sets it;
-	// callers do not. Inbound QUERYHITs are delivered through it.
+	// searches is the engine's in-flight search registry, and pushes its
+	// servent-route and pending-push registry. Run sets them; callers do
+	// not. Inbound QUERYHITs are delivered through searches, and PUSH
+	// routing and dial-backs through pushes.
 	searches *searchRegistry
+	pushes   *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -104,6 +112,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.SearchTimeout <= 0 {
 		o.SearchTimeout = searchTimeout
+	}
+	if o.PushClaimTimeout <= 0 {
+		o.PushClaimTimeout = pushClaimTimeout
 	}
 	if o.Logf == nil {
 		o.Logf = func(format string, args ...any) {
@@ -140,6 +151,10 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes maps a QUERYHIT's servent identifier to the peer that
+	// delivered it, and holds pushes waiting for the holder's dial-back.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +168,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -180,9 +196,11 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	}
 	e.started = true
 	e.opts = opts.withDefaults()
-	// Every peer gets this engine's registry, so a QUERYHIT delivered on
-	// any connection can be matched to the Search that is waiting for it.
+	// Every peer gets this engine's registries, so a QUERYHIT delivered
+	// on any connection can be matched to the Search that is waiting for
+	// it, and a PUSH routed back over the connection that delivered it.
 	e.opts.searches = e.searches
+	e.opts.pushes = e.pushes
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -220,20 +238,32 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
+		// A connection whose source address has a pending push is the
+		// holder's dial-back, not a 0.6 peer: it goes to the transfer
+		// waiting for it instead of through the handshake. offer never
+		// blocks, so an unclaimed dial-back cannot pin the accept loop;
+		// the pending entry's claim timeout closes it if nobody takes it.
+		if ip, ok := ipv4Of(conn.RemoteAddr()); ok {
+			if pp := e.pushes.claimFor(ip); pp != nil {
+				e.pushes.offer(pp, conn)
+				continue
+			}
+		}
 		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
 		e.mu.Lock()
 		e.peers[pc] = struct{}{}
 		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
-				logf("inbound %s: %v", c.RemoteAddr(), err)
+			if err := serveConn(ctx, pc, true, e.opts, e.laddr); err != nil {
+				logf("inbound %s: %v", pc.addr, err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
-		}(conn, pc)
+			e.pushes.removePeer(pc)
+		}(pc)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -242,6 +272,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// the cache loops started from Run, whose startDial calls happen
 	// while their own count is still held.
 	e.wg.Wait()
+	// Any dial-back that was offered but never claimed is closed here;
+	// the pending entry's timer would eventually do it, but shutdown is
+	// the last chance to not leave a socket behind.
+	e.pushes.closeAll()
 	logf("stopped")
 	return nil
 }
@@ -317,12 +351,13 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, pc, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			e.pushes.removePeer(pc)
 			delay = dialBackoff
 			select {
 			case <-ctx.Done():

@@ -247,7 +247,58 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Gnutella PUSH: the downloader half is in, proven against a scripted peer
+
+`internal/engine/gnutella/push.go` adds the pushed-transfer path for a
+QUERYHIT whose source is firewalled (unspecified IP or zero port). The
+trailing 16-byte servent identifier of a QUERYHIT is the routing key:
+`Engine.RequestPush(qh, hit)` registers a pending push and writes a PUSH
+(0x40, fixed 26-byte payload) back over whichever peer connection delivered
+the hit, naming the holder in `ServentID` and telling it the address to dial
+back to (`Engine`'s own local IPv4 on that link plus its listen port) — the
+semantics Shareaza's `CG1Packet::OnPush` implements, where the holder acts
+only when the PUSH names its own GUID. The engine's accept loop routes a
+dial-back whose source IP matches a pending push to the registry instead of
+the 0.6 handshake, and `Downloader.FetchConn(ctx, conn, dir)` runs the
+transfer over the handed-over connection. Mutation tests: dropping the PUSH
+write, a consistent IP/port field-order swap, a no-op claim timeout, and
+accepting a size mismatch on the pushed path each went red before being
+reverted.
+
+`FetchConn` shares the direct path's `transferPlan`/`writeBody`, so the
+destination rules (sanitised single-component name, resume from an existing
+partial via `Range`, size-only integrity) are identical whichever way the
+connection was obtained; the pushed path deliberately has no dial of its
+own. A pending push that nobody claims is expired after
+`Options.PushClaimTimeout` (default 30s) and its buffered connection closed,
+so an unclaimed dial-back cannot pin the accept loop — that expiry is
+mutation-tested too.
+
+**Verification is scripted-peer, not oracle.** The end-to-end test drives a
+scripted 0.6 peer over real TCP: answer the QUERY with a firewalled QUERYHIT
+carrying a servent ID, read the PUSH back, dial the advertised address and
+serve the file; resume and size-mismatch are also pinned over `FetchConn`.
+The gtk-gnutella oracle loop remains skipped-not-passed (no root, no sudo),
+exactly as for the handshake and download items.
+
 ## Open questions
+
+### PUSH: the holder half and the GIV handshake are still absent
+
+- **A real holder waits for GIV.** Shareaza and gtk-gnutella open a pushed
+  connection with a `GIV <index>:<guid>/` line before the HTTP request. This
+  slice sends the GET straight over the dial-back and never reads a GIV line,
+  so interop with a live client is unproven; only the scripted test peer
+  tolerates it. A follow-up would read and validate the GIV against the
+  pending key before writing the GET — or the serving half (answering an
+  inbound PUSH by dialing back with `GIV`) gets built, which is the same
+  coin's flip side.
+- **The dial-back is matched by source IP only.** Two holders behind one
+  address, or a holder that dials back from a different address than it sent
+  the QUERYHIT from, are not distinguished; the claim window bounds the
+  damage. Keying the registry on IP + source port is the natural tightening.
+- **PUSH is not forwarded** (the engine has no horizon routing), which is
+  fine for a leaf, and the serving half remains out of scope per the brief.
 
 ### Download client: decisions left open
 

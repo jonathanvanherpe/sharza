@@ -22,6 +22,7 @@ package gnutella
 // declared one before any byte is kept.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -114,6 +115,18 @@ func (qh QueryHit) Source() string {
 	return net.JoinHostPort(net.IP(qh.IP[:]).String(), strconv.Itoa(int(qh.Port)))
 }
 
+// transferPlan is where a transfer writes and from where it resumes,
+// resolved from the hit and what is already on disk. Both Fetch and
+// FetchConn share it, so the direct and pushed paths apply the same
+// destination rules.
+type transferPlan struct {
+	dest     string // path inside the caller's directory
+	name     string // sanitised single path component
+	size     int64  // size the hit declared
+	offset   int64  // byte offset the transfer starts at
+	complete bool   // dest already holds the whole file
+}
+
 // Fetch downloads the hit into dir and returns the path it wrote. The
 // file name is sanitised from the QUERYHIT, so a hostile name cannot
 // leave dir. If dir already holds a partial file, the transfer resumes
@@ -126,17 +139,107 @@ func (qh QueryHit) Source() string {
 // against it. A transfer that is longer or shorter than declared is
 // refused and the destination is restored to the offset it started at.
 func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, error) {
-	if dir == "" {
-		return DownloadResult{}, errors.New("gnutella: download: no destination directory")
-	}
-	size := int64(d.Hit.FileSize)
 	if d.QH.Port == 0 {
 		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source port")
 	}
 	if net.IP(d.QH.IP[:]).IsUnspecified() {
 		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source address")
 	}
+	plan, err := d.plan(dir)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	if plan.complete {
+		return DownloadResult{Path: plan.dest, Offset: plan.offset, Complete: true}, nil
+	}
 
+	src := d.QH.Source()
+	rawURL := fmt.Sprintf("http://%s/gnutella/%d", src, d.Hit.FileIndex)
+	req, err := d.buildRequest(ctx, rawURL, plan)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	client := d.Client
+	if client == nil {
+		client = defaultDownloadClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
+	}
+	return d.writeBody(resp, plan, src, rawURL)
+}
+
+// FetchConn downloads the hit over a caller-supplied connection instead
+// of dialing the QUERYHIT's source. It is the pushed-transfer path: the
+// holder of a firewalled source dials back to this engine's listen port,
+// and the engine's accept loop hands that connection to the caller,
+// which passes it here.
+//
+// The source in the QUERYHIT is deliberately not consulted, because it
+// is the address that could not be dialed (that is why a push was
+// needed). Every other rule is Fetch's: declared and actual lengths are
+// verified against the hit's size, a refused transfer is truncated back
+// to its starting offset, resume is a Range on the existing partial, and
+// the name is sanitised to one path component.
+func (d *Downloader) FetchConn(ctx context.Context, conn net.Conn, dir string) (DownloadResult, error) {
+	if conn == nil {
+		return DownloadResult{}, errors.New("gnutella: download: no pushed connection")
+	}
+	plan, err := d.plan(dir)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	if plan.complete {
+		return DownloadResult{Path: plan.dest, Offset: plan.offset, Complete: true}, nil
+	}
+
+	// The address is not dialed; it only forms the request line and the
+	// Host header. The holder is whoever connected to us.
+	host := stripPort(conn.RemoteAddr().String())
+	if host == "" {
+		host = "pushed"
+	}
+	src := net.JoinHostPort(host, "0")
+	rawURL := fmt.Sprintf("http://%s/gnutella/%d", src, d.Hit.FileIndex)
+	req, err := d.buildRequest(ctx, rawURL, plan)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+
+	// The response header must arrive within the download header
+	// timeout. The body has no fixed deadline: the caller's context
+	// bounds it, and cancelling expires the connection's deadline so a
+	// blocked read returns.
+	if err := conn.SetWriteDeadline(time.Now().Add(downloadHeaderTimeout)); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: pushed download: %w", err)
+	}
+	if err := req.Write(conn); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: pushed download request: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(downloadHeaderTimeout)); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: pushed download: %w", err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stop()
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: pushed download response: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: pushed download: %w", err)
+	}
+	return d.writeBody(resp, plan, src, rawURL)
+}
+
+// plan resolves the destination and resume point from the hit and what
+// is already on disk. A file larger than the hit is not a partial of it,
+// so it is refused rather than truncated into one.
+func (d *Downloader) plan(dir string) (transferPlan, error) {
+	if dir == "" {
+		return transferPlan{}, errors.New("gnutella: download: no destination directory")
+	}
+	size := int64(d.Hit.FileSize)
 	name := sanitizeFileName(d.Hit.FileName)
 	if name == "" {
 		// A name that is nothing but separators, dots or control
@@ -147,52 +250,49 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		name = fmt.Sprintf("file-%d", d.Hit.FileIndex)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: download dir %s: %w", dir, err)
+		return transferPlan{}, fmt.Errorf("gnutella: download dir %s: %w", dir, err)
 	}
 	dest := filepath.Join(dir, name)
 
-	// Decide the resume point from what is already on disk. A file
-	// larger than the hit is not a partial of it, so it is refused
-	// rather than truncated into one.
 	var offset int64
 	if fi, err := os.Stat(dest); err == nil {
 		offset = fi.Size()
 		if offset > size {
-			return DownloadResult{}, fmt.Errorf("%w: %s is %d bytes, hit %q is %d",
+			return transferPlan{}, fmt.Errorf("%w: %s is %d bytes, hit %q is %d",
 				ErrSizeMismatch, dest, offset, d.Hit.FileName, size)
 		}
 		if offset == size {
-			return DownloadResult{Path: dest, Offset: offset, Complete: true}, nil
+			return transferPlan{dest: dest, name: name, size: size, offset: offset, complete: true}, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return DownloadResult{}, fmt.Errorf("gnutella: stat %s: %w", dest, err)
+		return transferPlan{}, fmt.Errorf("gnutella: stat %s: %w", dest, err)
 	}
+	return transferPlan{dest: dest, name: name, size: size, offset: offset}, nil
+}
 
-	src := d.QH.Source()
-	rawURL := fmt.Sprintf("http://%s/gnutella/%d", src, d.Hit.FileIndex)
+// buildRequest makes the servent GET for a plan. The length header tells
+// the peer the size the QUERYHIT advertised, which is the whole file even
+// for a resumed range.
+func (d *Downloader) buildRequest(ctx context.Context, rawURL string, plan transferPlan) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: download request %s: %w", rawURL, err)
+		return nil, fmt.Errorf("gnutella: download request %s: %w", rawURL, err)
 	}
-	// Servent request convention. The length header tells the peer the
-	// size the QUERYHIT advertised, which is the whole file even for a
-	// resumed range.
 	req.Header.Set("User-Agent", version.UserAgent())
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Connection", "Keep-Alive")
-	req.Header.Set("X-Gnutella-Content-Length", strconv.FormatInt(size, 10))
-	if offset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	req.Header.Set("X-Gnutella-Content-Length", strconv.FormatInt(plan.size, 10))
+	if plan.offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", plan.offset))
 	}
+	return req, nil
+}
 
-	client := d.Client
-	if client == nil {
-		client = defaultDownloadClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
-	}
+// writeBody applies the status and size checks to a response and writes
+// the body to the plan's destination. It is the one place either the
+// direct or the pushed path moves bytes, so their integrity rules cannot
+// drift apart.
+func (d *Downloader) writeBody(resp *http.Response, plan transferPlan, src, rawURL string) (DownloadResult, error) {
 	defer resp.Body.Close()
 
 	// A transparently decompressed body is not the file: the peer
@@ -204,14 +304,14 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		return DownloadResult{}, fmt.Errorf("%w: peer returned a compressed body", ErrSizeMismatch)
 	}
 
-	start := offset
+	start := plan.offset
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// The whole file, even if a Range was requested: the peer
 		// ignored it. Rewrite from zero, so the result is the file the
 		// QUERYHIT named rather than a splice onto a partial.
 		start = 0
-		if err := checkDeclaredSize(resp, size); err != nil {
+		if err := checkDeclaredSize(resp, plan.size); err != nil {
 			return DownloadResult{}, err
 		}
 	case http.StatusPartialContent:
@@ -219,13 +319,13 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		if err != nil {
 			return DownloadResult{}, err
 		}
-		if rangeStart != offset || total != size {
+		if rangeStart != plan.offset || total != plan.size {
 			return DownloadResult{}, fmt.Errorf("%w: Content-Range %q, expected bytes %d-%d/%d",
-				ErrSizeMismatch, resp.Header.Get("Content-Range"), offset, size-1, size)
+				ErrSizeMismatch, resp.Header.Get("Content-Range"), plan.offset, plan.size-1, plan.size)
 		}
-		if resp.ContentLength >= 0 && resp.ContentLength != size-offset {
+		if resp.ContentLength >= 0 && resp.ContentLength != plan.size-plan.offset {
 			return DownloadResult{}, fmt.Errorf("%w: Content-Length %d, expected %d",
-				ErrSizeMismatch, resp.ContentLength, size-offset)
+				ErrSizeMismatch, resp.ContentLength, plan.size-plan.offset)
 		}
 	default:
 		// Drain a little so the connection can be reused, then refuse:
@@ -240,16 +340,16 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	} else {
 		flags |= os.O_APPEND
 	}
-	f, err := os.OpenFile(dest, flags, 0o644)
+	f, err := os.OpenFile(plan.dest, flags, 0o644)
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: create %s: %w", dest, err)
+		return DownloadResult{}, fmt.Errorf("gnutella: create %s: %w", plan.dest, err)
 	}
 	defer f.Close()
 
 	// Read one byte past the expected length: that single extra byte is
 	// what distinguishes an exactly-right body from an over-long one,
 	// and a short read is caught by the count either way.
-	want := size - start
+	want := plan.size - start
 	n, err := io.Copy(f, io.LimitReader(resp.Body, want+1))
 	if err != nil {
 		truncateTo(f, start)
@@ -260,10 +360,10 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		return DownloadResult{}, fmt.Errorf("%w: body %d bytes, expected %d", ErrSizeMismatch, n, want)
 	}
 	if err := f.Sync(); err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: sync %s: %w", dest, err)
+		return DownloadResult{}, fmt.Errorf("gnutella: sync %s: %w", plan.dest, err)
 	}
-	d.logf()("downloaded %s from %s: %d bytes at offset %d", name, src, n, start)
-	return DownloadResult{Path: dest, Bytes: n, Offset: start}, nil
+	d.logf()("downloaded %s from %s: %d bytes at offset %d", plan.name, src, n, start)
+	return DownloadResult{Path: plan.dest, Bytes: n, Offset: start}, nil
 }
 
 // checkDeclaredSize verifies the lengths a peer declared in a 200

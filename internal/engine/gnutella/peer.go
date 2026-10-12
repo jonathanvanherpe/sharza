@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/jonathanvanherpe/sharza/internal/version"
@@ -48,37 +47,41 @@ const keepAliveTTL byte = 7
 // except the address.
 const pongPayloadSize = 14
 
-// peer is one established-or-connecting TCP link.
+// peer is one established-or-connecting TCP link. It writes through its
+// owning peerConn's mutex, so the message loop's PONGs, the keep-alive
+// PINGs, Engine.Search's QUERYs and Engine.RequestPush's PUSH all
+// serialise on one lock instead of interleaving on the wire.
 type peer struct {
+	pc      *peerConn
 	conn    net.Conn
 	inbound bool // accepted by us, rather than dialed by us
 	opts    Options
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
-	mu      sync.Mutex // serialises writes to conn
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, pc *peerConn, inbound bool, opts Options, laddr net.Addr) error {
 	p := &peer{
-		conn:    conn,
+		pc:      pc,
+		conn:    pc.conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	if tc, ok := p.conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetNoDelay(true)
 	}
 	// Closing the connection is how an idle readLoop, blocked in
 	// DecodeHeader, is told the context ended.
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stopClose := context.AfterFunc(ctx, func() { _ = p.conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
+	r := bufio.NewReader(p.conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {
@@ -359,11 +362,12 @@ func (p *peer) writeMessage(hdr Header, payload []byte) error {
 	return p.write(buf)
 }
 
-// write serialises writes from the reader goroutine (PONGs) and the
-// loop goroutine (keep-alive PINGs).
+// write serialises writes from the reader goroutine (PONGs), the loop
+// goroutine (keep-alive PINGs) and any writer that reaches the
+// connection through the engine (Search, RequestPush).
 func (p *peer) write(b []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.pc.mu.Lock()
+	defer p.pc.mu.Unlock()
 	if err := p.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		return err
 	}
@@ -459,10 +463,12 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// descriptor ID it echoes, records the responder's servent identifier
+// against this connection so a PUSH can be routed back over it, then
+// surfaces the hit to the Options.OnQueryHit callback. Delivery is by ID
+// because that is all a QUERYHIT carries: a hit under no in-flight ID is
+// another query's result and the registry drops it, but the callback
+// still sees every hit.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
@@ -472,9 +478,16 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
+	// The servent identifier is the PUSH routing key: it names the
+	// servent that has the file, and this connection is the one that can
+	// carry a PUSH back to it.
+	if qh.HasServentID && p.opts.pushes != nil {
+		p.opts.pushes.recordRoute(qh.ServentID, p.pc)
+	}
 	if p.opts.OnQueryHit != nil {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
-	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	p.logf("queryhit from %s: id=%x hits=%d servent=%v",
+		p.conn.RemoteAddr(), hdr.ID, len(qh.Hits), qh.HasServentID)
 	return nil
 }

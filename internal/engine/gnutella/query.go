@@ -23,13 +23,24 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name, then a trailing 16-byte servent identifier.
+//
+// The servent identifier is the responder's GUID. It is the routing key
+// a PUSH uses to reach the servent that has the file, so it is carried
+// rather than discarded. A response that predates it (or was truncated)
+// leaves HasServentID false, and such a hit cannot be pushed to.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	// ServentID is the responder's 16-byte servent identifier, present
+	// after the last hit. HasServentID distinguishes a real identifier
+	// from an absent one, because the zero value is a valid-looking ID.
+	ServentID    [idSize]byte
+	HasServentID bool
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +114,9 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	if qh.HasServentID {
+		out = append(out, qh.ServentID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +158,13 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// The responder's servent identifier follows the last hit. It is
+	// optional in practice (an older or truncated response omits it), so
+	// fewer than 16 trailing bytes leaves it unset rather than failing:
+	// a hit is still a usable search result without a push route.
+	if len(payload)-pos >= idSize {
+		copy(qh.ServentID[:], payload[pos:pos+idSize])
+		qh.HasServentID = true
+	}
 	return qh, nil
 }

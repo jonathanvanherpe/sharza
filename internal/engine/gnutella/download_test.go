@@ -8,10 +8,12 @@ package gnutella
 // would take; nothing here reaches the network.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -439,3 +441,166 @@ func TestEngineDownloaderWiresLogSink(t *testing.T) {
 		t.Error("Downloader did not receive the engine's Logf")
 	}
 }
+
+// rawHTTPConn answers one request read from conn with the given status,
+// headers and body, then closes. It is a scripted Gnutella servent
+// serving a pushed transfer over a connection the downloader did not
+// dial, so FetchConn is exercised over a real HTTP exchange.
+func rawHTTPConn(conn net.Conn, status int, reason string, headers map[string]string, body []byte) (*http.Request, error) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(testDeadline))
+	req, err := http.ReadRequest(bufio.NewReader(conn))
+	if err != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
+	for k, v := range headers {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	b.WriteString("\r\n")
+	if _, err := io.WriteString(conn, b.String()); err != nil {
+		return req, err
+	}
+	if _, err := conn.Write(body); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+// FetchConn is the pushed path: the downloader never dials, it writes the
+// GET down a connection handed to it. These tests use net.Pipe so both
+// ends are visible at once.
+func TestDownloadFetchConnServesFullFile(t *testing.T) {
+	const (
+		index = 5
+		size  = 900
+	)
+	content := testContent(size)
+	qh := QueryHit{IP: [4]byte{127, 0, 0, 1}, Port: 1}
+	hit := FileHit{FileIndex: index, FileSize: size, FileName: "pushed.bin"}
+
+	client, server := net.Pipe()
+	reqCh := make(chan *http.Request, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		req, err := rawHTTPConn(server, 200, "OK", map[string]string{
+			"Content-Length":            strconv.Itoa(size),
+			"X-Gnutella-Content-Length": strconv.Itoa(size),
+		}, content)
+		reqCh <- req
+		errCh <- err
+	}()
+
+	dir := t.TempDir()
+	res, err := NewDownloader(qh, hit).FetchConn(context.Background(), client, dir)
+	if err != nil {
+		t.Fatalf("FetchConn: %v", err)
+	}
+	if res.Bytes != size || res.Offset != 0 || res.Resumed() {
+		t.Errorf("result = %+v, want %d bytes at offset 0", res, size)
+	}
+	onDisk, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if !bytes.Equal(onDisk, content) {
+		t.Errorf("file on disk (%d bytes) does not match served content", len(onDisk))
+	}
+
+	req := <-reqCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("pushed server: %v", err)
+	}
+	if req == nil {
+		t.Fatal("no request reached the pushed server")
+	}
+	if req.URL.Path != fmt.Sprintf("/gnutella/%d", index) {
+		t.Errorf("request path = %q, want /gnutella/%d", req.URL.Path, index)
+	}
+	if got := req.Header.Get("X-Gnutella-Content-Length"); got != strconv.Itoa(size) {
+		t.Errorf("X-Gnutella-Content-Length = %q, want %d", got, size)
+	}
+	if got := req.Header.Get("Range"); got != "" {
+		t.Errorf("Range = %q, want none on a whole-file pushed transfer", got)
+	}
+}
+
+func TestDownloadFetchConnResumeRange(t *testing.T) {
+	const (
+		index   = 6
+		size    = 1000
+		partial = 400
+	)
+	content := testContent(size)
+	qh := QueryHit{IP: [4]byte{127, 0, 0, 1}, Port: 1}
+	hit := FileHit{FileIndex: index, FileSize: size, FileName: "resume-pushed.bin"}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, hit.FileName), content[:partial], 0o644); err != nil {
+		t.Fatalf("seed partial: %v", err)
+	}
+
+	client, server := net.Pipe()
+	reqCh := make(chan *http.Request, 1)
+	go func() {
+		req, _ := rawHTTPConn(server, 206, "Partial Content", map[string]string{
+			"Content-Range":             fmt.Sprintf("bytes %d-%d/%d", partial, size-1, size),
+			"Content-Length":            strconv.Itoa(size - partial),
+			"X-Gnutella-Content-Length": strconv.Itoa(size),
+		}, content[partial:])
+		reqCh <- req
+	}()
+
+	res, err := NewDownloader(qh, hit).FetchConn(context.Background(), client, dir)
+	if err != nil {
+		t.Fatalf("FetchConn: %v", err)
+	}
+	if res.Offset != partial || !res.Resumed() || res.Bytes != size-partial {
+		t.Errorf("result = %+v, want %d bytes at offset %d", res, size-partial, partial)
+	}
+	onDisk, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if !bytes.Equal(onDisk, content) {
+		t.Errorf("resumed pushed file (%d bytes) does not match served content", len(onDisk))
+	}
+	req := <-reqCh
+	if req == nil {
+		t.Fatal("no request reached the pushed server")
+	}
+	if got := req.Header.Get("Range"); got != fmt.Sprintf("bytes=%d-", partial) {
+		t.Errorf("Range = %q, want bytes=%d-", got, partial)
+	}
+}
+
+// A body that does not match the hit's declared size is refused on the
+// pushed path exactly as on the direct one, and the destination is left
+// no larger than the offset the transfer started at.
+func TestDownloadFetchConnRefusesSizeMismatch(t *testing.T) {
+	const (
+		index = 8
+		size  = 300
+	)
+	content := testContent(size)
+	qh := QueryHit{IP: [4]byte{127, 0, 0, 1}, Port: 1}
+	hit := FileHit{FileIndex: index, FileSize: size, FileName: "bad-pushed.bin"}
+
+	// No Content-Length, so the body is delimited by the close and the
+	// client has only the size the hit declared to count against.
+	client, server := net.Pipe()
+	go func() {
+		_, _ = rawHTTPConn(server, 200, "OK", map[string]string{
+			"X-Gnutella-Content-Length": strconv.Itoa(size),
+		}, content[:size-1])
+	}()
+
+	dir := t.TempDir()
+	if _, err := NewDownloader(qh, hit).FetchConn(context.Background(), client, dir); !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("FetchConn error = %v, want ErrSizeMismatch", err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, hit.FileName)); err == nil && fi.Size() != 0 {
+		t.Errorf("refused pushed transfer left %d bytes on disk, want none", fi.Size())
+	}
+}
+
