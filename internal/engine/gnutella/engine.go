@@ -140,6 +140,11 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes remembers the source addresses a PUSH was sent to, so the
+	// dial-back a firewalled source opens can be recognised and logged
+	// rather than surfacing as an unexplained inbound peer.
+	pushes *pendingPushes
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +158,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPendingPushes(),
 	}
 }
 
@@ -221,6 +227,9 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
 		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
+		if e.pushes.take(stripPort(conn.RemoteAddr().String())) {
+			logf("expected push connection from %s", conn.RemoteAddr())
+		}
 		e.mu.Lock()
 		e.peers[pc] = struct{}{}
 		e.mu.Unlock()
@@ -395,20 +404,39 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	buf = append(buf, payload...)
 
 	e.mu.Lock()
-	peers := make([]*peerConn, 0, len(e.peers))
-	for pc := range e.peers {
-		peers = append(peers, pc)
-	}
 	reg := e.searches
 	timeout := e.opts.SearchTimeout
 	e.mu.Unlock()
 
-	if len(peers) == 0 {
-		return nil, nil
-	}
-
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+
+	written, err := e.broadcast(buf)
+
+	// Wait out the collection window so late hits are collected. If no
+	// write succeeded there is no peer that can answer, so the wait would
+	// only delay an empty result.
+	if written > 0 {
+		timer := time.NewTimer(timeout)
+		<-timer.C
+	}
+	return reg.close(hdr.ID), err
+}
+
+// broadcast writes buf to every currently connected peer concurrently,
+// each under writeTimeout, and returns how many writes succeeded and the
+// first error. It is the shared write side of Search and Push: both send
+// one frame to every peer and need the same three things (a per-write
+// deadline, one reported error, and whether any peer actually received
+// it). A peer added or dropped while the writes are in flight is not
+// part of the snapshot, which is what both callers want.
+func (e *Engine) broadcast(buf []byte) (int, error) {
+	e.mu.Lock()
+	peers := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		peers = append(peers, pc)
+	}
+	e.mu.Unlock()
 
 	var (
 		wg       sync.WaitGroup
@@ -439,16 +467,68 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	}
 	wg.Wait()
 
-	// Wait out the collection window so late hits are collected. If no
-	// write succeeded there is no peer that can answer, so the wait would
-	// only delay an empty result.
-	if written.Load() > 0 {
-		timer := time.NewTimer(timeout)
-		<-timer.C
-	}
-
 	errMu.Lock()
 	err := firstErr
 	errMu.Unlock()
-	return reg.close(hdr.ID), err
+	return int(written.Load()), err
+}
+
+// Push asks the firewalled servent named by qh to connect back to us and
+// serve hit. A servent behind NAT cannot answer the download GET the
+// QUERYHIT advertises, so the PUSH carries the hit's servent GUID, the
+// hit's file index, and this engine's own listen address as the
+// dial-back target. It is fanned out to every connected peer because the
+// GUID, not the link, names the target: the peer that delivered the
+// QUERYHIT need not be the peer that acts on the PUSH.
+//
+// There is no wait window: PUSH is one-way and its effect is a connection
+// the source opens, not a reply. The returned error is the first write
+// error, and no connected peer is not an error, exactly like Search. The
+// source address is registered only when a write succeeded, so a push
+// that reached nobody does not mark an address as awaiting a dial-back.
+func (e *Engine) Push(qh QueryHit, hit FileHit) error {
+	p := Push{
+		GUID:      qh.GUID,
+		FileIndex: hit.FileIndex,
+		IP:        e.listenIP4(),
+		Port:      e.listenPort(),
+	}
+	payload := EncodePush(p)
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    7, // direct peer, TTL can be modest
+		Hops:   0,
+		Length: uint32(len(payload)),
+	}
+	buf := hdr.AppendTo(nil)
+	buf = append(buf, payload...)
+
+	written, err := e.broadcast(buf)
+	if written > 0 {
+		e.pushes.add(net.IP(qh.IP[:]).String())
+	}
+	return err
+}
+
+// listenIP4 is the IPv4 address the listener bound, or the zero address
+// when it is not IPv4 (an IPv6-only or unspecified listener). It is the
+// address a PUSH tells a source to dial back to, mirroring the address
+// rule the PONG payload uses.
+func (e *Engine) listenIP4() [4]byte {
+	var ip4 [4]byte
+	if ta, ok := e.laddr.(*net.TCPAddr); ok {
+		if ip := ta.IP.To4(); ip != nil {
+			copy(ip4[:], ip)
+		}
+	}
+	return ip4
+}
+
+// listenPort is the port the listener bound, or 0 before Run.
+func (e *Engine) listenPort() uint16 {
+	if ta, ok := e.laddr.(*net.TCPAddr); ok {
+		return uint16(ta.Port)
+	}
+	return 0
 }

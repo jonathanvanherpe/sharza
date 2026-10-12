@@ -30,6 +30,12 @@ type QueryHit struct {
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	// GUID is the 16-byte servent identifier that trails the hits on
+	// the wire, before any GGEP/XML trailer. It is the identity a PUSH
+	// addresses back to the servent that generated the hit; a QUERYHIT
+	// with no GUID trailer decodes to the zero GUID.
+	GUID [16]byte
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -144,5 +150,13 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// The hits are followed by the 16-byte servent GUID, then optional
+	// GGEP/XML/remote-IP trailers. A short or absent GUID is not an
+	// error: many servents omit it, and the bytes after a present one
+	// are left unparsed so real GGEP/XML trailers cannot break the
+	// decode.
+	if len(payload)-pos >= idSize {
+		copy(qh.GUID[:], payload[pos:pos+idSize])
+	}
 	return qh, nil
 }

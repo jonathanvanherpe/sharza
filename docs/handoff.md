@@ -247,7 +247,82 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Gnutella 0.6 PUSH: the codec and the engine's send side
+
+`internal/engine/gnutella/push.go` adds the PUSH message (`0x40`) codec
+and `Engine.Push`, and `QueryHit` now carries the 16-byte servent GUID
+that trails the hits on the wire. The slice targets the firewalled half
+of the download leg: a QUERYHIT from a NAT'd source names an address that
+cannot accept our GET, so the requester asks that source to connect out
+instead.
+
+The wire format is the published one. A PUSH payload is a 16-byte GUID, a
+4-byte file index (LE), a 4-byte IPv4 address (big-endian, like every
+other address in the protocol) and a 2-byte port (LE), 26 bytes fixed.
+The brief said "reject payloads under 22 bytes"; 16+4+2 omits the address
+and cannot describe a valid PUSH, and Shareaza's `CG1Packet::OnPush`
+refuses `m_nLength < 26`. The published minimum is implemented instead.
+This is the same class of brief/spec divergence as the handshake item's
+`PUSH 0x03`, and it is handled the same way: follow the spec, record the
+deviation.
+
+`Engine.Push(qh, hit)` fans one PUSH frame out to every connected peer,
+built from the hit's servent GUID, the hit's file index, and the engine's
+own listen address as the dial-back target. The GUID, not the link, names
+the target, so fan-out is correct even when the peer that delivered the
+QUERYHIT is not the peer that should act on the PUSH. It mirrors `Search`:
+one write per peer under `writeTimeout`, the first write error returned,
+no wait window (a PUSH's effect is a connection the source opens, not a
+reply), and no connected peer is not an error. The write side is now the
+shared unexported `Engine.broadcast`, so `Search` and `Push` cannot drift
+apart in their deadline or error handling.
+
+The engine keeps a pending-push registry keyed by the source address a
+PUSH was sent to. A PUSH that reached nobody does not register, so an
+address is only remembered when a frame actually left. An inbound
+connection from a pending address is logged as "expected push
+connection", which is the observable that the dial-back is the one we
+asked for rather than an unexplained peer. Entries expire after
+`pushPendingTTL` (60 s) and are pruned on insert, so a push nobody answers
+does not grow the map for the daemon's lifetime.
+
+Inbound PUSH is decoded instead of ignored (`peer.handlePush`): the target
+GUID, file index and dial-back address are logged, and a malformed payload
+is dropped like any other bad message, never fatal. Nothing acts on it
+yet; see the open questions.
+
+Evidence: the codec round-trips and refuses every short payload; a
+two-peer fan-out over real TCP asserts each received frame's GUID equals
+the hit's servent GUID and its IP:port equal the engine listener; a
+0.6-style QUERYHIT with a trailing GUID parses (GGEP/XML bytes after it
+ignored) and one without stays zero-GUID; and an inbound dial-back from a
+registered address produces the expected-push log line. Mutation-checked:
+forcing the GUID field empty, offsetting the port by one, and disabling
+the fan-out each turned the guarding test red before being reverted.
+
 ## Open questions
+
+### Push: what this slice deliberately leaves open
+
+- **The dial-back transfer does not exist.** `Engine.Push` asks a source
+  to connect out; the accept side recognises the connection and logs it,
+  but nothing serves the file over it. The pushed connection needs a
+  servent-side HTTP GET handler (`/gnutella/<index>`) and a client that
+  reads it, which is the next slice.
+- **Inbound PUSH is logged, not acted on.** A PUSH naming *our* GUID
+  should make us dial the address it carries, and a PUSH for another node
+  is a routing decision (which peer holds that GUID). Neither is done: the
+  engine has no servent GUID to match against yet, and no GUID-to-peer
+  routing table.
+- **The engine advertises no GUID.** `QueryHit.GUID` is decoded because a
+  remote QUERYHIT carries one, but `EncodeQueryHit` does not append our
+  own, so peers cannot PUSH us. That is deliberate for this slice (acting
+  on inbound PUSH is out of scope) and belongs with the accept-side work.
+- **The pending-push registry's TTL is a guess.** 60 s is a round number,
+  not measured against a real firewalled source; the oracle would settle
+  it. `pushPendingTTL` is the single place to change.
+- **No GGEP push-proxy and no browse-host.** Both are separate features,
+  out of scope here.
 
 ### Download client: decisions left open
 

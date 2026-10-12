@@ -274,9 +274,10 @@ func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 	}
 }
 
-// handle processes one message. Routing and file transfer are out of
-// scope for this item, so Query, QueryHit and Push are acknowledged in
-// the log and ignored.
+// handle processes one message. Inbound routing and file transfer are
+// out of scope for this item: an inbound QUERY is answered from the
+// local catalogue and an inbound QUERYHIT is surfaced to the waiting
+// searcher, but an inbound PUSH is decoded for its log line only.
 func (p *peer) handle(hdr Header, payload []byte) error {
 	switch hdr.Type {
 	case MsgPing:
@@ -290,9 +291,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
-		return nil
+		return p.handlePush(hdr, payload)
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
 		return nil
@@ -476,5 +475,23 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	return nil
+}
+
+// handlePush decodes an inbound PUSH and logs the servent GUID it names.
+// Acting on a push (dialing the address back so a firewalled source can
+// serve us the file) and routing it onward are separate slices, so the
+// message is neither answered nor rejected. A malformed payload is
+// dropped only: like the other decoder failures it is a bad message from
+// a live peer, never a reason to close the connection.
+func (p *peer) handlePush(hdr Header, payload []byte) error {
+	push, err := DecodePush(payload)
+	if err != nil {
+		p.logf("bad push from %s: %v", p.conn.RemoteAddr(), err)
+		return nil
+	}
+	p.logf("push from %s: target-guid=%x file=%d dialback=%s:%d",
+		p.conn.RemoteAddr(), push.GUID, push.FileIndex,
+		net.IP(push.IP[:]).String(), push.Port)
 	return nil
 }

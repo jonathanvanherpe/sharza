@@ -95,6 +95,68 @@ func TestDecodeQueryHitMalformed(t *testing.T) {
 	}
 }
 
+// TestDecodeQueryHitReadsTrailingGUID pins the 0.6 QUERYHIT trailer: the
+// last hit is followed by the 16-byte servent GUID, then optional
+// GGEP/XML/remote-IP data. The GUID is what a PUSH addresses back to the
+// servent that answered, and the bytes after it must be ignored so a real
+// peer's GGEP block does not break the decode.
+func TestDecodeQueryHitReadsTrailingGUID(t *testing.T) {
+	guid := testID(0x3C)
+	qh := QueryHit{
+		HitCount: 1,
+		Port:     6346,
+		IP:       [4]byte{10, 0, 0, 1},
+		Speed:    1000,
+		Hits:     []FileHit{{FileIndex: 4, FileSize: 40, FileName: "guid.mp3"}},
+	}
+	wire := EncodeQueryHit(qh)
+	wire = append(wire, guid[:]...)
+	// A GGEP block and an XML trailer follow the GUID on real peers.
+	wire = append(wire, 0xC3, 0x01, 0x00)
+	wire = append(wire, []byte("<xml></xml>")...)
+
+	dec, err := DecodeQueryHit(wire)
+	if err != nil {
+		t.Fatalf("DecodeQueryHit: %v", err)
+	}
+	if dec.GUID != guid {
+		t.Errorf("GUID = %x, want the trailing servent GUID %x", dec.GUID, guid)
+	}
+	if len(dec.Hits) != 1 || dec.Hits[0].FileName != "guid.mp3" {
+		t.Fatalf("hits = %+v, want the one encoded hit", dec.Hits)
+	}
+}
+
+// TestDecodeQueryHitWithoutGUIDIsZero covers the tolerant path the live
+// swarm needs: a QUERYHIT with no GUID trailer (or a short one) decodes
+// with a zero GUID and no error, and the hit itself is unaffected.
+func TestDecodeQueryHitWithoutGUIDIsZero(t *testing.T) {
+	qh := QueryHit{
+		HitCount: 1,
+		Port:     6346,
+		IP:       [4]byte{10, 0, 0, 1},
+		Hits:     []FileHit{{FileIndex: 4, FileSize: 40, FileName: "noguid.mp3"}},
+	}
+	dec, err := DecodeQueryHit(EncodeQueryHit(qh))
+	if err != nil {
+		t.Fatalf("DecodeQueryHit: %v", err)
+	}
+	if dec.GUID != ([16]byte{}) {
+		t.Errorf("GUID = %x, want the zero GUID when no trailer is present", dec.GUID)
+	}
+
+	// Fewer than 16 bytes trailing is a short trailer, not a GUID and not
+	// an error.
+	short := append(EncodeQueryHit(qh), 0xAA, 0xBB)
+	dec2, err := DecodeQueryHit(short)
+	if err != nil {
+		t.Fatalf("DecodeQueryHit with a short trailer: %v", err)
+	}
+	if dec2.GUID != ([16]byte{}) {
+		t.Errorf("GUID with a short trailer = %x, want zero", dec2.GUID)
+	}
+}
+
 func FuzzDecodeQuery(f *testing.F) {
 	// seed with valid messages
 	q := Query{MinSpeed: 0, Search: "test"}
