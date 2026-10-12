@@ -33,7 +33,7 @@ RestartSec=5
 
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/sharza
+ReadWritePaths=%h/.local/share/sharza %h/.local/state/sharzad %t/sharzad
 ProtectKernelModules=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

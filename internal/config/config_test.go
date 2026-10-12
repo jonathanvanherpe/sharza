@@ -22,8 +22,156 @@ func TestDefaultIsUsable(t *testing.T) {
 	if len(c.WorkerRoles) == 0 {
 		t.Error("Default() spawns no workers")
 	}
-	if filepath.Dir(c.SocketPath) != c.StateDir {
-		t.Errorf("socket %q is not inside state dir %q", c.SocketPath, c.StateDir)
+	// The socket is a runtime artifact, so it belongs in RuntimeDir, not
+	// in the persistent state dir. Pinning it here catches a default that
+	// quietly creeps back into state.
+	if filepath.Dir(c.SocketPath) != c.RuntimeDir {
+		t.Errorf("socket %q is not inside runtime dir %q", c.SocketPath, c.RuntimeDir)
+	}
+	// Downloads are data, not state: a backup of the state file must not
+	// drag the user's whole library with it.
+	if filepath.Dir(c.DownloadDir) != c.DataDir {
+		t.Errorf("download dir %q is not inside data dir %q", c.DownloadDir, c.DataDir)
+	}
+	if c.StateDir == c.DataDir || c.RuntimeDir == c.StateDir {
+		t.Errorf("dirs are not distinct: data=%q state=%q runtime=%q",
+			c.DataDir, c.StateDir, c.RuntimeDir)
+	}
+}
+
+// Defaults must follow the XDG spec so the daemon lands where a Linux user
+// expects, and so nothing requires privileges to create. XDG_STATE_HOME is
+// load-bearing: persistent state is not user-facing data and does not belong
+// in ~/.local/share.
+func TestDefaultsFollowXDG(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+
+	c := Default()
+	if want := filepath.Join(base, "data", "sharza"); c.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", c.DataDir, want)
+	}
+	if want := filepath.Join(base, "state", "sharzad"); c.StateDir != want {
+		t.Errorf("StateDir = %q, want %q", c.StateDir, want)
+	}
+	if want := filepath.Join(base, "run", "sharzad"); c.RuntimeDir != want {
+		t.Errorf("RuntimeDir = %q, want %q", c.RuntimeDir, want)
+	}
+	if want := filepath.Join(base, "data", "sharza", "downloads"); c.DownloadDir != want {
+		t.Errorf("DownloadDir = %q, want %q (under data_dir)", c.DownloadDir, want)
+	}
+	if want := filepath.Join(base, "run", "sharzad", "sharzad.sock"); c.SocketPath != want {
+		t.Errorf("SocketPath = %q, want %q (under runtime_dir)", c.SocketPath, want)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+// Without a runtime dir (a system service, a minimal container) the socket
+// must still resolve to a writable per-user path. /run is not writable by an
+// unprivileged daemon, so silently defaulting there would be wrong.
+func TestDefaultsFallBackWithoutXDG(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+
+	c := Default()
+	if want := filepath.Join(home, ".local/share/sharza"); c.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", c.DataDir, want)
+	}
+	if want := filepath.Join(home, ".local/state/sharzad"); c.StateDir != want {
+		t.Errorf("StateDir = %q, want %q", c.StateDir, want)
+	}
+	if want := filepath.Join(c.StateDir, "run"); c.RuntimeDir != want {
+		t.Errorf("RuntimeDir = %q, want %q under state_dir", c.RuntimeDir, want)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+// A relative directory would resolve against whatever cwd the service manager
+// happened to hand the daemon, which is how it ends up managing a directory
+// nobody chose.
+func TestDirFieldsMustBeAbsolute(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		field string
+		apply func(*Config)
+	}{
+		{"data_dir", func(c *Config) { c.DataDir = "relative/data" }},
+		{"state_dir", func(c *Config) { c.StateDir = "relative/state" }},
+		{"runtime_dir", func(c *Config) { c.RuntimeDir = "relative/run" }},
+	}
+	for _, tc := range cases {
+		c := &Config{DataDir: t.TempDir(), StateDir: t.TempDir(), RuntimeDir: t.TempDir()}
+		c.applyDefaults()
+		tc.apply(c)
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("%s relative path was accepted, want rejection", tc.field)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("%s error does not name the field: %v", tc.field, err)
+		}
+	}
+}
+
+// Validate is pure: it may notice that a path is already a regular file, but
+// it must not create anything. This pins the "file in the way" rejection at
+// load time, before the daemon touches the filesystem.
+func TestValidateRejectsFileWhereDirExpected(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	file := filepath.Join(base, "state")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	c := &Config{DataDir: t.TempDir(), StateDir: file, RuntimeDir: t.TempDir()}
+	c.applyDefaults()
+	err := c.Validate()
+	if err == nil {
+		t.Error("Validate accepted a regular file as state_dir, want rejection")
+	} else if !strings.Contains(err.Error(), "state_dir") {
+		t.Errorf("error does not name the field: %v", err)
+	}
+}
+
+// The JSON keys must round-trip: Load uses DisallowUnknownFields, so a stale
+// tag would reject a config file that spells a key correctly.
+func TestLoadReadsDirFields(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{
+  "data_dir": "/tmp/sharza-test-data",
+  "state_dir": "/tmp/sharza-test-state",
+  "runtime_dir": "/tmp/sharza-test-run",
+  "web_listen": "127.0.0.1:9999"
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DataDir != "/tmp/sharza-test-data" ||
+		c.StateDir != "/tmp/sharza-test-state" ||
+		c.RuntimeDir != "/tmp/sharza-test-run" {
+		t.Errorf("dirs = %q / %q / %q, want the three configured",
+			c.DataDir, c.StateDir, c.RuntimeDir)
+	}
+	if c.SocketPath != "/tmp/sharza-test-run/sharzad.sock" {
+		t.Errorf("socket_path = %q, want it derived from runtime_dir", c.SocketPath)
+	}
+	if c.DownloadDir != "/tmp/sharza-test-data/downloads" {
+		t.Errorf("download_dir = %q, want it derived from data_dir", c.DownloadDir)
 	}
 }
 
@@ -280,18 +428,20 @@ func TestLoadRejectsBadWebListen(t *testing.T) {
 	}
 }
 
-func TestEnsureDirsCreatesBoth(t *testing.T) {
+func TestEnsureDirsCreatesAll(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
 	c := &Config{
+		DataDir:     filepath.Join(base, "data"),
 		StateDir:    filepath.Join(base, "state"),
-		DownloadDir: filepath.Join(base, "downloads"),
+		RuntimeDir:  filepath.Join(base, "run"),
+		DownloadDir: filepath.Join(base, "data", "downloads"),
 	}
 	c.applyDefaults()
 	if err := c.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)
 	}
-	for _, d := range []string{c.StateDir, c.DownloadDir} {
+	for _, d := range []string{c.DataDir, c.StateDir, c.RuntimeDir, c.DownloadDir} {
 		fi, err := os.Stat(d)
 		if err != nil {
 			t.Errorf("stat %s: %v", d, err)
@@ -300,11 +450,93 @@ func TestEnsureDirsCreatesBoth(t *testing.T) {
 		if !fi.IsDir() {
 			t.Errorf("%s is not a directory", d)
 		}
-		// The state dir holds the user's whole download queue and search
-		// history, so it must not be world-readable.
+		// The state dir holds the user's whole download queue and
+		// search history, so it must not be world-readable. The others
+		// are no less private: a socket path is the daemon's auth.
 		if perm := fi.Mode().Perm(); perm != 0o700 {
 			t.Errorf("%s mode = %04o, want 0700", d, perm)
 		}
+	}
+}
+
+// A directory can exist and still be unusable. This is the case a bare
+// MkdirAll cannot see: the path is already there, so it reports success while
+// the first store write fails later with a permission error.
+func TestEnsureDirsRejectsUnwritableDir(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the probe cannot fail")
+	}
+	base := t.TempDir()
+	readonly := filepath.Join(base, "readonly")
+	if err := os.Mkdir(readonly, 0o500); err != nil {
+		t.Fatalf("mkdir readonly: %v", err)
+	}
+	c := &Config{
+		DataDir:     filepath.Join(readonly, "data"),
+		StateDir:    filepath.Join(readonly, "state"),
+		RuntimeDir:  filepath.Join(readonly, "run"),
+		DownloadDir: filepath.Join(readonly, "downloads"),
+	}
+	c.applyDefaults()
+	err := c.EnsureDirs()
+	if err == nil {
+		t.Fatal("EnsureDirs accepted a read-only parent, want an error")
+	}
+	if !strings.Contains(err.Error(), "not writable") && !strings.Contains(err.Error(), "create") {
+		t.Errorf("error does not explain the failure: %v", err)
+	}
+}
+
+// This is the probe's own test. The read-only *parent* above makes MkdirAll
+// fail, so it would stay green even if the probe did not exist. Here the
+// target directory exists (MkdirAll reports success) and only the write probe
+// can notice it is unusable, so removing the probe turns this red.
+func TestEnsureDirsProbesExistingDir(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the probe cannot fail")
+	}
+	base := t.TempDir()
+	existing := filepath.Join(base, "existing")
+	if err := os.Mkdir(existing, 0o500); err != nil {
+		t.Fatalf("mkdir existing: %v", err)
+	}
+	// Only DataDir needs to be the unwritable one: EnsureDirs checks it first.
+	c := &Config{
+		DataDir:     existing,
+		StateDir:    filepath.Join(base, "state"),
+		RuntimeDir:  filepath.Join(base, "run"),
+		DownloadDir: filepath.Join(base, "downloads"),
+	}
+	c.applyDefaults()
+	err := c.EnsureDirs()
+	if err == nil {
+		t.Fatal("EnsureDirs accepted an existing read-only dir; MkdirAll is not a usability check")
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Errorf("error does not name the writability failure: %v", err)
+	}
+}
+
+// EnsureDirs must fail when a path component is a regular file: the daemon
+// cannot write a state file into something that is not a directory.
+func TestEnsureDirsRejectsFileInTheWay(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	blocker := filepath.Join(base, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	c := &Config{
+		DataDir:     filepath.Join(blocker, "data"),
+		StateDir:    filepath.Join(base, "state"),
+		RuntimeDir:  filepath.Join(base, "run"),
+		DownloadDir: filepath.Join(base, "downloads"),
+	}
+	c.applyDefaults()
+	if err := c.EnsureDirs(); err == nil {
+		t.Error("EnsureDirs accepted a file in place of a directory, want an error")
 	}
 }
 

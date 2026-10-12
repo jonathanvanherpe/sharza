@@ -238,7 +238,9 @@ func writeConfig(t *testing.T, dir, restartDelay string) string {
 	}
 
 	cfg := config.Config{
+		DataDir:            filepath.Join(dir, "data"),
 		StateDir:           dir,
+		RuntimeDir:         dir,
 		SocketPath:         filepath.Join(dir, cfgSocketName),
 		WebListen:          fmt.Sprintf("127.0.0.1:%d", freePort(t)),
 		WorkerRoles:        []role.Role{role.BT, role.ED2K, role.G2},
@@ -725,7 +727,17 @@ func TestStopLeavesNoOrphanWorkerDescendants(t *testing.T) {
 	bin := buildForker(t)
 
 	cfg := config.Default()
-	cfg.StateDir = t.TempDir()
+	// Every writable root must point into the temp dir. StartWorkers calls
+	// EnsureDirs, so leaving DataDir or RuntimeDir at their env-derived
+	// defaults would create directories in the real home.
+	base := t.TempDir()
+	cfg.DataDir = filepath.Join(base, "data")
+	cfg.StateDir = filepath.Join(base, "state")
+	cfg.RuntimeDir = filepath.Join(base, "run")
+	// Default() also pre-fills DownloadDir from the default data dir. It is
+	// its own field, so overriding DataDir does not move it; leaving it would
+	// still send the write probe into the real home.
+	cfg.DownloadDir = filepath.Join(cfg.DataDir, "downloads")
 	// One role is enough and keeps the failure legible: the invariant is
 	// about descendants, not about how many workers there are.
 	cfg.WorkerRoles = []role.Role{role.BT}

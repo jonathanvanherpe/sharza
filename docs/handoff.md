@@ -6,6 +6,73 @@ blocker.
 
 ## Resolved in this cycle
 
+### Daemon config: persistent, state and runtime dirs from config, with XDG-aware defaults
+
+`internal/config` now owns where the daemon puts things. Three new config
+keys, `data_dir`, `state_dir` and `runtime_dir`, are resolved at load time;
+`socket_path` and `download_dir` derive from them rather than standing alone
+(an explicit setting is still honoured, but a bare `data_dir` moves downloads
+with it).
+
+Defaults follow the XDG Base Directory spec so an unprivileged daemon lands
+where a Linux user expects, and `$XDG_RUNTIME_DIR` is required to be per-user
+and non-persistent, which is exactly right for a socket:
+
+- `data_dir` = `$XDG_DATA_HOME/sharza` (fallback `~/.local/share/sharza`)
+- `state_dir` = `$XDG_STATE_HOME/sharzad` (fallback `~/.local/state/sharzad`)
+- `runtime_dir` = `$XDG_RUNTIME_DIR/sharzad` (fallback `state_dir/run`, so a
+  system service or container without a runtime dir still gets a writable
+  socket path instead of dying on an unwritable `/run`)
+
+Validation is split in two on purpose. `Validate` is pure: it rejects a
+relative path (which would resolve against whatever cwd the service manager
+handed the process) and a path that already exists as a regular file, but it
+creates nothing. `EnsureDirs` creates all four directories at mode 0700 and
+probes each with a temp file, because *existing* is not the same as *usable*
+(a read-only mount or a dir owned by another user passes `MkdirAll`). It runs
+once at startup (`cmd/sharzad`) before the store opens, so a bad path fails
+the daemon with a message naming the directory instead of surfacing later as
+a store write that silently cannot happen. The systemd units grant
+`ReadWritePaths` for exactly the three roots.
+
+One test gotcha worth recording: `config.Default()` pre-fills `DownloadDir`
+from the *default* data dir, and `DownloadDir` is its own field, so
+overriding `DataDir` afterwards does not move it. The supervisor orphan test
+overrides all four (data, state, runtime, download) for this reason; a
+test that overrides only `DataDir` would send the writability probe into the
+real home directory (found by strace after the suite kept recreating
+`~/.local/share/sharza`).
+
+## Open questions
+
+### Where does the config file itself live?
+
+The dirs the daemon writes to are now configurable, but discovery of the
+config *file* is still the flag default of `~/.config/sharza/sharza.json`.
+No `config_dir` handling exists for `/etc/sharza`, per-user overrides, or an
+XDG-free install, and the file path in `docs/ARCHITECTURE.md` predates the
+JSON migration. A `XDG_CONFIG_HOME`-rooted default plus an explicit
+`Config`-path flag is the natural shape, but the search order and the
+system-wide path are a packaging decision.
+
+### The socket filename in the docs and the code disagree
+
+Live code serves `sharzad.sock` under `runtime_dir`; `docs/ARCHITECTURE.md`
+still shows `/run/sharzad/rpc.sock`. Either the doc or the filename should
+change. The code's name also differs per-user, since it follows
+`$XDG_RUNTIME_DIR`, so a multi-user host gets `/run/user/<uid>/sharzad` per
+login session — which is correct XDG behaviour, but it means the doc's
+"`/run/sharzad`" picture is wrong in more ways than the filename alone.
+
+### systemd unit install path
+
+`packaging/systemd/` ships both `sharzad.service` and a `sharzad@.service`
+instance unit, both with `ReadWritePaths` for the three dirs, but nothing
+decides where they install (`/usr/lib/systemd/system` vs
+`/usr/local/lib/systemd/system`) or whether the instance unit is the
+intended default. Packaging does not exist yet, so this is parked, not
+wrong.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.

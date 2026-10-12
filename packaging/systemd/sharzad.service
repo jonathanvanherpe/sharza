@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Sharza supervisor. Runs as a user service: the daemon needs no privileges,
-# because its state directory and control socket live under the user's own
-# data dir.
+# because its data, state and control socket live under the user's own XDG
+# directories ($XDG_DATA_HOME, $XDG_STATE_HOME and $XDG_RUNTIME_DIR).
 #
 # Install with:
 #   systemctl --user enable --now sharzad.service
@@ -32,13 +32,14 @@ TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
 
-# Hardening. The daemon needs to write its state dir and nothing else, and it
-# has no reason to own new privileges.
+# Hardening. The daemon writes its data and state dirs plus the runtime socket
+# and nothing else, and it has no reason to own new privileges. %t is the user
+# runtime dir (/run/user/$UID) under a user service.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/sharza
+ReadWritePaths=%h/.local/share/sharza %h/.local/state/sharzad %t/sharzad
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

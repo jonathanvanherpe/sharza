@@ -79,6 +79,15 @@ func runSupervisor(ctx context.Context, cfgPath string, noWorkers bool) error {
 		return err
 	}
 
+	// Create and probe every directory before anything opens a file in
+	// one. The store and the socket server would each create their own
+	// parent implicitly, but neither reports a read-only or wrong-owner
+	// directory as clearly as this does, and doing it up front means a
+	// misconfigured path fails at startup rather than at the first write.
+	if err := cfg.EnsureDirs(); err != nil {
+		return err
+	}
+
 	st, err := store.Open(store.FileStoreOptions{Path: cfg.StatePath()})
 	if err != nil {
 		return err
@@ -130,8 +139,8 @@ func runSupervisor(ctx context.Context, cfgPath string, noWorkers bool) error {
 	defer httpSrv.Close()
 
 	fmt.Fprintf(logOut,
-		"sharzad: supervisor pid=%d socket=%s web=%s state=%s schema=%d workers=%v\n",
-		os.Getpid(), cfg.SocketPath, cfg.WebListen, cfg.StatePath(),
+		"sharzad: supervisor pid=%d socket=%s web=%s data=%s state=%s runtime=%s schema=%d workers=%v\n",
+		os.Getpid(), cfg.SocketPath, cfg.WebListen, cfg.DataDir, cfg.StateDir, cfg.RuntimeDir,
 		mustSchemaVersion(st), cfg.WorkerRoles)
 	if cfg.ExposeWeb {
 		fmt.Fprintf(logOut,

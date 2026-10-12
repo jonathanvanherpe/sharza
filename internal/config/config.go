@@ -2,10 +2,11 @@
 
 // Package config resolves Sharza's runtime paths and settings.
 //
-// Sharza keeps everything under a single state directory so the whole
-// installation is one directory to back up, one to move between hosts, and
-// one to remove. Nothing is written outside it, and nothing requires
-// privileges to create.
+// Paths follow the XDG base directory spec so the daemon needs no privileges
+// and lands where a Linux user expects: downloaded data under
+// $XDG_DATA_HOME, persistent state under $XDG_STATE_HOME, and the control
+// socket under $XDG_RUNTIME_DIR. Every path is overridable in the config
+// file, and the daemon creates what is missing at startup.
 package config
 
 import (
@@ -23,15 +24,36 @@ import (
 	"github.com/jonathanvanherpe/sharza/internal/role"
 )
 
-// DefaultStateDir is used when no config file names one. It follows XDG.
-const DefaultStateDirName = ".local/share/sharza"
+// Directory names under the XDG bases. State and runtime carry the daemon's
+// own name because they belong to sharzad; downloaded data carries the project
+// name because it belongs to the user.
+const (
+	dataDirName  = "sharza"
+	stateDirName = "sharzad"
+)
+
+// defaultWebListen lives one above the Gnutella/Gnutella2 port (6346), on
+// loopback, so the UI port is easy to remember and unreachable from the
+// network.
+const defaultWebListen = "127.0.0.1:6347"
 
 // Config is the resolved runtime configuration.
 type Config struct {
-	// StateDir holds the database, socket and logs.
+	// DataDir holds downloaded file data. It follows $XDG_DATA_HOME and is
+	// deliberately separate from StateDir, so backing up the small state
+	// file does not drag a directory of downloads with it.
+	DataDir string `json:"data_dir"`
+
+	// StateDir holds the database and logs. It follows $XDG_STATE_HOME,
+	// the spec's home for persistent state that is not user-facing data.
 	StateDir string `json:"state_dir"`
 
-	// SocketPath is the control socket.
+	// RuntimeDir holds the control socket. It follows $XDG_RUNTIME_DIR,
+	// which is a tmpfs cleared at logout, so a stale socket cannot outlive
+	// the session that made it.
+	RuntimeDir string `json:"runtime_dir"`
+
+	// SocketPath is the control socket, inside RuntimeDir by default.
 	SocketPath string `json:"socket_path"`
 
 	// WebListen is the web UI bind address. By default it must be a
@@ -59,7 +81,7 @@ type Config struct {
 	// that exited. A zero value means use the default.
 	WorkerRestartDelay string `json:"worker_restart_delay"`
 
-	// DownloadDir is where completed files land.
+	// DownloadDir is where completed files land, inside DataDir by default.
 	DownloadDir string `json:"download_dir"`
 
 	// GnutellaEnabled turns the g2 worker's Gnutella engine on. The
@@ -88,36 +110,37 @@ type Config struct {
 	ConfigPath string `json:"-"`
 }
 
-// Default returns a configuration rooted at the user's XDG data dir.
+// Default returns a configuration rooted at the user's XDG directories.
 func Default() *Config {
-	base, err := os.UserHomeDir()
-	if err != nil {
-		base = os.TempDir()
-	}
-	stateDir := filepath.Join(base, DefaultStateDirName)
-	c := &Config{
-		StateDir:  stateDir,
-		WebListen: "127.0.0.1:6347",
-	}
+	c := &Config{WebListen: defaultWebListen}
 	c.applyDefaults()
 	return c
 }
 
+// applyDefaults fills every unset field. It is the single place defaults are
+// resolved, so Default and a partially-specified config file agree on what an
+// omitted key means.
 func (c *Config) applyDefaults() {
+	if c.DataDir == "" {
+		c.DataDir = defaultDataDir()
+	}
 	if c.StateDir == "" {
-		c.StateDir = Default().StateDir
+		c.StateDir = defaultStateDir()
+	}
+	if c.RuntimeDir == "" {
+		c.RuntimeDir = defaultRuntimeDir(c.StateDir)
 	}
 	if c.SocketPath == "" {
-		c.SocketPath = filepath.Join(c.StateDir, rpcSocketName)
+		c.SocketPath = filepath.Join(c.RuntimeDir, rpcSocketName)
 	}
 	if c.WebListen == "" {
-		c.WebListen = "127.0.0.1:6347"
+		c.WebListen = defaultWebListen
 	}
 	if len(c.WorkerRoles) == 0 {
 		c.WorkerRoles = role.WorkerRoles()
 	}
 	if c.DownloadDir == "" {
-		c.DownloadDir = filepath.Join(c.StateDir, "downloads")
+		c.DownloadDir = filepath.Join(c.DataDir, "downloads")
 	}
 	if c.GnutellaListen == "" {
 		c.GnutellaListen = "0.0.0.0:6346"
@@ -125,6 +148,45 @@ func (c *Config) applyDefaults() {
 }
 
 const rpcSocketName = "sharzad.sock"
+
+// xdgBase resolves an XDG base directory: the environment variable when it is
+// set to an absolute path, otherwise the fallback the spec names under the
+// user's home. A relative env value is ignored rather than joined, because
+// "relative to what" has no good answer for a daemon started by systemd.
+func xdgBase(env, fallback string) string {
+	if v := os.Getenv(env); v != "" && filepath.IsAbs(v) {
+		return v
+	}
+	return filepath.Join(homeDir(), fallback)
+}
+
+// homeDir resolves the user's home, falling back to the temp dir so a daemon
+// with no HOME still resolves a usable, absolute base instead of an empty one.
+func homeDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	return os.TempDir()
+}
+
+func defaultDataDir() string {
+	return filepath.Join(xdgBase("XDG_DATA_HOME", ".local/share"), dataDirName)
+}
+
+func defaultStateDir() string {
+	return filepath.Join(xdgBase("XDG_STATE_HOME", ".local/state"), stateDirName)
+}
+
+// defaultRuntimeDir uses $XDG_RUNTIME_DIR when it is set, and otherwise keeps
+// the socket in a run/ subdirectory of the state directory. A daemon started
+// as a system service has no session runtime dir, and the socket still has to
+// live somewhere writable that only its owner can reach.
+func defaultRuntimeDir(stateDir string) string {
+	if v := os.Getenv("XDG_RUNTIME_DIR"); v != "" && filepath.IsAbs(v) {
+		return filepath.Join(v, stateDirName)
+	}
+	return filepath.Join(stateDir, "run")
+}
 
 // Load reads a config file. An empty path yields Default. A missing file at an
 // explicit path is an error, because silently running with defaults after the
@@ -166,11 +228,18 @@ func (c *Config) StatePath() string {
 // Validate checks the configuration for things that would fail late and
 // confusingly at runtime.
 func (c *Config) Validate() error {
-	if c.StateDir == "" {
-		return fmt.Errorf("state_dir is required")
-	}
-	if !filepath.IsAbs(c.StateDir) {
-		return fmt.Errorf("state_dir must be an absolute path, got %q", c.StateDir)
+	// Every writable root is checked the same way. A relative path would
+	// resolve against whatever cwd the service manager handed the process,
+	// and a path that exists as a regular file can never become a
+	// directory; both are cheap to reject here and expensive to debug later.
+	for _, d := range []struct{ field, path string }{
+		{"data_dir", c.DataDir},
+		{"state_dir", c.StateDir},
+		{"runtime_dir", c.RuntimeDir},
+	} {
+		if err := validateAbsDir(d.field, d.path); err != nil {
+			return err
+		}
 	}
 	if !c.ExposeWeb {
 		if err := c.checkLoopback(); err != nil {
@@ -220,6 +289,23 @@ func (c *Config) Validate() error {
 		if err := validateURL(fmt.Sprintf("gnutella_caches[%d]", i), cache); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateAbsDir checks a directory the daemon will write to. It is pure: it
+// may stat the path to catch a regular file in the way, but it never creates
+// anything. Creation and the writability probe belong to EnsureDirs, which
+// runs once at startup.
+func validateAbsDir(field, path string) error {
+	if path == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%s must be an absolute path, got %q", field, path)
+	}
+	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+		return fmt.Errorf("%s %q exists but is not a directory", field, path)
 	}
 	return nil
 }
@@ -286,12 +372,38 @@ func (c *Config) checkLoopback() error {
 	}
 }
 
-// EnsureDirs creates the directories Sharza writes to.
+// EnsureDirs creates every directory Sharza writes to and probes each one for
+// writability. It runs once at startup, so a misconfigured or read-only path
+// fails the daemon with a message naming the directory rather than surfacing
+// later as a store write that silently cannot happen.
 func (c *Config) EnsureDirs() error {
-	for _, d := range []string{c.StateDir, c.DownloadDir} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return fmt.Errorf("create %s: %w", d, err)
+	// DataDir first: DownloadDir defaults to a subdirectory of it, and
+	// creating the parent before the child keeps the intent obvious even
+	// though MkdirAll would succeed in either order.
+	for _, d := range []string{c.DataDir, c.StateDir, c.RuntimeDir, c.DownloadDir} {
+		if err := ensureDir(d); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// ensureDir creates dir if it is missing, then proves it is writable with a
+// probe file. Existing is not the same as usable: a directory can sit on a
+// read-only mount or be owned by another user, and os.MkdirAll reports
+// success in both cases.
+func ensureDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".sharza-write-probe-*")
+	if err != nil {
+		return fmt.Errorf("%s is not writable: %w", dir, err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("remove write probe in %s: %w", dir, err)
 	}
 	return nil
 }
