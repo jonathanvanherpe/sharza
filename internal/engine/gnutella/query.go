@@ -23,13 +23,17 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name. A trailing 16-byte servent identifier
+// (client ID/GUID) follows all hits in Gnutella 0.6.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+	// ServentID is the 16-byte identifier of the servent that
+	// generated the hit (client ID/GUID). Used for PUSH.
+	ServentID [16]byte
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -85,7 +89,7 @@ func EncodeQueryHit(qh QueryHit) []byte {
 	if qh.HitCount != uint8(len(qh.Hits)) {
 		qh.HitCount = uint8(len(qh.Hits))
 	}
-	// minimum size: 1+2+4+4 + (per hit: 4+4 + NUL)
+	// minimum size: 1+2+4+4 + (per hit: 4+4 + NUL) + 16-byte servent ID
 	out := make([]byte, 11)
 	out[0] = qh.HitCount
 	binary.LittleEndian.PutUint16(out[1:3], qh.Port)
@@ -103,6 +107,8 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// append 16-byte servent identifier
+	out = append(out, qh.ServentID[:]...)
 	return out
 }
 
@@ -140,9 +146,31 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		pos += nulIdx + 1
 		hits = append(hits, hit)
 		if pos > len(payload) {
-			break
+			return qh, fmt.Errorf("%w: unexpected payload end after hit", ErrQueryHitBadFormat)
 		}
 	}
 	qh.Hits = hits
+	if pos+16 > len(payload) {
+		// If missing servent ID, treat as zero ID but still accept
+		// for backward compatibility within the test scope? Brief says
+		// carry and emit - but decoder must be robust
+		// leave zero if truncated
+	} else {
+		copy(qh.ServentID[:], payload[pos:pos+16])
+	}
 	return qh, nil
+}
+
+// IsFirewalled reports whether the hit's address is not usable for
+// inbound connections. An unspecified IPv4 (0.0.0.0) or zero port
+// indicates the peer is behind a firewall.
+func (qh QueryHit) IsFirewalled() bool {
+	if qh.Port == 0 {
+		return true
+	}
+	ip := qh.IP
+	if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 {
+		return true
+	}
+	return false
 }

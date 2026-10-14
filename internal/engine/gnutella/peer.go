@@ -56,6 +56,7 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+	pc      *peerConn  // back-reference for push routing
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
@@ -68,6 +69,10 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc: &peerConn{
+			conn: conn,
+			addr: conn.RemoteAddr(),
+		},
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -290,9 +295,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
-		return nil
+		return p.handlePush(hdr, payload)
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
 		return nil
@@ -472,9 +475,27 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
+	if p.opts.pushReg != nil && p.pc != nil {
+		p.opts.pushReg.setRoute(qh.ServentID, p.pc)
+	}
 	if p.opts.OnQueryHit != nil {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	return nil
+}
+
+// handlePush processes an inbound PUSH message.
+func (p *peer) handlePush(hdr Header, payload []byte) error {
+	push, err := DecodePush(payload)
+	if err != nil {
+		p.logf("bad push from %s: %v", p.conn.RemoteAddr(), err)
+		return nil
+	}
+	if p.opts.pushReg == nil {
+		return nil
+	}
+	p.opts.pushReg.claim(push.ServentID, push.FileIndex, p.conn)
+	p.logf("push from %s: servent=%x idx=%d ip=%v:%d", p.conn.RemoteAddr(), push.ServentID, push.FileIndex, net.IP(push.IP[:]), push.Port)
 	return nil
 }

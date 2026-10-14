@@ -365,3 +365,123 @@ func (d *Downloader) logf() func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "sharzad: gnutella: download: "+format+"\n", args...)
 	}
 }
+
+// FetchFromConn downloads using an existing connection (e.g. from PUSH dial-back).
+// It reuses the same Range/length/size checks and name sanitisation. The
+// connection must be an established HTTP connection speaking to a Gnutella servent
+// that will respond to GET /gnutella/<index>.
+func (d *Downloader) FetchFromConn(ctx context.Context, dir string, conn net.Conn) (DownloadResult, error) {
+	if dir == "" {
+		return DownloadResult{}, errors.New("gnutella: download: no destination directory")
+	}
+	size := int64(d.Hit.FileSize)
+	if d.QH.Port == 0 && d.QH.IP[0]==0 && d.QH.IP[1]==0 && d.QH.IP[2]==0 && d.QH.IP[3]==0 {
+		// allow conn case - we may have pushed back from unknown ip? but size checks still valid
+	}
+	name := sanitizeFileName(d.Hit.FileName)
+	if name == "" {
+		name = fmt.Sprintf("file-%d", d.Hit.FileIndex)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: download dir %s: %w", dir, err)
+	}
+	dest := filepath.Join(dir, name)
+
+	var offset int64
+	if fi, err := os.Stat(dest); err == nil {
+		offset = fi.Size()
+		if offset > size {
+			return DownloadResult{}, fmt.Errorf("%w: %s is %d bytes, hit %q is %d",
+				ErrSizeMismatch, dest, offset, d.Hit.FileName, size)
+		}
+		if offset == size {
+			return DownloadResult{Path: dest, Offset: offset, Complete: true}, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return DownloadResult{}, fmt.Errorf("gnutella: stat %s: %w", dest, err)
+	}
+
+	rawURL := fmt.Sprintf("http://%s/gnutella/%d", d.QH.Source(), d.Hit.FileIndex)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: download request %s: %w", rawURL, err)
+	}
+	req.Header.Set("User-Agent", version.UserAgent())
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "Keep-Alive")
+	req.Header.Set("X-Gnutella-Content-Length", strconv.FormatInt(size, 10))
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+
+	tr := &http.Transport{
+		DisableCompression:    true,
+		ResponseHeaderTimeout: downloadHeaderTimeout,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+	resp, err := client.Do(req)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Uncompressed {
+		return DownloadResult{}, fmt.Errorf("%w: peer returned a compressed body", ErrSizeMismatch)
+	}
+
+	start := offset
+	switch resp.StatusCode {
+	case http.StatusOK:
+		start = 0
+		if err := checkDeclaredSize(resp, size); err != nil {
+			return DownloadResult{}, err
+		}
+	case http.StatusPartialContent:
+		rangeStart, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+		if err != nil {
+			return DownloadResult{}, err
+		}
+		if rangeStart != offset || total != size {
+			return DownloadResult{}, fmt.Errorf("%w: Content-Range %q, expected bytes %d-%d/%d",
+				ErrSizeMismatch, resp.Header.Get("Content-Range"), offset, size-1, size)
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != size-offset {
+			return DownloadResult{}, fmt.Errorf("%w: Content-Length %d, expected %d",
+				ErrSizeMismatch, resp.ContentLength, size-offset)
+		}
+	default:
+		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: status %s", rawURL, resp.Status)
+	}
+
+	flags := os.O_WRONLY | os.O_CREATE
+	if start == 0 {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_APPEND
+	}
+	f, err := os.OpenFile(dest, flags, 0o644)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: create %s: %w", dest, err)
+	}
+	defer f.Close()
+
+	want := size - start
+	n, err := io.Copy(f, io.LimitReader(resp.Body, want+1))
+	if err != nil {
+		truncateTo(f, start)
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
+	}
+	if n != want {
+		truncateTo(f, start)
+		return DownloadResult{}, fmt.Errorf("%w: body %d bytes, expected %d", ErrSizeMismatch, n, want)
+	}
+	if err := f.Sync(); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: sync %s: %w", dest, err)
+	}
+	d.logf()("downloaded %s from pushed connection: %d bytes at offset %d", name, n, start)
+	return DownloadResult{Path: dest, Bytes: n, Offset: start}, nil
+}

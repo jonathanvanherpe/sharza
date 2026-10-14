@@ -1,0 +1,11 @@
+func TestQueryHitIsFirewalled(t *testing.T) {
+	if !QueryHit{Port: 0}.IsFirewalled() {
+		t.Error("port 0 should be firewalled")
+	}
+	if !QueryHit{Port: 6346, IP: [4]byte{0, 0, 0, 0}}.IsFirewalled() {
+		t.Error("unspecified IP should be firewalled")
+	}
+	if QueryHit{Port: 6346, IP: [4]byte{192, 168, 1, 1}}.IsFirewalled() {
+		t.Error("valid should not be firewalled")
+	}
+}

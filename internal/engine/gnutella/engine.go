@@ -93,6 +93,9 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushReg routes PUSH messages and tracks pending dial-backs.
+	pushReg *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +143,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushReg routes PUSH messages and tracks pending dial-backs.
+	pushReg *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +159,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushReg:  newPushRegistry(0),
 	}
 }
 
@@ -183,6 +190,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.pushReg = e.pushReg
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -219,6 +227,14 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 				break
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
+		}
+		// Offer to pending push before normal serve
+		// Check for pending push dial-back first
+		if e.pushReg != nil {
+			if claimed := e.pushReg.claimAny(conn); claimed {
+				logf("claimed push dial-back from %s", conn.RemoteAddr())
+				continue // don't run serveConn/handshake for this connection
+			}
 		}
 		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
 		e.mu.Lock()
@@ -451,4 +467,59 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// Push sends a PUSH message to the peer that served the given servent ID
+// (via the route recorded when its QUERYHIT was received), waits for the
+// holder to dial back, and returns the claimed net.Conn. If no route exists
+// or the dial-back times out, an error is returned.
+func (e *Engine) Push(ctx context.Context, serventID [16]byte, fileIndex uint32, ip [4]byte, port uint16) (net.Conn, error) {
+	if e.pushReg == nil {
+		return nil, errors.New("gnutella: push not available")
+	}
+	pr, ok := e.pushReg.getRoute(serventID)
+	if !ok || pr.pc == nil {
+		return nil, errors.New("gnutella: no push route for servent")
+	}
+	pb, cancel := e.pushReg.waitFor(serventID, fileIndex)
+	defer cancel()
+
+	p := Push{
+		ServentID: serventID,
+		FileIndex: fileIndex,
+		IP:        ip,
+		Port:      port,
+	}
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    1,
+		Hops:   0,
+		Length: uint32(len(EncodePush(p))),
+	}
+	buf := hdr.AppendTo(nil)
+	buf = append(buf, EncodePush(p)...)
+
+	pc := pr.pc
+	pc.mu.Lock()
+	err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err == nil {
+		_, err = pc.conn.Write(buf)
+	}
+	pc.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := pb.wait()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+// SendPush is an alternative API name as mentioned in brief? The brief says
+// "add the requester API (write the PUSH, return the claimed dial-back net.Conn)."
+func (e *Engine) SendPush(ctx context.Context, serventID [16]byte, fileIndex uint32, ip [4]byte, port uint16) (net.Conn, error) {
+	return e.Push(ctx, serventID, fileIndex, ip, port)
 }
