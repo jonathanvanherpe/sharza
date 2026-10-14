@@ -28,6 +28,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,6 +81,12 @@ type Downloader struct {
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
+
+	// engine enables the push path for a firewalled source. It is set by
+	// Engine.Downloader; a Downloader built by NewDownloader has none,
+	// and fetching from a firewalled source through it is refused
+	// rather than silently attempted.
+	engine *Engine
 }
 
 // DownloadResult reports a finished transfer.
@@ -120,6 +127,11 @@ func (qh QueryHit) Source() string {
 // with a Range request; if it already holds the complete file, Fetch
 // returns without contacting the peer.
 //
+// A source the QUERYHIT advertises as unreachable (a zero port or an
+// unspecified address) is firewalled: Fetch asks the engine to PUSH it
+// and completes the GET over the dial-back the push opens. That needs an
+// engine; a bare NewDownloader has none and refuses such a source.
+//
 // The size the QUERYHIT advertised is the only check Gnutella 1 offers,
 // so every declared length (Content-Length, Content-Range,
 // X-Gnutella-Content-Length) and the actual body length are verified
@@ -130,12 +142,6 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		return DownloadResult{}, errors.New("gnutella: download: no destination directory")
 	}
 	size := int64(d.Hit.FileSize)
-	if d.QH.Port == 0 {
-		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source port")
-	}
-	if net.IP(d.QH.IP[:]).IsUnspecified() {
-		return DownloadResult{}, errors.New("gnutella: download: queryhit has no source address")
-	}
 
 	name := sanitizeFileName(d.Hit.FileName)
 	if name == "" {
@@ -168,23 +174,24 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		return DownloadResult{}, fmt.Errorf("gnutella: stat %s: %w", dest, err)
 	}
 
+	if firewalledSource(d.QH) {
+		if d.engine == nil {
+			return DownloadResult{}, errors.New("gnutella: download: source is firewalled, and this Downloader has no engine to push through")
+		}
+		return d.fetchPush(ctx, dest, name, offset, size)
+	}
+	return d.fetchDirect(ctx, dest, name, offset, size)
+}
+
+// fetchDirect is the reachable case: a plain GET of /gnutella/<index>
+// from the address the QUERYHIT advertises.
+func (d *Downloader) fetchDirect(ctx context.Context, dest, name string, offset, size int64) (DownloadResult, error) {
 	src := d.QH.Source()
 	rawURL := fmt.Sprintf("http://%s/gnutella/%d", src, d.Hit.FileIndex)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := d.newRequest(ctx, rawURL, offset, size)
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("gnutella: download request %s: %w", rawURL, err)
+		return DownloadResult{}, err
 	}
-	// Servent request convention. The length header tells the peer the
-	// size the QUERYHIT advertised, which is the whole file even for a
-	// resumed range.
-	req.Header.Set("User-Agent", version.UserAgent())
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "Keep-Alive")
-	req.Header.Set("X-Gnutella-Content-Length", strconv.FormatInt(size, 10))
-	if offset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-	}
-
 	client := d.Client
 	if client == nil {
 		client = defaultDownloadClient
@@ -193,6 +200,78 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
 	}
+	return d.receive(resp, src, dest, name, offset, size)
+}
+
+// fetchPush is the firewalled case: PUSH the source, wait for its
+// dial-back, and send the GET over that connection. The request path is
+// the servent GET convention, /get/<index>/<url-encoded name>, which is
+// what Shareaza's own client builds (QueryHit.cpp:1869) and what its
+// upload server parses (UploadTransferHTTP.cpp:596). It has no trailing
+// slash: the 0.4 spec example shows one, but Shareaza neither writes nor
+// requires it, and its parser strips one anyway.
+func (d *Downloader) fetchPush(ctx context.Context, dest, name string, offset, size int64) (DownloadResult, error) {
+	req, err := d.engine.BeginPush(d.QH.ServentID, d.Hit.FileIndex)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	pc, err := req.Wait(ctx)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	defer pc.conn.Close()
+	// Unblock a read on the dial-back when the caller's context ends;
+	// the connection is ours now, not the engine's.
+	stopClose := context.AfterFunc(ctx, func() { _ = pc.conn.Close() })
+	defer stopClose()
+
+	// The GIV names the file the pusher intends to serve; the QUERYHIT
+	// named the one we asked for. They should agree, and the QUERYHIT is
+	// authoritative for what we want, so the GIV name is only a fallback
+	// for a hit that carried no name at all.
+	reqName := d.Hit.FileName
+	if reqName == "" {
+		reqName = pc.giv.Name
+	}
+	src := pc.conn.RemoteAddr().String()
+	rawURL := "http://" + src + fmt.Sprintf("/get/%d/%s", d.Hit.FileIndex, url.PathEscape(reqName))
+	httpReq, err := d.newRequest(ctx, rawURL, offset, size)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	d.logf()("push to %x accepted by %s; requesting %s", d.QH.ServentID, src, httpReq.URL.RequestURI())
+	if err := httpReq.Write(pc.conn); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push download %s: write request: %w", src, err)
+	}
+	resp, err := http.ReadResponse(pc.br, httpReq)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push download %s: %w", src, err)
+	}
+	return d.receive(resp, src, dest, name, offset, size)
+}
+
+// newRequest builds the servent GET shared by both paths. The length
+// header tells the peer the size the QUERYHIT advertised, which is the
+// whole file even for a resumed range.
+func (d *Downloader) newRequest(ctx context.Context, rawURL string, offset, size int64) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gnutella: download request %s: %w", rawURL, err)
+	}
+	req.Header.Set("User-Agent", version.UserAgent())
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "Keep-Alive")
+	req.Header.Set("X-Gnutella-Content-Length", strconv.FormatInt(size, 10))
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+	return req, nil
+}
+
+// receive writes an HTTP response body to dest, applying the size checks
+// and the resume/whole-file logic to both the direct and the push path,
+// so the two cannot drift apart.
+func (d *Downloader) receive(resp *http.Response, src, dest, name string, offset, size int64) (DownloadResult, error) {
 	defer resp.Body.Close()
 
 	// A transparently decompressed body is not the file: the peer
@@ -231,7 +310,7 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		// Drain a little so the connection can be reused, then refuse:
 		// an error page is not the file.
 		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
-		return DownloadResult{}, fmt.Errorf("gnutella: download %s: status %s", rawURL, resp.Status)
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: status %s", src, resp.Status)
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE
@@ -253,7 +332,7 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	n, err := io.Copy(f, io.LimitReader(resp.Body, want+1))
 	if err != nil {
 		truncateTo(f, start)
-		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
+		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", src, err)
 	}
 	if n != want {
 		truncateTo(f, start)

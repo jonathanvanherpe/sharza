@@ -8,6 +8,7 @@ package gnutella
 // the supervisor collects worker output.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -90,9 +91,19 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// PushTimeout is how long a push download waits for the firewalled
+	// source to dial back after the PUSH is sent. Zero means the
+	// default 30 s.
+	PushTimeout time.Duration
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// serventID is this engine's own servent identifier, put in the
+	// QUERYHITs it answers with so peers can push to it. Run sets it
+	// from the Engine; callers do not.
+	serventID [idSize]byte
 }
 
 func (o Options) withDefaults() Options {
@@ -104,6 +115,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.SearchTimeout <= 0 {
 		o.SearchTimeout = searchTimeout
+	}
+	if o.PushTimeout <= 0 {
+		o.PushTimeout = defaultPushTimeout
 	}
 	if o.Logf == nil {
 		o.Logf = func(format string, args ...any) {
@@ -136,9 +150,18 @@ type Engine struct {
 
 	peers map[*peerConn]struct{}
 
+	// serventID is this engine's own servent identifier: the id a peer
+	// names in a PUSH addressed to us, and the id we put in the
+	// QUERYHITs we answer with. Generated once, in New.
+	serventID [idSize]byte
+
 	// searches correlates inbound QUERYHITs with the Search that asked
 	// for them, by descriptor ID.
 	searches *searchRegistry
+
+	// pushes correlates an inbound dial-back with the PUSH that caused
+	// it, by the identifier the PUSH named.
+	pushes *pushRegistry
 
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
@@ -149,10 +172,12 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:     make(chan struct{}),
+		peers:     make(map[*peerConn]struct{}),
+		dialed:    make(map[string]struct{}),
+		searches:  newSearchRegistry(),
+		pushes:    newPushRegistry(),
+		serventID: newDescriptorID(),
 	}
 }
 
@@ -183,6 +208,9 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// And its own servent identifier, so the QUERYHITs it answers carry
+	// an id a peer can name in a PUSH back to us.
+	e.opts.serventID = e.serventID
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -220,20 +248,36 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
-		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-		e.mu.Lock()
-		e.peers[pc] = struct{}{}
-		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(c net.Conn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			// One bufio.Reader is shared by the peek, the handshake and
+			// the message loop: the handshake may buffer bytes past its
+			// terminator, and losing them would corrupt the first
+			// message.
+			br := bufio.NewReader(c)
+			if isPushDialback(c, br) {
+				// A pushed servent dialling back. On success it takes
+				// ownership of the connection, so it is not closed
+				// here; on failure servePush reports why and this
+				// closes it.
+				if err := e.servePush(c, br); err != nil {
+					logf("push dial-back %s: %v", c.RemoteAddr(), err)
+					_ = c.Close()
+				}
+				return
+			}
+			pc := &peerConn{conn: c, addr: c.RemoteAddr()}
+			e.mu.Lock()
+			e.peers[pc] = struct{}{}
+			e.mu.Unlock()
+			if err := serveConnReader(ctx, c, br, true, e.opts, e.laddr); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
-		}(conn, pc)
+		}(conn)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -363,6 +407,7 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	d.engine = e
 	return d
 }
 
@@ -410,11 +455,30 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
 
+	written, err := writeToPeers(peers, buf)
+
+	// Wait out the collection window so late hits are collected. If no
+	// write succeeded there is no peer that can answer, so the wait would
+	// only delay an empty result.
+	if written > 0 {
+		timer := time.NewTimer(timeout)
+		<-timer.C
+	}
+
+	return reg.close(hdr.ID), err
+}
+
+// writeToPeers writes buf to every peer concurrently and reports how
+// many writes succeeded and the first error, if any. Each write holds
+// its peer's mutex and sets its own deadline, so one stalled peer
+// neither blocks the others nor pins a writer forever. Serialising on
+// the peer's mutex is what keeps a message from interleaving with a
+// keep-alive PING on the same connection.
+func writeToPeers(peers []*peerConn, buf []byte) (written int, firstErr error) {
 	var (
-		wg       sync.WaitGroup
-		written  atomic.Int32
-		errMu    sync.Mutex
-		firstErr error
+		wg    sync.WaitGroup
+		n     atomic.Int32
+		errMu sync.Mutex
 	)
 	for _, pc := range peers {
 		wg.Add(1)
@@ -434,21 +498,105 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 				errMu.Unlock()
 				return
 			}
-			written.Add(1)
+			n.Add(1)
 		}(pc)
 	}
 	wg.Wait()
+	return int(n.Load()), firstErr
+}
 
-	// Wait out the collection window so late hits are collected. If no
-	// write succeeded there is no peer that can answer, so the wait would
-	// only delay an empty result.
-	if written.Load() > 0 {
-		timer := time.NewTimer(timeout)
-		<-timer.C
+// BeginPush starts a push download from a firewalled source. It registers
+// a request keyed by the QUERYHIT's servent identifier, writes a PUSH to
+// every live peer naming that identifier and this engine's dial-back
+// address, and returns the request for the caller to Wait on.
+//
+// The PUSH is addressed to the firewalled servent (the QUERYHIT's id,
+// which is what a GIV from it will carry); the address inside it is
+// ours, where it dials back. Registering before writing is what stops a
+// dial-back that arrives before BeginPush returns from being dropped.
+//
+// No peer means no route to the source, so there is nothing to wait for
+// and it fails immediately rather than after the timeout. A second push
+// to the same servent is refused while the first is pending: one servent
+// dials back at most once per PUSH, so two requests could not be told
+// apart.
+func (e *Engine) BeginPush(target [idSize]byte, index uint32) (*PushRequest, error) {
+	if target == ([idSize]byte{}) {
+		return nil, errors.New("gnutella: push: queryhit carries no servent identifier")
+	}
+	e.mu.Lock()
+	started := e.started
+	laddr := e.laddr
+	timeout := e.opts.PushTimeout
+	reg := e.pushes
+	peers := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		peers = append(peers, pc)
+	}
+	e.mu.Unlock()
+
+	if !started {
+		return nil, errors.New("gnutella: push: engine is not running")
+	}
+	if len(peers) == 0 {
+		return nil, errors.New("gnutella: push: no peers to route the push through")
+	}
+	ip, port, ok := dialbackAddress(peers, laddr)
+	if !ok {
+		return nil, errors.New("gnutella: push: no reachable address to advertise for the dial-back")
 	}
 
-	errMu.Lock()
-	err := firstErr
-	errMu.Unlock()
-	return reg.close(hdr.ID), err
+	req, ok := reg.register(target, timeout)
+	if !ok {
+		return nil, fmt.Errorf("gnutella: push: another push to servent %x is already pending", target)
+	}
+
+	payload := EncodePush(Push{ServentID: target, FileIndex: index, IP: ip, Port: port})
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    pushTTL,
+		Hops:   0,
+		Length: uint32(len(payload)),
+	}
+	buf := hdr.AppendTo(nil)
+	buf = append(buf, payload...)
+
+	written, err := writeToPeers(peers, buf)
+	if written == 0 {
+		reg.forget(target, req)
+		if err == nil {
+			err = errors.New("gnutella: push: no peer accepted the push")
+		}
+		return nil, err
+	}
+	return req, nil
+}
+
+// dialbackAddress picks the IPv4 address and port a pushed servent should
+// dial back to. The port is always the listen port; the address is the
+// listener's own IPv4 if it is concrete, otherwise the local address of
+// an established peer link, which is the same host when the listener is
+// bound to 0.0.0.0.
+func dialbackAddress(peers []*peerConn, laddr net.Addr) (ip [4]byte, port uint16, ok bool) {
+	ta, isTCP := laddr.(*net.TCPAddr)
+	if !isTCP || ta.Port == 0 {
+		return ip, 0, false
+	}
+	port = uint16(ta.Port)
+	if ip4 := ta.IP.To4(); ip4 != nil && !ta.IP.IsUnspecified() {
+		copy(ip[:], ip4)
+		return ip, port, true
+	}
+	for _, pc := range peers {
+		la, isTCP := pc.conn.LocalAddr().(*net.TCPAddr)
+		if !isTCP {
+			continue
+		}
+		if ip4 := la.IP.To4(); ip4 != nil && !la.IP.IsUnspecified() {
+			copy(ip[:], ip4)
+			return ip, port, true
+		}
+	}
+	return ip, 0, false
 }

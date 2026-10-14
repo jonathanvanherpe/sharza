@@ -62,6 +62,14 @@ type peer struct {
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
 func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+	return serveConnReader(ctx, conn, bufio.NewReader(conn), inbound, opts, laddr)
+}
+
+// serveConnReader is serveConn with the connection's reader supplied by
+// the caller. The accept path peeks at the first bytes to tell a push
+// dial-back from a handshake, and the peeked reader must then be handed
+// on so those bytes are not lost.
+func serveConnReader(ctx context.Context, conn net.Conn, r *bufio.Reader, inbound bool, opts Options, laddr net.Addr) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
@@ -78,7 +86,6 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {
@@ -290,7 +297,12 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
+		// A PUSH addressed to us is the responder half of the push
+		// convention (dial back and serve the GET), which this slice
+		// does not implement. A push *we* send is not seen here: it is
+		// answered by a dial-back on a new connection, handled on the
+		// accept path (push.go).
+		p.logf("ignoring %s from %s: the push responder half is out of scope",
 			typeName(hdr.Type), p.conn.RemoteAddr())
 		return nil
 	default:
@@ -437,11 +449,12 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		}
 	}
 	qh := QueryHit{
-		HitCount: uint8(len(hits)),
-		Port:     p.listenPort(),
-		IP:       ip4,
-		Speed:    0, // speed not specified; 0 is fine
-		Hits:     hits,
+		HitCount:  uint8(len(hits)),
+		Port:      p.listenPort(),
+		IP:        ip4,
+		Speed:     0, // speed not specified; 0 is fine
+		Hits:      hits,
+		ServentID: p.opts.serventID,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{

@@ -28,7 +28,7 @@ func TestDecodeQueryMalformed(t *testing.T) {
 	}{
 		{"too short", []byte{0x01}},
 		{"no nul", []byte{0x10, 0x27, 0x74, 0x65, 0x73, 0x74}}, // speed 0x2710, "test"
-		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},      // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
+		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},   // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
 	}
 	for _, c := range cases {
 		if c.name == "empty search with nul?" {
@@ -46,10 +46,11 @@ func TestDecodeQueryMalformed(t *testing.T) {
 
 func TestEncodeDecodeQueryHitRoundTrip(t *testing.T) {
 	qh := QueryHit{
-		HitCount: 1,
-		Port:     6346,
-		IP:       [4]byte{127, 0, 0, 1},
-		Speed:    10000,
+		HitCount:  1,
+		Port:      6346,
+		IP:        [4]byte{127, 0, 0, 1},
+		Speed:     10000,
+		ServentID: testID(0x1F),
 		Hits: []FileHit{
 			{FileIndex: 1, FileSize: 12345, FileName: "file.mp3"},
 		},
@@ -65,8 +66,65 @@ func TestEncodeDecodeQueryHitRoundTrip(t *testing.T) {
 	if dec.IP != qh.IP {
 		t.Errorf("ip mismatch")
 	}
+	if dec.ServentID != qh.ServentID {
+		t.Errorf("servent id = %x, want %x", dec.ServentID, qh.ServentID)
+	}
 	if len(dec.Hits) != 1 || dec.Hits[0].FileName != "file.mp3" || dec.Hits[0].FileSize != 12345 {
 		t.Errorf("hit mismatch: %+v", dec.Hits)
+	}
+}
+
+// TestDecodeQueryHitServentIDIsTrailing16Bytes pins the one positional
+// invariant the spec gives for the servent identifier: it is the last 16
+// bytes, after whatever vendor, extension and XML bytes sit between the
+// last name and it. The fixture is a realistic Shareaza trailer, so a
+// decoder that instead read the 16 bytes straight after the name would
+// be caught.
+func TestDecodeQueryHitServentIDIsTrailing16Bytes(t *testing.T) {
+	payload := EncodeQueryHit(QueryHit{
+		HitCount: 1,
+		Port:     6346,
+		IP:       [4]byte{10, 0, 0, 1},
+		Hits:     []FileHit{{FileIndex: 4, FileSize: 32, FileName: "x"}},
+	})
+	payload = append(payload, 0) // name NUL is already there; this is the trailer's first byte
+
+	want := testID(0xC3)
+	// A vendor code, a public-size byte, flags, an XML block and its NUL,
+	// then the identifier. None of it is parsed; the identifier must
+	// still be found at the end.
+	payload = append(payload, []byte("RAZA")...)
+	payload = append(payload, 0x04, 0x01, 0x00, 0x01, 0x00, 0x00)
+	payload = append(payload, 0x00)
+	payload = append(payload, want[:]...)
+
+	dec, err := DecodeQueryHit(payload)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if dec.ServentID != want {
+		t.Errorf("servent id = %x, want the trailing %x", dec.ServentID, want)
+	}
+	if got := dec.Hits[0].FileName; got != "x" {
+		t.Errorf("filename = %q, want %q", got, "x")
+	}
+}
+
+func TestFirewalledSource(t *testing.T) {
+	cases := []struct {
+		name string
+		qh   QueryHit
+		want bool
+	}{
+		{"reachable", QueryHit{IP: [4]byte{192, 168, 1, 2}, Port: 6346}, false},
+		{"zero port", QueryHit{IP: [4]byte{192, 168, 1, 2}, Port: 0}, true},
+		{"unspecified ip", QueryHit{IP: [4]byte{0, 0, 0, 0}, Port: 6346}, true},
+		{"both", QueryHit{}, true},
+	}
+	for _, tc := range cases {
+		if got := firewalledSource(tc.qh); got != tc.want {
+			t.Errorf("%s: firewalledSource = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

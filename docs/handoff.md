@@ -247,6 +247,65 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Gnutella 0.6 push: the downloader half is in
+
+A firewalled source cannot be fetched directly, so the 0.6 push handshake
+inverts the connection: the downloader sends a PUSH naming the source's
+servent id, the source dials back, announces itself with a `GIV` line, and
+the downloader issues the GET over that same dial-back connection.
+`internal/engine/gnutella/push.go` implements the requester half of that, and
+`Downloader.Fetch` now branches on it: a QUERYHIT whose port is zero or whose
+address is unspecified (`firewalledSource`, matching Shareaza's
+`QueryHit.cpp`) goes through `fetchPush`; everything else stays on the direct
+`fetchDirect` path.
+
+Five things are worth recording, because each is a place a later slice
+could get the protocol wrong without any test complaining here:
+
+- **The PUSH payload is a mix of endiannesses on purpose.** 16-byte servent
+  id of the *source* (the push target, not the recipient), then the file
+  index little-endian, then the IPv4 address in **network order**, then the
+  port **little-endian**. Verified against Shareaza's `Network.cpp::SendPush`
+  (`WriteLongLE(S_un.S_addr)` writes the address in network order because
+  `s_addr` already is; `WriteShortLE(htons(sin_port))` writes the port low
+  byte first). The layout is pinned by an exact-byte test, not just a round
+  trip, so an endianness slip cannot decode its own mistake.
+- **The last 16 bytes of a QUERYHIT carry the servent id.** Shareaza seeks to
+  the end (`QueryHit.cpp`); the spec agrees. The decoder therefore copies the
+  trailing 16 bytes rather than the 16 bytes after the last name, and a test
+  with a realistic vendor/XML trailer in between pins that: mutating the
+  decoder to read from `pos` turns it red.
+- **`GIV` names the pusher's own id, which equals the push target.** The
+  identifier in `GIV <index>:<id>/<name>` is the same one the PUSH was sent
+  to (`Handshake.cpp` writes `MyProfile.oGUID`), so the registry keys on it:
+  `Engine.BeginPush` registers a pending request under
+  `QueryHit.ServentID`, and a dial-back whose `GIV` names an unknown id is
+  refused with `GNUTELLA/0.6 503 Unknown push` and closed. The name is
+  optional and URL-decoded; Shareaza's own `GIV` omits it.
+- **The GET path over a push is `/get/<index>/<name>` with no trailing
+  slash**, taken from Shareaza's `QueryHit.cpp` request build and
+  `UploadTransferHTTP.cpp` parse. This differs from the direct path in the
+  download slice, which still uses the non-standard `/gnutella/<index>`; the
+  two are not reconciled in this change because that is a compatibility
+  question for the *serving* side, not the push handshake. Flagged below.
+- **The responder half is deliberately absent.** Accepting an inbound PUSH and
+  dialing out, push proxies, and the EQHD `G1_QHD_PUSH` block that a real
+  Shareaza-family source advertises are all out of scope here; the engine
+  never asks to be pushed to, so nothing needs that block decoded. See the
+  open questions.
+
+Coverage: the PUSH and `GIV` codecs are unit-tested (layout, short/malformed
+rejection, uppercase hex, a GGEP trailer tolerated), and the whole path runs
+against a scripted holder over real TCP in `push_test.go` -- it advertises
+itself firewalled, asserts the bytes of the PUSH it receives (servent id,
+index, and the engine's own dial-back address and port), dials back with a
+`GIV`, and serves the file over the GET it receives on that connection. A
+no-dial-back holder pins `ErrPushTimeout`, and a stray dial-back pins the 503
+refusal. Each key assertion was mutation-tested: reading the servent id from
+the wrong offset, writing the port big-endian, and changing the firewalled
+predicate from `||` to `&&` each turned its guarding test red before being
+reverted.
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -304,6 +363,35 @@ Still out of scope from the brief, each its own slice: QUERY
 forwarding/horizon routing beyond the direct link, push and browse, wiring
 `Search` into the RPC surface (human gate), and the G2 tree codec / UDP
 transceiver / KHL family.
+
+### Gnutella 0.6 push: what is deliberately left open
+
+The downloader half of push is in; these are the pieces around it that a
+later slice owns, none of them a blocker:
+
+- **The responder half does not exist.** The engine never accepts an inbound
+  PUSH, so it cannot serve a file to a peer that is behind a firewall. That
+  is a serving-side feature and pairs with the serving side of the direct
+  download path, which is also not implemented.
+- **The EQHD `G1_QHD_PUSH` block is not parsed.** A Shareaza-family source
+  can advertise push support in the QUERYHIT's extended header; we key off
+  the address/port being unusable instead, which is what Shareaza's own
+  `firewalledSource` test does. If a future source advertises push without a
+  zero address, that block becomes load-bearing and must be parsed.
+- **Push proxies and proxied `GIV` are unimplemented.** A proxy answers a
+  PUSH on a firewalled source's behalf and forwards the dial-back; nothing
+  here does that, and no live peer has been asked to.
+- **The `/gnutella/<index>` vs `/get/<index>/<name>` split is unreconciled.**
+  The direct download path and the push path build different request paths.
+  The push path matches Shareaza; the direct path predates this slice. Which
+  one a *server* should parse is a serving-side decision, and if the direct
+  path is ever changed to match Shareaza, the push path needs no change.
+- **The oracle leg is again skipped, not passed.** gtk-gnutella remains the
+  would-be differential oracle for the push exchange and is still not
+  installable here (no root, no sudo), and in any case push is not the path
+  gtk-gnutella's public ultrapeers exercise. The scripted holder in
+  `push_test.go` is the whole of the evidence; do not read it as oracle
+  verification.
 
 ### Should the daemon ship default `gnutella_caches`?
 

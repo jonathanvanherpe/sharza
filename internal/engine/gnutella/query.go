@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -24,12 +25,20 @@ type Query struct {
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
 // NUL-terminated name.
+//
+// The last 16 bytes of the payload are the servent identifier of the
+// peer that can serve the files: the 0.6 spec puts it after the result
+// set, and Shareaza reads it with a seek-to-end regardless of the vendor
+// and extension bytes in between (QueryHit.cpp:274). It is the address a
+// PUSH is sent to, so a hit without it cannot be downloaded from a
+// firewalled source.
 type QueryHit struct {
-	HitCount uint8
-	Port     uint16 // little-endian
-	IP       [4]byte
-	Speed    uint32 // little-endian
-	Hits     []FileHit
+	HitCount  uint8
+	Port      uint16 // little-endian
+	IP        [4]byte
+	Speed     uint32 // little-endian
+	Hits      []FileHit
+	ServentID [idSize]byte
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +112,13 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// The servent identifier is the trailing field: 16 bytes at the end
+	// of the payload, after the result set. Real servents pad the space
+	// between with a vendor code, flags, GGEP and XML, but the spec's
+	// only invariant is that the identifier is last, so a minimal
+	// QUERYHIT may append it directly (Shareaza tolerates the short
+	// trailer and still seeks to the final 16 bytes).
+	out = append(out, qh.ServentID[:]...)
 	return out
 }
 
@@ -144,5 +160,33 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// The servent identifier, when present, is the final 16 bytes. It is
+	// read from the end rather than from pos because a real QUERYHIT
+	// carries vendor, flag, GGEP and XML bytes between the last name and
+	// the identifier; anything at or before pos is part of the result
+	// set. A payload with no room for it (an old or minimal hit) simply
+	// has the zero identifier, which marks it undownloadable-by-push
+	// rather than malformed.
+	if len(payload)-pos >= idSize {
+		copy(qh.ServentID[:], payload[len(payload)-idSize:])
+	}
 	return qh, nil
+}
+
+// firewalledSource reports whether a QUERYHIT's source cannot accept an
+// inbound connection, so a PUSH is the only way to reach it.
+//
+// The predicate is the address the hit advertises: a zero port or an
+// unspecified address names no reachable endpoint. This mirrors
+// Shareaza's test, which treats exactly these as firewalled
+// (QueryHit.cpp:266-270, :1789-1802: "m_pQueryHit->m_pAddress.S_un.S_addr
+// == 0 || m_pQueryHit->m_nPort == 0").
+//
+// Deliberately not consulted: the QueryHit's own "push" flag lives in
+// the EQHD extra block (G1_QHD_PUSH), which this decoder does not parse;
+// and Shareaza's IsLowID / private-address test needs an eDonkey-style
+// address classification that has no meaning on the Gnutella side. Both
+// are recorded in docs/handoff.md as omissions, not oversights.
+func firewalledSource(qh QueryHit) bool {
+	return qh.Port == 0 || net.IP(qh.IP[:]).IsUnspecified()
 }
