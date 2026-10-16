@@ -247,6 +247,65 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### The G2 tree codec brief's PING vector contradicts Shareaza and the spec
+
+The P1 Gnutella2 tree-packet brief gave the marker packet's wire bytes as
+`58 00 50 49 4e 47`, that is a four-byte type name `"PING"`. Shareaza's
+`G2_PACKET_PING` is `MAKE_G2_PACKET('P','I',0,0,0,0,0,0)` (`G2Packet.h:130`), a
+two-byte name, and the specification documents the packet as `/PI`. The codec
+therefore encodes it as control `0x48` (Len_Len 1, Name_Len-1 1), a zero
+length byte, then `PI` -- `48 00 50 49`, which is exactly what
+`CG2Packet::ToBuffer` produces; `/PO` is likewise `48 00 50 4f`, not `"PONG"`.
+A brief-faithful four-byte name would frame a different packet, so as with the
+G1 handshake brief the published format wins, and `TestG2WireVectors` pins it.
+
+### The G2 tree codec is framing only, and its four decisions are recorded
+
+`internal/engine/gnutella/g2packet.go` adds `EncodeG2Packet`, `AppendTo`,
+`DecodeG2Packet` and `DecodeG2Children` -- how one packet is framed, and how a
+compound packet's children are framed inside its payload. No socket, no hub
+topology, no KHL/KHLA semantics. The wire format is read from Shareaza's
+`G2Packet.cpp` (`ToBuffer`, `New`, `WritePacket`, `ReadPacket`,
+`SkipCompound`) as oracle and from the published specification; the two agree.
+
+The decisions a later slice will meet first, each in the file comment:
+
+- **The encoder never writes Len_Len 0.** Shareaza's `ToBuffer` starts the
+  length-of-length at 1, so a zero-length packet still carries a zero length
+  byte. The specification's more compact Len_Len 0 form is accepted on decode
+  and normalised on re-encode. If a peer is ever found that rejects the length
+  byte, this is the first thing to revisit.
+- **A packet's own BE bit governs its own length field**, rather than the root
+  packet's byte order the specification names. In any conformant tree the two
+  agree, because Shareaza stamps the parent's BE bit into every child; the
+  packet's own bit is what keeps encode context-free. A tree whose flags
+  disagree is preserved rather than silently reinterpreted.
+- **The reserved control bit is accepted and dropped.** Shareaza never sets
+  it; decode tolerates it and re-encode clears it, a third normalising form
+  alongside Len_Len 0 and a trailing child-stream terminator. All three have
+  tests.
+- **Decode bounds nesting at 64 levels** (`ErrG2Depth`). Real trees are two
+  levels (KHL, NH, HS); the limit exists only so a hostile stream cannot
+  recurse without end.
+
+The types are wire bytes, so `G2TypePing` is `"PI"`; the KHL family's
+`NH`/`HS`/`CH` and `/KHL`, `/KHLR`, `/KHLA` names are defined but only `NH`
+and `HS` have any structure beyond framing, and nothing outside this package
+uses them yet.
+
+Mutations: flipping the compound flag on decode, pinning Len_Len to 1,
+ignoring the BE bit on encode, and dropping the child-stream terminator each
+turned a guarding test red before being reverted. The missing terminator was
+also caught by `FuzzDecodeG2Packet` on its own seed corpus without the
+mutator, with a re-encode that would not decode back -- the property the fuzz
+target asserts. A 30-second fuzz run (~474k executions, 99 interesting
+inputs) found nothing.
+
+Not verifiable here: no G2 oracle client is installed (Shareaza is
+Windows-only and the reference checkout is read as source, not built), so the
+format is pinned against Shareaza's source and the published specification
+plus the encoder/decoder round trip, not against a live differential harness.
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -302,8 +361,10 @@ decisions from that slice are worth recording before the next one:
 
 Still out of scope from the brief, each its own slice: QUERY
 forwarding/horizon routing beyond the direct link, push and browse, wiring
-`Search` into the RPC surface (human gate), and the G2 tree codec / UDP
-transceiver / KHL family.
+`Search` into the RPC surface (human gate), and the G2 UDP transceiver / KHL
+family. The G2 tree codec itself has since landed (see the resolved entry
+above); what remains of G2 is the wire that carries these packets, not their
+framing.
 
 ### Should the daemon ship default `gnutella_caches`?
 
@@ -399,3 +460,31 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### The G2 codec has no consumer yet, and no field-level types
+
+`g2packet.go` is deliberately framing only, so three things it does not do are
+worth naming before something builds on it:
+
+- **Nothing calls it.** `Engine` still speaks G1 only: there is no G2
+  handshake, no UDP transceiver, and no KHL consumer, so the codec is proven
+  by its own tests against Shareaza's source rather than by traffic. The first
+  caller will settle whether `DecodeG2Children`'s "children then rest" split,
+  or the packet-level `Payload`-after-children form, is the one it wants.
+- **`NH`, `HS` and `CH` have no field-level types.** They decode to opaque
+  payloads. `TestG2WireVectors` pins the framing by encoding a hand-built KHL
+  tree and comparing it byte for byte with the bytes Shareaza's
+  `CreateKHLPacket` would write; it is a framing test, not a KHL model. A KHL
+  slice wants typed leaf-count/leaf-limit/address accessors, and will have to
+  decide whether they live on `G2Packet` or in a `g2` subpackage.
+- **The depth limit (64) is a guess, not a measurement.** It is far above any
+  real tree; if a legitimate G2 structure nests deeper, the number is what
+  moves, not the invariant.
+
+### `internal/engine/gnutella/query.go` and `query_test.go` are not gofmt-clean
+
+Both committed files are missing a trailing newline, and `query_test.go` has
+one misaligned line comment, so `gofmt -l` flags them. Noticed while
+formatting the G2 files; left untouched because they are another slice's
+files and the harness opens one PR per cycle. A later cycle that touches the
+query code should run `gofmt -w` on them.
