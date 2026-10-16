@@ -61,7 +61,13 @@ type peer struct {
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+//
+// r is the buffered reader over conn and must be the one the caller
+// created: the accept loop peeks its first bytes to tell a handshake
+// from an HTTP GET, and the handshake may buffer bytes past its
+// terminator. Wrapping conn again here would lose both, so the reader
+// is passed in rather than made here.
+func serveConn(ctx context.Context, r *bufio.Reader, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
@@ -78,7 +84,6 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {

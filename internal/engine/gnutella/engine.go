@@ -8,6 +8,7 @@ package gnutella
 // the supervisor collects worker output.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -34,12 +35,17 @@ const (
 // see Options.SearchTimeout.
 const searchTimeout = 5 * time.Second
 
-// Options tunes an Engine. Zero values select sane defaults.
-// FileEntry is a file in the local catalogue for QUERY responses.
+// FileEntry is a file in the local catalogue. It serves two roles: the
+// Index/Size/Name triple answers an inbound QUERY (see peer.go), and
+// Path is the file on disk a Gnutella 1 download GET is answered from
+// (see serve.go). A Path is what makes an entry servable; an entry
+// without one is advertised by QUERY responses but cannot be
+// downloaded, and the GET is answered 404.
 type FileEntry struct {
 	Index uint32
 	Size  uint32
 	Name  string
+	Path  string
 }
 
 // Options tunes an Engine. Zero values select sane defaults.
@@ -220,20 +226,16 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
-		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-		e.mu.Lock()
-		e.peers[pc] = struct{}{}
-		e.mu.Unlock()
+		// One listener serves both protocols. Which one a connection
+		// is decides in serveInbound, after it has peeked the first
+		// bytes; the peer registration therefore happens inside the
+		// handshake branch, once the connection is known to be a
+		// Gnutella peer rather than a download request.
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(c net.Conn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
-				logf("inbound %s: %v", c.RemoteAddr(), err)
-			}
-			e.mu.Lock()
-			delete(e.peers, pc)
-			e.mu.Unlock()
-		}(conn, pc)
+			e.serveInbound(ctx, c, logf)
+		}(conn)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -317,7 +319,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, bufio.NewReader(conn), conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()

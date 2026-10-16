@@ -247,6 +247,118 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Engine.Fetch joins search and download
+
+`internal/engine/gnutella/fetch.go` adds `(*Engine).Fetch(ctx, query, dir)
+(FetchResult, error)`, which composes the two landed requester-side
+primitives: `Search` finds the files, `Downloader` moves the one that is
+tried. Nothing wire-format-shaped is added here; the QUERY and the HTTP GET
+are exactly the ones `Search` and `Downloader` already send. This is the
+P1 exit-gate criterion "completes a search and a download" as a single
+artifact, and `TestFetchSearchThenDownloadEndToEnd` is it: one call sends a
+QUERY over a real 0.6 link, takes the QUERYHIT that answers it, moves the
+named file over real HTTP, and compares the bytes on disk exactly with what
+the servent wrote.
+
+Decisions worth recording, because the next slice inherits all of them:
+
+- **Candidates are ordered by descending declared `FileSize`**, ties kept in
+  the order `Search` returned them (a stable sort, so the outcome does not
+  depend on the sort implementation). Each candidate gets a fresh
+  `Downloader` built from its own QUERYHIT, since the peer that answered the
+  query need not be the peer that serves the file. The first transfer that
+  succeeds wins; the rest are not attempted.
+- **`Search`'s partial hits are still usable.** `Search` can return hits
+  alongside an error (a write to one peer failed, another answered). `Fetch`
+  tries those hits and only surfaces `Search`'s error when it has nothing to
+  try — the opposite of taking the error as final and discarding a
+  downloadable hit.
+- **The collection window is inherited, not shortened.** `Search` runs to the
+  full `Options.SearchTimeout` and has no context, so `Fetch` consults `ctx`
+  only between transfer attempts. A cancelled context stops the next
+  transfer; it does not truncate a search that has already been sent.
+- **`ErrNoHits` and `ErrAllCandidatesFailed` are different.** No QUERYHIT at
+  all is the first; a QUERYHIT whose file list is empty is the second, and a
+  set of attempts that all failed is neither — that returns the last transfer
+  error, which says why they failed.
+- **No integrity check is added.** Gnutella 1 has no content hash and no
+  block protocol on this path, so the declared size remains the only one, and
+  `Fetcher` reports a refused transfer as a failed candidate. A failed
+  transfer still truncates back to its starting offset, so a `Fetch` that
+  ends in error leaves no partial where a complete file should be.
+
+Both new assertions were mutation-tested: removing the declared-size
+comparison in `download.go` turned `TestFetchAllCandidatesMismatchLeavesNoPartial`
+red, and skipping the sort in `orderCandidates` turned
+`TestFetchOrdersCandidatesByDescendingSize` red; both were reverted. The code
+was adopted from `agent/20261015-5nszr` rather than from
+`agent/20261013-afh8y` or `agent/20261015-hwcv6`: the latter two surface
+`Search`'s error before the hits it returned are tried, and both rewrite this
+file destructively, so their `docs/handoff.md` was deliberately not taken.
+
+When `Fetch` first landed its end-to-end test used a scripted QUERY peer and
+an `httptest` server, because the engine could not serve the file its own
+QUERYHIT advertised. The upload half is now built (see the next entry), so
+`TestFetchSearchThenDownloadEndToEnd` is two real engines and nothing about
+the exchange is scripted. The **gtk-gnutella oracle leg is still SKIPPED, not
+passed**: it cannot be installed here (no root, no sudo).
+
+### The Gnutella 1 upload half: the engine serves what it advertises
+
+`internal/engine/gnutella/serve.go` makes the engine answer the download GET
+its own QUERYHIT points at. `Engine.Search` had answered a QUERY from
+`Options.Catalogue` and `Engine.Fetch` had downloaded the hit, but the
+QUERYHIT advertises the engine's Gnutella listener and that listener spoke
+only the 0.6 handshake, so a second Sharza engine could never complete the
+loop. Now it can, and `TestFetchSearchThenDownloadEndToEnd` is that loop over
+two engines with no scripted peer.
+
+The design decision the next slice inherits:
+
+- **One port speaks both protocols, because that is what a QUERYHIT means.**
+  The servent convention (and gtk-gnutella) put the download address in the
+  QUERYHIT's port field, and that port is the same one peers use for the 0.6
+  handshake. `Engine.handleQuery` already advertised `p.listenPort()`, so the
+  only interoperable fix was to make that port answer a download GET as well.
+  A second, separate HTTP listener whose port the QUERYHIT advertised was
+  rejected: it would work against our own client but would lie to any peer
+  that tried to open a Gnutella connection or push to the advertised port.
+- **The accept loop sniffs, it does not read ahead.** `serveInbound` wraps
+  the connection in one `bufio.Reader`, `Peek`s eight bytes (a CONNECT and a
+  GET both start with `G`, so eight is the length of `GNUTELLA`), and hands
+  the *same reader* to whichever path wins. `serveConn` now takes that reader
+  instead of making its own. Consuming the peeked bytes, or re-wrapping the
+  connection, loses the handshake's buffered input; the mutation is covered
+  below.
+- **`net/http`, not a hand-rolled response.** The HTTP side is served with
+  `http.ServeContent`, so the byte-range contract (200, 206 with
+  `Content-Range`, 416) is stdlib behaviour rather than something this repo
+  re-implements and half-tests. It stays cgo-free. A single already-accepted
+  connection is served through a one-connection `net.Listener`; its second
+  `Accept` blocks until the connection is closed, because
+  `http.Server.Serve` returns without waiting for its connection handler and
+  would otherwise let the engine consider the transfer finished early.
+- **`FileEntry.Path` is what makes an entry servable.** An entry with no
+  `Path` is still advertised by a QUERY response but the GET is 404, so an
+  empty (or path-less) catalogue serves nothing. The route is
+  `GET /gnutella/<index>`, lenient about a trailing name a servent may
+  append; an unknown index is 404 and a range past EOF is 416.
+- **One request per connection**, keep-alives disabled, with a write timeout
+  and a shutdown hook: a client that requests a file and then stops reading
+  must not pin the engine's shutdown. This is deliberate; a servent that
+  keeps connections alive for many files is a later, separately-tested
+  change.
+
+Guards mutation-tested: making the sniff always choose the handshake path
+turned `TestServeDownloadFullFile`, `TestHandshakeAndDownloadShareThePort`
+and `TestFetchSearchThenDownloadEndToEnd` red; a wrong
+`X-Gnutella-Content-Length` turned the serving tests red and was also caught
+by the download client's own size check; consuming the peeked bytes
+(`Discard`) turned the handshake tests, the serving tests and the two-engine
+loop red. All were reverted. The gtk-gnutella oracle for this leg is
+**SKIPPED, not passed** (no root, no sudo), so serving is proven against the
+engine's own client and a plain `net/http` client on loopback only.
+
 ## Open questions
 
 ### Download client: decisions left open
