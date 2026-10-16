@@ -247,6 +247,77 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### P1 exit gate: the live search-and-download probe exists; the swarm returned a recorded negative
+
+`cmd/sharza-probe` is a development-only, manually-run end-to-end probe for the
+P1 exit gate. It loads the daemon's own config (`config.Load`), starts the same
+`gnutella.Engine` with `Listen`/`Peers`/`Caches`, waits on `Engine.Ready()`, then
+polls `Engine.Search(term)` until a QUERYHIT arrives and downloads the smallest
+advertised file at or below `-max-size` with
+`Engine.Downloader(qh, hit).Fetch(ctx, dir)`, checking the on-disk size against
+the advertised size on the way out.
+
+No engine change was needed: `Search`, `Downloader`, `QueryHit.Source` and
+`DownloadResult` were already exported, and the engine's `Logf` carries the
+dial/refuse detail. The engine exposes no peer count, so the probe infers "no
+connected peer" from a `Search` that returns zero hits well inside its own
+window, which is the observable of `Search`'s `len(peers)==0` early return. The
+probe is a `package main` under `cmd/`, is referenced by no package, and is not
+shipped: `packaging/deb/build-deb.sh` installs only `sharzad` and `sharza-ctl`.
+It is never invoked by `go test` or CI.
+
+**Control run (no caches, no peers) — the zero baseline.** With
+`gnutella_caches` and `gnutella_peers` both empty and a 12 s deadline:
+
+```
+sharza-probe: config: listen=0.0.0.0:6346 peers=[] caches=[]
+sharza-probe: engine ready on [::]:6346
+sharza-probe: search 1: no hits in 0s (returned early, so no connected peers yet)
+sharza-probe: search 2: no hits in 0s (returned early, so no connected peers yet)
+sharza-probe: search 3: no hits in 0s (returned early, so no connected peers yet)
+sharza-probe: search 4: no hits in 0s (returned early, so no connected peers yet)
+sharza-probe: FAIL: no queryhits for "test" before the deadline: context deadline exceeded
+```
+
+Exit 1. The immediate return with no hits is the no-peer signal: a future
+positive run cannot be vacuous, because a probe that never reached the network
+would look exactly like this, not like a hit.
+
+**Live run (four known-alive caches, `-term mp3`).** Two runs, 150 s and 90 s,
+both exit 1 with zero QUERYHITs. The caches answered promptly (12-29 hosts
+each, both `net=gnutella` and `net=gnutella2` merged), so bootstrap worked, and
+the dial loops produced real traffic:
+
+```
+sharza-probe: gnutella: cache http://midian.jayl.de/g2/gwc.php: 29 host(s), 11 url(s)
+sharza-probe: gnutella: peer 115.166.3.140:37058: peer refused connection: 503 Not Good Leaf
+...
+sharza-probe: gnutella: peer 115.64.118.56:6346: response: handshake not terminated: read tcp 192.168.1.4:34952->115.64.118.56:6346: read: connection reset by peer
+...
+sharza-probe: search 2: window 15.001s closed with no hits
+sharza-probe: FAIL: no queryhits for "mp3" before the deadline: context deadline exceeded
+```
+
+Counts across the two runs: 427 and 307 handshake resets, 157 and 49 explicit
+`503` refusals (`Not Good Leaf`, `Shielded leaf node`, `We're Leaves`, `Wrong
+Protocol`), and **zero completed handshakes**, so `Search` only ever took its
+"no connected peers yet" path. No file was ever named, so no download was
+attempted.
+
+**What this is and is not.** This is a recorded negative result, not a pass.
+The probe itself is exercised and reaches the network; the P1 exit gate is not
+met on 2026-10-16. The failure mode differs from the 2026-10-10 handshake (7 of
+7 *configured* gtk-gnutella ultrapeers completed, `compressed=true`): every
+cache-derived peer either refused (the usual server-side leaf-slot policy, and
+the Shielded Shareaza-family population) or reset the connection before the 0.6
+handshake terminated. Whether that is a degraded/rotated 2026-10-16 swarm or a
+regression on our side is not established here, and the oracle leg
+(gtk-gnutella, needing root) remains unrun.
+
+The brief's PUSH contingency was "hits but every source refuses an inbound GET":
+it did not trigger, because there were no hits at all and PUSH cannot address a
+missing QUERYHIT. See the open question below for the next slice.
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -399,3 +470,27 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### The live probe's zero hits: what to do next
+
+The probe did its job (it reached the network and recorded the failure), but it
+left two questions for the next slice rather than a fix:
+
+- **Why does the 2026-10-16 cache population reset the handshake?** The
+  2026-10-10 run dialed seven hand-picked gtk-gnutella ultrapeers and all seven
+  completed; the cache-derived list on 2026-10-16 mostly refuses or resets. The
+  probe cannot tell whether the list rotated, whether those hosts now ban this
+  source, or whether a header the 2026-10-10 peers tolerated is now rejected.
+  The cheapest next step is a `gnutella_peers` run against the same explicit
+  ultrapeers the 2026-10-10 entries recorded, which separates "stale cache" from
+  "engine regression" without new code.
+- **PUSH is still unbuilt and still unproven either way.** The contingency the
+  brief named (QUERYHITs arrive but every source refuses the inbound GET) never
+  triggered, because there were no QUERYHITs. Building `MsgPush` now would be
+  speculative: with no live hit there is nothing to validate it against, and a
+  scripted-peer test alone is the kind of evidence the handshake item already
+  showed can pass while the real swarm does something else. It stays the first
+  candidate once a hit appears.
+
+The exit gate's search-and-download criterion therefore remains open, with the
+probe as the instrument that will show it passing the moment the swarm answers.
