@@ -6,6 +6,46 @@ blocker.
 
 ## Resolved in this cycle
 
+### The Gnutella 1 push direction: the firewalled *source* dials back and sends GIV
+
+The `next-task` brief for the Gnutella 1 push slice arrived as an unfinished
+analysis rather than a task: it was working out which side of a push sends
+`GIV`, realised that answer decides who serves the file, and was cut off before
+stating any scope, files or acceptance test. Nothing bounded was implementable
+from it, but the question it was chasing is settled from the Shareaza Gnutella 1
+reference (`CG1Packet::OnPush`, `CNetwork::SendPush`, `CHandshake::OnConnected`
+and `OnAcceptGive`):
+
+- A downloader **A** that cannot fetch from a source **B** directly (B is
+  firewalled) sends a `PUSH` packet (`0x40`) addressed to B's servent GUID. The
+  payload is exactly 26 bytes: B's 16-byte GUID, the file's `index` in **B's**
+  catalogue (LE), and **A's own** IPv4 address and port (the callback address).
+  A receiver acts on the push only when the payload GUID equals its own.
+- **B, the source, dials A** at that address. That is the one outbound
+  connection B's firewall permits, and it is why push exists.
+- On connect **B sends `GIV <index>:<B's guid>/`** (the upload handshake,
+  `IDS_UPLOAD_GIV`, from `CHandshake::OnConnected`) and then serves the file.
+  B is the uploader and the index is B's: `GIV` is an offer ("give"), not a
+  "give me". A accepts it as the download side (`OnAcceptGive` →
+  `Network.OnPush` → the waiting transfer) and issues the GET on the same
+  socket.
+
+The instinct worth keeping is the one the brief kept second-guessing: the side
+that sends `GIV` is the **uploader/source**, and the index it names is its own.
+Two wire forms must not be conflated: this binary `0x40` PUSH payload, and the
+Gnutella2/HTTP-text `PUSH <guid>:...` handshake line Shareaza also accepts
+(`CHandshake::OnAcceptPush`).
+
+This cycle implements only the two pure encodings that pin the direction down,
+in `internal/engine/gnutella/push.go`: the 26-byte PUSH payload
+(`Push`/`EncodePush`/`DecodePush`) and the `GIV` line (`GIV`/`EncodeGIV`/
+`DecodeGIV`), with the wire layout, the "act only if the target is me" field,
+the zero-callback rejection and the malformed-line refusals all covered by tests
+that were mutation-tested (reversing the IP bytes, moving the port to
+big-endian, and dropping the GUID-length check each turned a test red). It is
+the smallest verifiable unit of the item; the listener and upload server it
+implies are not built, see Open questions.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -301,9 +341,43 @@ decisions from that slice are worth recording before the next one:
   verification.
 
 Still out of scope from the brief, each its own slice: QUERY
-forwarding/horizon routing beyond the direct link, push and browse, wiring
+forwarding/horizon routing beyond the direct link, browse, wiring
 `Search` into the RPC surface (human gate), and the G2 tree codec / UDP
-transceiver / KHL family.
+transceiver / KHL family. Push now has its wire primitives
+(`internal/engine/gnutella/push.go`); what it still lacks is listed under
+"Push: what the wire primitives deliberately leave open" below.
+
+### Push: what the wire primitives deliberately leave open
+
+`push.go` encodes and decodes the two push messages, but a working push needs
+more than a codec, and those parts are a larger, gate-touching slice that this
+cycle did not take:
+
+- **The requester side has no path to send a PUSH.** `Push.Valid` and the
+  encoder exist, but nothing in `Engine`/`peer` builds a `0x40` frame, chooses
+  the target GUID from a QUERYHIT, or routes it to the neighbour that owns that
+  GUID. Shareaza tracks a GUID-to-neighbour route table for this
+  (`GetNodeRoute`); the engine has no such table, so even the requester half
+  needs a routing decision first.
+- **The source side has no dial-back listener.** Acting on an inbound PUSH
+  means connecting out to the payload's address and sending `GIV`, then serving
+  the file. The engine has no upload server at all: `download.go` is a client,
+  and nothing answers a `GET /gnutella/<index>`. That server is the real bulk
+  of the slice, and it is not in `push.go`.
+- **`GIV.Name` is carried verbatim, not URL-decoded.** Servents conventionally
+  percent-encode the name and Shareaza runs `URLDecode` over it. Decoding is a
+  caller policy, so the codec keeps the bytes intact; if the upload side ever
+  matches on the name, it must decide where the decode happens.
+- **The codec is unused in the live path.** It is a primitive with tests, like
+  the PING/PONG framing was before it was wired. There is no caller yet, so it
+  is not yet evidence that push *works*, only that its wire shape is pinned.
+- **The GGEP tail is ignored.** PUSH may carry a GGEP block after the fixed 26
+  bytes (Shareaza reads `GGEP_HEADER_TLS_SUPPORT` from it). `DecodePush` drops
+  trailing bytes; a TLS-capable push would need them parsed.
+- **`Push.Valid` does not police the address.** Shareaza also drops a
+  hop-forwarded push whose callback address is firewalled or in a reserved
+  range. That is reachability policy, not wire format, so it is left to the
+  caller.
 
 ### Should the daemon ship default `gnutella_caches`?
 
