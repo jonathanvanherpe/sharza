@@ -62,6 +62,10 @@ type peer struct {
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
 func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+	return serveConnWithReader(ctx, conn, inbound, opts, laddr, bufio.NewReader(conn))
+}
+
+func serveConnWithReader(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, r *bufio.Reader) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
@@ -78,7 +82,6 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {

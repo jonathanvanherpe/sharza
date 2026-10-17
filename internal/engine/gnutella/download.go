@@ -365,3 +365,24 @@ func (d *Downloader) logf() func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "sharzad: gnutella: download: "+format+"\n", args...)
 	}
 }
+
+// FetchOverConn performs a download over an established connection
+// (used for PUSH callback connections). The connection is passed to
+// the HTTP client via a custom transport.
+func FetchOverConn(ctx context.Context, conn net.Conn, dir string, d *Downloader) (DownloadResult, error) {
+	// Create a transport that always uses the provided connection
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+		ResponseHeaderTimeout: downloadHeaderTimeout,
+		DisableCompression:    true,
+	}
+	client := &http.Client{Transport: tr}
+	old := d.Client
+	d.Client = client
+	res, err := d.Fetch(ctx, dir)
+	d.Client = old
+	tr.CloseIdleConnections()
+	return res, err
+}

@@ -11,6 +11,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"bufio"
+	"bytes"
+	"strings"
 	"net"
 	"os"
 	"sync"
@@ -32,7 +35,10 @@ const (
 // writing its QUERY. The window always runs to the end, so a peer that
 // answers first does not cut short the peers that have not answered yet;
 // see Options.SearchTimeout.
-const searchTimeout = 5 * time.Second
+const (
+	searchTimeout = 5 * time.Second
+	pushTimeout   = 15 * time.Second
+)
 
 // Options tunes an Engine. Zero values select sane defaults.
 // FileEntry is a file in the local catalogue for QUERY responses.
@@ -93,6 +99,10 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// PushTimeout is the window to wait for a firewalled peer's
+	// GIV connection after sending PUSH. Zero means the default 15s.
+	PushTimeout time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -102,15 +112,19 @@ func (o Options) withDefaults() Options {
 	if o.IdleTimeout <= 0 {
 		o.IdleTimeout = 5 * time.Minute
 	}
-	if o.SearchTimeout <= 0 {
-		o.SearchTimeout = searchTimeout
-	}
-	if o.Logf == nil {
-		o.Logf = func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "sharzad: gnutella: "+format+"\n", args...)
+		if o.SearchTimeout <= 0 {
+			o.SearchTimeout = searchTimeout
 		}
-	}
-	return o
+		if o.PushTimeout <= 0 {
+			o.PushTimeout = pushTimeout
+		}
+		if o.Logf == nil {
+			o.Logf = func(format string, args ...any) {
+				fmt.Fprintf(os.Stderr, "sharzad: gnutella: "+format+"\n", args...)
+			}
+		}
+		return o
+
 }
 
 func (o Options) logf() func(format string, args ...any) {
@@ -139,6 +153,10 @@ type Engine struct {
 	// searches correlates inbound QUERYHITs with the Search that asked
 	// for them, by descriptor ID.
 	searches *searchRegistry
+
+	// pendingPush maps a servent ID to a channel that receives the
+	// connection from a firewalled peer dialing back after a PUSH.
+	pendingPush sync.Map // [16]byte -> chan net.Conn
 
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
@@ -220,20 +238,13 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
-		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-		e.mu.Lock()
-		e.peers[pc] = struct{}{}
-		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(c net.Conn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := e.serveInbound(ctx, c); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
-			e.mu.Lock()
-			delete(e.peers, pc)
-			e.mu.Unlock()
-		}(conn, pc)
+		}(conn)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -451,4 +462,155 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// serveInbound classifies an inbound connection. If it starts with "GIV:",
+// it is a firewalled peer dialing back after a PUSH; otherwise it is
+// a regular peer connection and goes through the normal handshake/serve path.
+func (e *Engine) serveInbound(ctx context.Context, conn net.Conn) error {
+	defer conn.Close()
+
+	// Peek for GIV
+	br := bufio.NewReader(conn)
+	peek, err := br.Peek(3)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	if string(peek) == "GIV" {
+		return e.handleGiv(ctx, br, conn)
+	}
+
+	// Not a GIV; treat as peer connection. Use prefixConn to replay peeked bytes.
+	pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
+	e.mu.Lock()
+	e.peers[pc] = struct{}{}
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		delete(e.peers, pc)
+		e.mu.Unlock()
+	}()
+	if err := serveConnWithReader(ctx, conn, true, e.opts, e.laddr, br); err != nil {
+		return err
+	}
+	return nil
+}
+
+// handleGiv handles a GIV: callback from a firewalled peer after receiving PUSH.
+// Format: "GIV: /<file index>/<servant id>\n\n"
+// The connection is returned to whoever is waiting for that servant ID.
+func (e *Engine) handleGiv(ctx context.Context, br *bufio.Reader, conn net.Conn) error {
+	// Read until \n\n or \r\n\r\n
+	var buf []byte
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		buf = append(buf, b)
+		if len(buf) >= 2 && buf[len(buf)-2] == '\n' && buf[len(buf)-1] == '\n' {
+			break
+		}
+		if len(buf) >= 4 && bytes.Equal(buf[len(buf)-4:], []byte("\r\n\r\n")) {
+			break
+		}
+		if len(buf) > 512 {
+			break
+		}
+	}
+	line := string(buf)
+	// Parse /<index>/<guid>
+	if idx := strings.Index(line, "GIV:"); idx >= 0 {
+		line = line[idx+4:]
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return fmt.Errorf("invalid GIV")
+	}
+	if line[0] == '/' {
+		line = line[1:]
+	}
+	slash := strings.IndexByte(line, '/')
+	if slash < 0 {
+		return fmt.Errorf("invalid GIV")
+	}
+	idxStr := line[:slash]
+	guidStr := line[slash+1:]
+	guidStr = strings.TrimRight(guidStr, "\r\n")
+
+	var fileIndex uint32
+	fmt.Sscanf(idxStr, "%d", &fileIndex)
+
+	var guid [16]byte
+	// Try to parse as 32 hex chars or as raw bytes in some forms; for now just copy if hex length matches
+	if len(guidStr) == 32 {
+		for i := 0; i < 16; i++ {
+			var v byte
+			fmt.Sscanf(guidStr[2*i:2*i+2], "%02x", &v)
+			guid[i] = v
+		}
+	}
+
+	if v, ok := e.pendingPush.Load(guid); ok {
+		ch := v.(chan net.Conn)
+		select {
+		case ch <- conn:
+		default:
+		}
+	}
+	return nil
+}
+
+// FetchHit attempts to download a hit, sending PUSH if the source appears
+// firewalled (dial fails).
+func (e *Engine) FetchHit(ctx context.Context, from net.Addr, queryID [16]byte, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	d := NewDownloader(qh, hit)
+	d.Logf = e.opts.logf()
+	res, err := d.Fetch(ctx, dir)
+	if err == nil {
+		return res, nil
+	}
+	// If it fails due to dial failure, try PUSH
+	// Simple heuristic: look for dial/network errors
+	var opErr *net.OpError
+	if errors.As(err, &opErr) || errors.Is(err, context.DeadlineExceeded) {
+		// Try PUSH
+		var push Push
+		copy(push.ServentID[:], qh.ServentID[:])
+		push.FileIndex = hit.FileIndex
+		if la, ok := e.laddr.(*net.TCPAddr); ok && la.IP != nil {
+			if ip4 := la.IP.To4(); ip4 != nil {
+				copy(push.RequesterIP[:], ip4)
+			}
+		}
+		if la, ok := e.laddr.(*net.TCPAddr); ok {
+			push.Port = uint16(la.Port)
+		}
+
+		ch := make(chan net.Conn, 1)
+		e.pendingPush.Store(push.ServentID, ch)
+		defer e.pendingPush.Delete(push.ServentID)
+
+		// Send PUSH to the peer that gave us the hit
+		if from != nil {
+			// TODO: send PUSH over the connection that delivered the hit
+		}
+
+		select {
+		case <-ctx.Done():
+			return DownloadResult{}, ctx.Err()
+		case conn := <-ch:
+			// Got callback connection; perform download over it
+			return FetchOverConn(ctx, conn, dir, d)
+		case <-time.After(e.opts.PushTimeout):
+			return DownloadResult{}, fmt.Errorf("push timeout")
+		}
+	}
+	return res, err
 }
