@@ -23,13 +23,21 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name, and (0.6 extension) the 16-byte servent client
+// ID of the peer answering the query, appended after the last hit.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+	// ClientID is the 16-byte servent ID of the peer that answered.
+	// It is encoded only when HasClientID is true: pre-0.6 senders
+	// omit it, and every QueryHit this engine decoded before the
+	// extension existed carries the zero value with HasClientID
+	// false. Push targets it, so a hit without it cannot push.
+	ClientID    [idSize]byte
+	HasClientID bool
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +111,10 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// 0.6 extension: the answering peer's client ID trails the last hit.
+	if qh.HasClientID {
+		out = append(out, qh.ClientID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +156,15 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// 0.6 extension: a trailing 16-byte client ID follows the last hit.
+	// Absent means a pre-0.6 sender (HasClientID stays false); anything
+	// that is not exactly the client ID is not a client ID, so a short
+	// remainder is ignored rather than guessed at. Trailing bytes past
+	// the client ID are not defined by the spec this package pins, so
+	// they are ignored too rather than treated as an error.
+	if len(payload)-pos >= idSize {
+		copy(qh.ClientID[:], payload[pos:pos+idSize])
+		qh.HasClientID = true
+	}
 	return qh, nil
 }

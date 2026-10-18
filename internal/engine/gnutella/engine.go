@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// nodeID is this engine's 16-byte servent ID. Run generates a fresh
+	// one per engine instance from crypto/rand, so it is stable for the
+	// life of the process and differs from every other engine. QUERYHIT
+	// replies stamp it on the wire so a peer can address a PUSH back at
+	// us by the same ID; an inbound PUSH whose GUID matches it is the
+	// push request aimed at this engine. Callers never set it.
+	nodeID [idSize]byte
 }
 
 func (o Options) withDefaults() Options {
@@ -183,6 +191,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// One servent ID per engine, generated fresh at Run. It is copied
+	// into every peer's options so QUERYHIT replies and inbound PUSH
+	// checks use the same ID for the life of the process.
+	e.opts.nodeID = newDescriptorID()
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)

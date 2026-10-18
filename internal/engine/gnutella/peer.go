@@ -442,6 +442,11 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
+		// Stamp our servent ID so a leaf that cannot reach us at the
+		// advertised IP:port can address a PUSH back at us by the same
+		// ID. This is the only client ID we put on the wire.
+		ClientID:    p.opts.nodeID,
+		HasClientID: true,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{

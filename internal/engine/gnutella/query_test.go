@@ -68,6 +68,61 @@ func TestEncodeDecodeQueryHitRoundTrip(t *testing.T) {
 	if len(dec.Hits) != 1 || dec.Hits[0].FileName != "file.mp3" || dec.Hits[0].FileSize != 12345 {
 		t.Errorf("hit mismatch: %+v", dec.Hits)
 	}
+	if dec.HasClientID {
+		t.Error("round-trip hit has no client ID but decode reported one; HasClientID leaked true")
+	}
+}
+
+// TestEncodeDecodeQueryHitWithClientID pins the 0.6 extension: a hit that
+// carries a client ID encodes it as the trailing 16 bytes and decodes it
+// back, and a hit that does not carry one stays absent. The push item
+// depends on this: a QUERYHIT that cannot round-trip its client ID is not
+// one a PUSH can be addressed back at.
+func TestEncodeDecodeQueryHitWithClientID(t *testing.T) {
+	id := [idSize]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	withID := QueryHit{
+		HitCount:    1,
+		Port:        6346,
+		IP:          [4]byte{10, 0, 0, 1},
+		Speed:       10000,
+		Hits:        []FileHit{{FileIndex: 7, FileSize: 42, FileName: "a.bin"}},
+		ClientID:    id,
+		HasClientID: true,
+	}
+	enc := EncodeQueryHit(withID)
+	if len(enc) != 11+8+len("a.bin")+1+idSize {
+		t.Fatalf("encoded %d bytes, want the 0.6 payload to end with %d client-ID bytes", len(enc), idSize)
+	}
+	dec, err := DecodeQueryHit(enc)
+	if err != nil {
+		t.Fatalf("decode with client id: %v", err)
+	}
+	if !dec.HasClientID {
+		t.Fatal("hit carried a client ID but decode dropped it; HasClientID stayed false")
+	}
+	if dec.ClientID != id {
+		t.Errorf("client id round-trip = %x, want %x", dec.ClientID, id)
+	}
+
+	// A pre-0.6 sender omits the client ID entirely. Same hit, truncated
+	// by the trailing 16 bytes: decode must not invent one.
+	without := withID
+	without.ClientID = [idSize]byte{}
+	without.HasClientID = false
+	encNo := EncodeQueryHit(without)
+	if len(encNo) == len(enc) {
+		t.Fatal("test setup: encoding with and without a client ID produced the same length")
+	}
+	decNo, err := DecodeQueryHit(encNo)
+	if err != nil {
+		t.Fatalf("decode without client id: %v", err)
+	}
+	if decNo.HasClientID {
+		t.Error("hit omitted its client ID but decode reported one present")
+	}
+	if decNo.ClientID != [idSize]byte{} {
+		t.Errorf("client id on a pre-0.6 hit = %x, want zero", decNo.ClientID)
+	}
 }
 
 func TestDecodeQueryHitMalformed(t *testing.T) {
