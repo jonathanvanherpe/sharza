@@ -6,6 +6,48 @@ blocker.
 
 ## Resolved in this cycle
 
+### Requester-side PUSH is implemented, and what it deliberately does not do
+
+A QUERYHIT whose source cannot be dialled is now answered by sending a PUSH
+(payload type `0x40`, 26 bytes: target servent id, little-endian file index,
+our listen IPv4 and port, §2.2.8) back down the very connection that carried
+the hit. The route has two halves that were both missing: the QUERYHIT's
+trailing servent identifier is decoded into `QueryHit.ClientID`, and the
+connection it arrived on is stamped into `QueryHit.Via` (a runtime field,
+never encoded). `pushRegistry` keys a live connection by remote address; its
+`remove` is identity-guarded (`if r.byAddr[addr] == p`) so a peer that
+reconnects from the same port is not evicted by the old connection's deferred
+deregistration, which `TestPushRegistryRemoveKeepsReconnectedPeer` pins with
+colliding `net.Pipe` addresses.
+
+`pushTTL` is 7, Shareaza's `MaximumTTL - 1`: a PUSH traverses no hops we did
+not choose, so it starts one below the ceiling. Each PUSH gets a fresh
+descriptor id, because §2.2.8 duplicate detection is keyed on the message id
+and reusing the QUERYHIT's would make a second push for the same file get
+dropped as a duplicate.
+
+The guard that matters for correctness is the context one: the push is sent
+only when the fetch failed at the transport level *and* `ctx.Err() == nil`. A
+caller that cancelled made a decision, and turning it into a PUSH on the wire
+would be a bug that a naive "fetch failed → push" test would bless. The two
+"no push" tests therefore assert the `RequestPush` closure is present before
+asserting silence — otherwise they would pass vacuously against an engine that
+wired nothing at all, which is exactly what mutation 4 below demonstrated.
+
+Verified over real TCP: a scripted peer replies with a hit whose source is
+TEST-NET-1 (`192.0.2.1`, routable nowhere) or whose transport refuses every
+dial; the download fails; the PUSH arrives on the same connection, addressed
+to the hit's servent id, carrying the file index, and advertised with the
+engine's own listen address. Codec and registry are also unit-tested directly,
+with the raw byte layout asserted before the round trip so a matching
+encode/decode mutation cannot hide. Four deliberate mutations — opcode to
+`0x03`, file index to big-endian, target id zeroed, servent-id trailer dropped
+— each turned the tests red and was reverted.
+
+Still not done, each its own slice: **serving** an inbound PUSH (we can ask a
+firewalled peer to connect to us, but we do not yet honour such a request
+ourselves), QUERY forwarding/horizon routing, and browse.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -399,3 +441,29 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### The QUERYHIT trailer is emitted only when a servent id exists
+
+§2.2.6 puts the result set, then an extensions block terminated by a NUL (so
+an empty block is a double NUL), then the optional servent identifier. A hit
+with no `ClientID` here emits nothing after the last hit name, so locally built
+payloads stay byte-identical to the result set and the old tests keep passing;
+the decoder tolerates both. Shareaza's `WriteTrailerG1` always writes the
+block terminator, so a strict reader that expects the double NUL would find
+our shorter payload surprising. Nothing in the live traffic seen so far reads
+it that way, and the engine now always sets `ClientID` on replies it sends
+(`Options.ServentID`), so the choice only affects hand-built payloads in tests.
+
+### A connection is guarded by two locks, and that is a latent race
+
+`Engine.Search` serialises its writes with the per-connection mutex `pc.mu`
+(`searchConn`), while `peer.writeMessage` uses `p.mu`. They are different
+locks over the same `net.Conn`, so a search QUERY and a PUSH (or a PING, or a
+PONG) can interleave their frame writes when they meet on the same connection.
+The frames are small and the window is narrow, which is why it has not been
+observed, but it is not safe by construction. The fix is a single write path
+per connection; it is recorded here rather than fixed now because it predates
+this change and touching the search path is its own risk. It should be closed
+before anything that raises concurrent write pressure (QUERY forwarding,
+browse, a second engine) lands.
+

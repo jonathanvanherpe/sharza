@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -23,13 +24,28 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name; after the result set, an NUL-terminated
+// extensions block and the trailing 16-byte servent identifier
+// (spec rfc-0_6-draft §2.2.6).
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	// ClientID is the trailing servent identifier (last 16 bytes of the
+	// payload): the value a PUSH must target to reach the servent that
+	// sent this hit (§2.2.8). It is zero when the payload ended before
+	// one, which older or minimal encoders may produce.
+	ClientID [idSize]byte
+
+	// Via names the connection this hit arrived on. It is not wire data
+	// and is never encoded or decoded: the receiving peer stamps it so a
+	// caller can send a PUSH back down the path the hit came from, which
+	// is what makes the request routable without new machinery. It is
+	// nil for hits built locally (e.g. our own QUERYHIT replies).
+	Via net.Addr
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +119,16 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	if qh.ClientID != ([idSize]byte{}) {
+		// The extensions block after the result set is NUL-terminated
+		// even when empty, so a hit with no extensions carries a double
+		// NUL (the last name's terminator plus the block's own), and the
+		// servent identifier is the 16 bytes after it (§2.2.6). A hit
+		// with no servent identifier emits nothing here, which keeps
+		// locally built payloads byte-identical to the result set.
+		out = append(out, 0x00)
+		out = append(out, qh.ClientID[:]...)
+	}
 	return out
 }
 
@@ -142,6 +168,16 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		if pos > len(payload) {
 			break
 		}
+	}
+	// The servent identifier is the last 16 bytes of the payload
+	// (§2.2.6), whatever extensions or private data sit between the
+	// result set and it (neither of which this decoder parses). It is
+	// only taken when at least 16 bytes remain past the result set: a
+	// payload that ends with the result set (an older or minimal
+	// encoder) simply has none, and the last hit's name bytes are not
+	// an identifier.
+	if len(payload)-pos >= idSize {
+		copy(qh.ClientID[:], payload[len(payload)-idSize:])
 	}
 	qh.Hits = hits
 	return qh, nil

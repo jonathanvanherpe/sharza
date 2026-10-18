@@ -90,9 +90,24 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// ServentID is the 16-byte servent identifier advertised as the
+	// trailing field of every QUERYHIT we send (spec §2.2.6): it is how
+	// another servent routes a PUSH back to us when the source we
+	// advertised turns out to be unreachable from it. Zero means Run
+	// generates one, which is what production does; a caller that
+	// already has a persistent identity sets it before Run.
+	ServentID [idSize]byte
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushes is the engine's live-connection registry for requester-side
+	// PUSH. Run sets it; callers do not. A QUERYHIT records the
+	// connection it arrived on (QueryHit.Via), and a download that fails
+	// at the transport level sends the PUSH back down that same
+	// connection through this registry.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +155,11 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes maps each live connection's remote address to its peer, so
+	// a PUSH for a QUERYHIT can be written down the connection the hit
+	// arrived on.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +173,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -181,8 +202,19 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	e.started = true
 	e.opts = opts.withDefaults()
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
-	// any connection can be matched to the Search that is waiting for it.
+	// any connection can be matched to the Search that is waiting for it,
+	// and so a PUSH can be written down the connection the hit arrived
+	// on.
 	e.opts.searches = e.searches
+	e.opts.pushes = e.pushes
+	// Generate the servent identity once, here rather than in
+	// withDefaults: withDefaults runs on every log call, and a fresh
+	// identifier per log line would give every QUERYHIT reply we send a
+	// different trailing id, which is exactly what a PUSH route is
+	// keyed on.
+	if e.opts.ServentID == ([idSize]byte{}) {
+		e.opts.ServentID = newDescriptorID()
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -357,12 +389,26 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 //
 // The engine holds no job state for the transfer: Fetch writes only to
 // the directory the caller passes, exactly like NewDownloader does.
+//
+// When the hit arrived from a live peer (Via names the connection) and
+// carried that peer's servent identifier (ClientID), the downloader also
+// gets a RequestPush closure: a download of a firewalled source that
+// fails at the transport level then asks that peer to push the file to
+// us, over the same connection, which is the Gnutella 0.6 path for a
+// source that cannot dialled directly (spec §2.2.8). A hit with no
+// connection or no identifier has no push path and no closure.
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	pushes := e.opts.pushes
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	if pushes != nil && qh.Via != nil && qh.ClientID != ([idSize]byte{}) {
+		d.RequestPush = func() error {
+			return pushes.send(qh.Via, qh.ClientID, hit.FileIndex)
+		}
+	}
 	return d
 }
 

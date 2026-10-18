@@ -78,6 +78,19 @@ type Downloader struct {
 	// Client performs the GET. Nil selects defaultDownloadClient.
 	Client *http.Client
 
+	// RequestPush, when set, asks the servent that advertised this hit
+	// to push the file to us: the firewalled-source path of spec
+	// rfc-0_6-draft §2.2.8. Fetch calls it at most once, and only when
+	// the transfer failed at the transport level (the GET itself could
+	// not be made) while the caller's context is still live; a
+	// cancellation is a decision, not a dead source, and never fires it.
+	// The push error is logged, not returned: the download's own
+	// failure is what Fetch reports, and a PUSH that could not be sent
+	// only means the firewalled source stays unreachable this time.
+	// Engine.Downloader wires this for hits that carry a live
+	// connection and a servent identifier; NewDownloader leaves it nil.
+	RequestPush func() error
+
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
 }
@@ -191,6 +204,15 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// The transport itself failed: connection refused, dial timeout,
+		// no route. That is the shape of a firewalled source, which
+		// cannot accept a connection at all, so it is where the PUSH
+		// request of spec §2.2.8 belongs. A cancelled context is the
+		// caller's decision to stop and must not turn into a push
+		// request on the wire.
+		if ctx.Err() == nil {
+			d.requestPush(src)
+		}
 		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
@@ -264,6 +286,24 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	}
 	d.logf()("downloaded %s from %s: %d bytes at offset %d", name, src, n, start)
 	return DownloadResult{Path: dest, Bytes: n, Offset: start}, nil
+}
+
+// requestPush sends the PUSH request for this hit if one is wired. It
+// is best-effort: the transfer has already failed, and a PUSH that
+// could not be sent (the peer that carried the QUERYHIT has since
+// disconnected, for instance) only means the firewalled source stays
+// unreachable this time. The outcome is logged rather than returned,
+// because Fetch reports the download's own failure and the caller can
+// act on that alone.
+func (d *Downloader) requestPush(src string) {
+	if d.RequestPush == nil {
+		return
+	}
+	if err := d.RequestPush(); err != nil {
+		d.logf()("push request for index %d via %s failed: %v", d.Hit.FileIndex, src, err)
+		return
+	}
+	d.logf()("push requested for index %d from unreachable source %s", d.Hit.FileIndex, src)
 }
 
 // checkDeclaredSize verifies the lengths a peer declared in a 200

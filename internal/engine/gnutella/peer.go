@@ -92,6 +92,12 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	if c, ok := next.(io.Closer); ok {
 		defer c.Close()
 	}
+	// The connection becomes usable for PUSH only once the handshake has
+	// completed, and stops being usable when serveConn returns; the
+	// deferred remove runs after loop, so a hit delivered in the loop's
+	// last moments still finds a live entry.
+	opts.pushes.add(p)
+	defer opts.pushes.remove(p)
 	return p.loop(ctx, next)
 }
 
@@ -274,9 +280,11 @@ func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 	}
 }
 
-// handle processes one message. Routing and file transfer are out of
-// scope for this item, so Query, QueryHit and Push are acknowledged in
-// the log and ignored.
+// handle processes one message. QUERY and QUERYHIT are handled (the
+// local catalogue answers queries, hits are delivered to the search
+// registry and the OnQueryHit callback); PUSH is only ever sent by this
+// servent, so an inbound one is acknowledged in the log and ignored
+// until upload serving exists.
 func (p *peer) handle(hdr Header, payload []byte) error {
 	switch hdr.Type {
 	case MsgPing:
@@ -290,7 +298,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
+		p.logf("ignoring %s from %s: we are the requester; serving pushes needs upload handling, which does not exist yet",
 			typeName(hdr.Type), p.conn.RemoteAddr())
 		return nil
 	default:
@@ -442,6 +450,11 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
+		// The trailing servent identifier is how a receiver routes a
+		// PUSH back to us if our own source turns out to be
+		// unreachable from it; a reply without one is malformed
+		// (spec §2.2.6).
+		ClientID: p.opts.ServentID,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
@@ -463,12 +476,17 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 // callback. Delivery is by ID because that is all a QUERYHIT carries: a
 // hit under no in-flight ID is another query's result and the registry
 // drops it, but the callback still sees every hit.
+//
+// The connection the hit arrived on is stamped into qh.Via before
+// either surface sees it, so a caller whose download later fails at the
+// transport level can send a PUSH back down the path the hit came from.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+	qh.Via = p.conn.RemoteAddr()
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
