@@ -271,7 +271,10 @@ sanitiser each turned its guarding test red before being reverted.
   differential oracle for the exchange leg, but it cannot be installed here
   (no root, no sudo), so the download is proven against the scripted servent
   only. The controlled two-client loop remains the wanted, separately-run
-  artifact, exactly as for the handshake item.
+  artifact, exactly as for the handshake item. The search+download flow leg
+  (`flow_test.go`) is scripted-only too and adds no oracle claim: its three
+  tests compose `Engine.Search` with `Downloader.Fetch` against one local
+  scripted ultrapeer over real TCP, nothing else.
 
 ### Requester-side search: what the first real `Search` deliberately leaves open
 
@@ -304,6 +307,20 @@ Still out of scope from the brief, each its own slice: QUERY
 forwarding/horizon routing beyond the direct link, push and browse, wiring
 `Search` into the RPC surface (human gate), and the G2 tree codec / UDP
 transceiver / KHL family.
+
+### A peer is registered in the engine before its handshake completes
+
+`dialLoop` adds the `peerConn` to `e.peers` before `serveConn` runs the
+CONNECT handshake, and the registration is guarded by `peer.mu` while the
+connection's own writes use `peerConn.mu`. A `Search` issued in that window
+can therefore interleave frame writes with the handshake on the same
+connection. The flow tests in `flow_test.go` sidestep it by only calling
+`eng.Search` after the scripted ultrapeer has read the engine's 200
+confirmation (its `ready` channel), which proves the handshake finished; the
+race is not fixed. Registering the peer only after a successful handshake, or
+sharing one mutex across registration and the connection, are the two natural
+fixes, and both touch production code outside this slice. Fixing it also means
+revisiting the `<-fp.ready` guards, which exist only because of this.
 
 ### Should the daemon ship default `gnutella_caches`?
 
