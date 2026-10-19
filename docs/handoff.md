@@ -247,6 +247,50 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### `SearchAndDownload`: the P1 search-to-download leg, and a struct rename
+
+`Engine.SearchAndDownload(ctx, q, dir)` fuses the two-step path (`Search`
+then `Downloader.Fetch`) into one call, so a caller that just wants a file
+need not re-implement hit selection. The search is `searchQuery` with the
+caller's context (same descriptor registration, same collection window, so
+the latency/completeness trade is exactly `Search`'s); the fetch is
+`Downloader.Fetch` with the same context and directory, so resume, size
+verification and name sanitisation behave identically to a hand-driven
+transfer.
+
+Two decisions worth recording:
+
+- **Selection runs before any disk access.** The first QUERYHIT with at
+  least one non-empty file and a dialable address (non-zero port, no
+  unspecified `0.0.0.0`/`::`) wins; unusable hits are skipped rather than
+  failing the whole search on one peer's malformed reply. If nothing is
+  usable the error is `ErrNoSuitableHit` and `dir` is left untouched — an
+  unusable hit never creates a directory or a partial file, so the caller
+  sees a clean error rather than an error plus something to clean up.
+- **`ErrNoSuitableHit` is a distinct error from a transfer failure.** A
+  caller can tell "nothing to download" (worth re-searching) apart from
+  "the download broke" (worth retrying the same hit).
+
+**The struct is named `DownloadJob`, not `DownloadResult`.** The brief's
+`DownloadResult` name was already taken by the transfer-level type in
+`download.go` (`Path`, `Bytes`, `Offset`, `Complete`), which reports the
+mechanics of one `Fetch` call and is the type a resume-aware job store
+would reuse. `DownloadJob` (in the new `download_result.go`) reports what a
+search caller wants — the chosen hit, the path, the whole file's size — and
+deliberately hides whether any of it resumed, so a resumed transfer and a
+clean one produce the same job. The brief's fallback name `DownloadJob` was
+used rather than overloading or renaming the existing type.
+
+The leg is covered by `search_download_test.go` over real TCP (not in-memory
+pipes): a live engine linked to a scripted 0.6 servent that answers a QUERY
+with a QUERYHIT, plus an `httptest` HTTP server that serves the file. The
+three cases are a hit resolving into a complete file at a sanitised path, a
+partial file on disk resuming, and an unusable hit erroring with
+`ErrNoSuitableHit` while creating nothing. Three assertions were
+mutation-tested: disabling the address filter, reporting only this call's
+bytes instead of the whole file's size, and returning the hit all each
+turned their guarding test red before being reverted.
+
 ## Open questions
 
 ### Download client: decisions left open
@@ -304,6 +348,26 @@ Still out of scope from the brief, each its own slice: QUERY
 forwarding/horizon routing beyond the direct link, push and browse, wiring
 `Search` into the RPC surface (human gate), and the G2 tree codec / UDP
 transceiver / KHL family.
+
+`SearchAndDownload` (see the resolved entry above) reuses `searchQuery`
+unchanged, so the four decisions above apply to it too. Two things it adds
+that are worth a maintainer's eye:
+
+- **`SearchAndDownload` downloads the first usable hit only, and stops.**
+  Selection walks the returned hits in arrival order and takes the first one
+  with a non-empty file and a dialable address; the rest are discarded. A
+  hit that fails `Fetcher.Fetch` is not retried against the next usable hit
+  in the same result set — the error is returned as-is and the caller decides
+  whether to search again. If a later slice wants "try the next source on
+  failure", the selection loop is the place to change, and it would need a
+  decision about whether a size-mismatch refusal should also fall through to
+  the next hit or stay fatal.
+- **Hit-arrival order is peer order, not quality order.** The first usable
+  hit wins regardless of the peer's advertised speed or how many files it
+  matched, because `Options` carries no ranking policy yet. When a job store
+  or a multi-source downloader arrives, that ordering becomes load-bearing
+  and should be chosen deliberately rather than inherited from map iteration
+  plus collection order.
 
 ### Should the daemon ship default `gnutella_caches`?
 
