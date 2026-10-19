@@ -6,6 +6,39 @@ blocker.
 
 ## Resolved in this cycle
 
+### QUERYHIT was missing the mandatory 16-byte servent ID
+
+`EncodeQueryHit`/`DecodeQueryHit` implemented the header as hit count,
+port, IPv4 and speed — 11 bytes — and went straight into the per-hit
+list. Both the annotated 0.4 spec and the 0.6 RFC place a mandatory
+16-byte servent identifier (GUID) between Speed and the hits, so the
+layout was wrong in both directions: every QUERYHIT a real peer
+(gtk-gnutella, LimeWire, Shareaza) sent was decoded misaligned (file
+names and sizes read from inside the GUID), and every QUERYHIT we sent
+was unparseable to them. This is worth stating plainly because **the
+old tests passed against a dialect no live peer speaks** — green
+unit tests are not evidence of interop, and the two-engine search test
+exercised the same wrong layout end to end.
+
+`QueryHit` now carries `ServentID [16]byte`; the encoder writes it
+after Speed, the decoder consumes it, and the minimum payload check
+rose from 11 to 27 bytes. `Engine.Run` generates one servent ID per
+run with `crypto/rand`, tagged like a descriptor ID (byte 8 = 0xFF,
+byte 15 = 0x00), and every QUERYHIT `handleQuery` stamps it. Per-run
+random is correct for this item: nothing persists it, and PUSH — the
+consumer of the servent ID on the wire — is the next slice.
+
+Covered by a byte-exact encode test, a decode of a hand-built
+spec-shaped payload (known servent ID, hit bytes chosen so the old
+misalignment could not parse correctly by accident), and the two-engine
+search test asserting a non-zero, correctly tagged servent ID on the
+QUERYHIT that answers a live QUERY over TCP. Mutation-tested: deleting
+the ServentID write from the encoder turned the round-trip, the
+byte-exact test and the two-engine search test red before being
+reverted. The layout now matches the spec, but the oracle differential
+loop is **skipped, not passed** (gtk-gnutella cannot be installed here);
+no live check was run for this item.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.

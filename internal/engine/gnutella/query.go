@@ -11,6 +11,13 @@ import (
 
 const (
 	queryHeaderMin = 2 // minimum speed (2 bytes LE)
+
+	// queryHitHeaderMin is the fixed QUERYHIT header: 1-byte hit count,
+	// 2-byte port (LE), 4-byte IPv4 (BE), 4-byte speed (LE) and the
+	// mandatory 16-byte servent ID (GUID). Both the annotated 0.4 spec
+	// and the 0.6 RFC place the servent ID between Speed and the hits;
+	// a payload shorter than this cannot be a well-formed QUERYHIT.
+	queryHitHeaderMin = 27
 )
 
 // Query represents a Gnutella QUERY message (0x80).
@@ -22,14 +29,20 @@ type Query struct {
 
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
-// 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// 4-byte speed (LE), 16-byte servent ID (GUID), then per hit:
+// 4-byte file index, 4-byte size, NUL-terminated name.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
-	Hits     []FileHit
+	// ServentID identifies the servent that answered. Both the
+	// annotated 0.4 spec and the 0.6 RFC make it mandatory, between
+	// Speed and the hit list; peers use it to tell which client
+	// produced the hits (and, later, where to send a PUSH for a
+	// firewalled source). It is a GUID tagged like a descriptor ID.
+	ServentID [idSize]byte
+	Hits      []FileHit
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -85,12 +98,14 @@ func EncodeQueryHit(qh QueryHit) []byte {
 	if qh.HitCount != uint8(len(qh.Hits)) {
 		qh.HitCount = uint8(len(qh.Hits))
 	}
-	// minimum size: 1+2+4+4 + (per hit: 4+4 + NUL)
-	out := make([]byte, 11)
+	// header: hit count (1), port (2 LE), IPv4 (4 BE), speed (4 LE),
+	// servent ID (16); then per hit: 4+4 LE + name + NUL.
+	out := make([]byte, queryHitHeaderMin)
 	out[0] = qh.HitCount
 	binary.LittleEndian.PutUint16(out[1:3], qh.Port)
 	copy(out[3:7], qh.IP[:])
 	binary.LittleEndian.PutUint32(out[7:11], qh.Speed)
+	copy(out[11:27], qh.ServentID[:])
 	for _, hit := range qh.Hits {
 		// append file index (4 LE), file size (4 LE), name + NUL
 		name := hit.FileName
@@ -108,7 +123,7 @@ func EncodeQueryHit(qh QueryHit) []byte {
 
 // DecodeQueryHit decodes a QueryHit from payload.
 func DecodeQueryHit(payload []byte) (QueryHit, error) {
-	if len(payload) < 11 {
+	if len(payload) < queryHitHeaderMin {
 		return QueryHit{}, fmt.Errorf("%w: payload too short", ErrQueryHitBadFormat)
 	}
 	qh := QueryHit{
@@ -117,7 +132,8 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		Speed:    binary.LittleEndian.Uint32(payload[7:11]),
 	}
 	copy(qh.IP[:], payload[3:7])
-	pos := 11
+	copy(qh.ServentID[:], payload[11:27])
+	pos := queryHitHeaderMin
 	hits := make([]FileHit, 0, qh.HitCount)
 	if qh.HitCount > 0 && pos >= len(payload) {
 		return QueryHit{}, fmt.Errorf("%w: hit 0 header too short", ErrQueryHitBadFormat)

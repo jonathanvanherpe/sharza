@@ -93,6 +93,13 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// serventID is this run's servent GUID, stamped into every
+	// QUERYHIT the engine builds. Run generates it; callers do not
+	// set it. It follows the same GUID tagging convention as a
+	// descriptor ID and is deliberately not persisted across restarts
+	// (per-run random is correct for the current scope).
+	serventID [idSize]byte
 }
 
 func (o Options) withDefaults() Options {
@@ -115,6 +122,15 @@ func (o Options) withDefaults() Options {
 
 func (o Options) logf() func(format string, args ...any) {
 	return o.withDefaults().Logf
+}
+
+// newServentID returns this run's servent identifier: a random GUID
+// tagged per the spec convention (byte 8 = 0xFF, byte 15 = 0x00), the
+// same layout newDescriptorID uses for message IDs. It identifies the
+// client inside every QUERYHIT we send, and it is per-run: nothing
+// persists it across restarts, which is correct for the current scope.
+func newServentID() [idSize]byte {
+	return newDescriptorID()
 }
 
 // Engine accepts and maintains Gnutella 0.6 peer connections.
@@ -181,8 +197,11 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	e.started = true
 	e.opts = opts.withDefaults()
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
-	// any connection can be matched to the Search that is waiting for it.
+	// any connection can be matched to the Search that is waiting for it,
+	// and this run's servent ID, so every QUERYHIT we build answers with
+	// the same identity.
 	e.opts.searches = e.searches
+	e.opts.serventID = newServentID()
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)

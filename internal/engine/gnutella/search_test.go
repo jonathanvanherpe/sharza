@@ -92,6 +92,16 @@ func TestSearchReturnsQueryHitWithMatchingDescriptorID(t *testing.T) {
 	if qh.IP != [4]byte{127, 0, 0, 1} {
 		t.Errorf("ip = %v, want 127.0.0.1", qh.IP)
 	}
+	// The QUERYHIT that answered over the wire must carry a servent
+	// ID: the mandatory 16-byte GUID between Speed and the hits,
+	// generated once per engine run and tagged like a descriptor ID.
+	if qh.ServentID == ([idSize]byte{}) {
+		t.Error("servent id is all zeros, want engine B's per-run servent GUID")
+	}
+	if qh.ServentID[8] != guidNetworkID || qh.ServentID[15] != guidReserved {
+		t.Errorf("servent id %x is not GUID-tagged (byte 8 want 0x%02x, byte 15 want 0x%02x)",
+			qh.ServentID, guidNetworkID, guidReserved)
+	}
 
 	// The callback is a separate surface and must still see the same hit.
 	mu.Lock()
@@ -151,10 +161,11 @@ func TestSearchIgnoresQueryHitWithNonMatchingDescriptorID(t *testing.T) {
 		t.Fatal("test setup: random descriptor ID collided with the bogus one")
 	}
 	qh := QueryHit{
-		HitCount: 1,
-		Port:     1234,
-		IP:       [4]byte{127, 0, 0, 1},
-		Hits:     []FileHit{{FileIndex: 9, FileSize: 9, FileName: "wrong.mp3"}},
+		HitCount:  1,
+		Port:      1234,
+		IP:        [4]byte{127, 0, 0, 1},
+		ServentID: testID(0x5A),
+		Hits:      []FileHit{{FileIndex: 9, FileSize: 9, FileName: "wrong.mp3"}},
 	}
 	hp := EncodeQueryHit(qh)
 	sendMsg(t, conn, Header{ID: bogus, Type: MsgQueryHit, TTL: 6, Hops: 0, Length: uint32(len(hp))}, hp)
@@ -221,10 +232,11 @@ func TestSearchTimeoutReturnsPartialHits(t *testing.T) {
 	// Answer mid-window: only the timeout wait can collect this hit.
 	time.Sleep(250 * time.Millisecond)
 	qh := QueryHit{
-		HitCount: 1,
-		Port:     1234,
-		IP:       [4]byte{127, 0, 0, 1},
-		Hits:     []FileHit{{FileIndex: 7, FileSize: 100, FileName: "partial.mp3"}},
+		HitCount:  1,
+		Port:      1234,
+		IP:        [4]byte{127, 0, 0, 1},
+		ServentID: testID(0x77),
+		Hits:      []FileHit{{FileIndex: 7, FileSize: 100, FileName: "partial.mp3"}},
 	}
 	hp := EncodeQueryHit(qh)
 	sendMsg(t, ansConn, Header{ID: hdr.ID, Type: MsgQueryHit, TTL: 6, Hops: 0, Length: uint32(len(hp))}, hp)

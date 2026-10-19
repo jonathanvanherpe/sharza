@@ -441,7 +441,11 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		Port:     p.listenPort(),
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
-		Hits:     hits,
+		// The servent ID is mandatory in the QUERYHIT wire format:
+		// peers use it to identify the client that answered (and,
+		// for firewalled sources, where to send a PUSH).
+		ServentID: p.opts.serventID,
+		Hits:      hits,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
