@@ -103,6 +103,24 @@ type DownloadResult struct {
 // Resumed reports whether the transfer continued an existing partial.
 func (r DownloadResult) Resumed() bool { return r.Offset > 0 }
 
+// DownloadJob reports one search-and-download: the hit that was chosen
+// and what the transfer left on disk. Bytes is what this call received;
+// Offset is where it started. A file already complete on disk gives
+// Bytes 0 and Offset equal to the file size.
+type DownloadJob struct {
+	// Hit is the file the search selected.
+	Hit FileHit
+
+	// Path is the file written, inside the directory the caller passed.
+	Path string
+
+	// Bytes is how many bytes the transfer received and wrote.
+	Bytes int64
+
+	// Offset is the byte offset the transfer started at.
+	Offset int64
+}
+
 // NewDownloader returns a Downloader for one hit.
 func NewDownloader(qh QueryHit, hit FileHit) *Downloader {
 	return &Downloader{QH: qh, Hit: hit}

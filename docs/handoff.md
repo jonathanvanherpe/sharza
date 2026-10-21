@@ -249,6 +249,51 @@ sanitiser each turned its guarding test red before being reverted.
 
 ## Open questions
 
+### The engine cannot serve the file its QUERYHIT advertises
+
+`Engine.SearchAndDownload` composes `Search` and `Downloader.Fetch` into the
+P1 "completes a search and a download" flow, and the test
+(`search_download_test.go`) proves the composition over real TCP. But the
+two halves are not symmetric. The searcher side is real. The serving side is
+not: a QUERYHIT advertises the engine's Gnutella listen port, and the download
+GETs `/gnutella/<index>` on that port, yet nothing in the engine answers an
+HTTP GET on the listener and `FileEntry` carries no path to read bytes from.
+
+So the test has to stand in for A's file server. It sets the unexported
+`Options.advertisePort` seam (zero in production, same pattern as
+`cacheAllowLoopback`) so A's QUERYHIT names an `httptest` server that holds the
+catalogue payload. The assertion that the downloaded bytes equal the catalogue
+payload is therefore an assertion that `Fetch` moves what that server sends. It
+does not show that the engine serves its own files. Do not read the test as
+proof that a Gnutella 1 peer can upload.
+
+A real upload path needs its own decision: an HTTP GET handler on the
+Gnutella listener (which means sniffing a `GET ` first line in `serveConn`
+alongside the `GNUTELLA` handshake), a `FileEntry` that maps an index to a
+path, and a rule for what is shareable. None of it is in this slice. Once it
+exists, `advertisePort` should be deleted and the test pointed at the engine's
+own listener.
+
+### Search-and-download: what the composed flow leaves open
+
+- **The first usable hit is taken, not the best one.** Hits are tried in the
+  order `Search` returned them, and the first with a non-zero port, a specified
+  address and a named file wins. There is no ranking by speed, size or number
+  of sources, and no fallback to a second hit if the first transfer fails.
+- **A search error with a usable hit is not reported.** A write failure to some
+  peers does not invalidate a hit another peer answered, so the flow proceeds.
+  Nothing logs it. A later caller that wants that signal needs `search`'s error
+  surfaced some other way.
+- **A file already complete on disk returns `Bytes` 0 and `Offset` equal to the
+  file size**, not an error. That follows `Fetch`'s `Complete` result, which
+  `DownloadJob` does not carry; a caller that needs to tell "downloaded now"
+  from "already there" has to infer it from `Bytes`.
+- **`Search`'s collection window still runs to `SearchTimeout`.** The new
+  `search(ctx, …)` only lets the context end it early. The flow waits out the
+  window on every call.
+- **No RPC surface.** `SearchAndDownload` is not wired into `sharzad`'s RPC
+  surface. That is the human gate and stays out of this cycle.
+
 ### Download client: decisions left open
 
 - **Resume is implicit.** `Fetch(ctx, dir)` continues whatever partial file

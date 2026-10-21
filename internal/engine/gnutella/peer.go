@@ -61,7 +61,13 @@ type peer struct {
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+//
+// ready, if non-nil, is called once the handshake has succeeded and before
+// the first message is read. It is the moment the connection becomes a
+// peer that Search may write to: a QUERY written before it would land
+// inside the handshake and break it, so the engine registers a connection
+// here, not when it is accepted or dialed.
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, ready func()) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
@@ -88,6 +94,9 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	}
 	if err != nil {
 		return err
+	}
+	if ready != nil {
+		ready()
 	}
 	if c, ok := next.(io.Closer); ok {
 		defer c.Close()
@@ -436,9 +445,13 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 			copy(ip4[:], ip)
 		}
 	}
+	port := p.listenPort()
+	if p.opts.advertisePort != 0 {
+		port = p.opts.advertisePort
+	}
 	qh := QueryHit{
 		HitCount: uint8(len(hits)),
-		Port:     p.listenPort(),
+		Port:     port,
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
