@@ -90,6 +90,13 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// advertisePort, when non-zero, is the port a QUERYHIT advertises in
+	// place of the listen port. The engine has no file server on its
+	// listener, so a QUERYHIT's source is wherever the files are served;
+	// the search-and-download test points it at a server it stands up.
+	// Production never sets it: zero advertises the listen port.
+	advertisePort uint16
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
@@ -221,13 +228,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
 		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-		e.mu.Lock()
-		e.peers[pc] = struct{}{}
-		e.mu.Unlock()
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, e.register(pc)); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -244,6 +248,18 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	e.wg.Wait()
 	logf("stopped")
 	return nil
+}
+
+// register returns the ready callback for one connection: it makes pc a
+// peer that Search writes to, and runs once the handshake has succeeded.
+// Only e.mu is taken, and no peer lock is held, so this adds no lock
+// ordering of its own.
+func (e *Engine) register(pc *peerConn) func() {
+	return func() {
+		e.mu.Lock()
+		e.peers[pc] = struct{}{}
+		e.mu.Unlock()
+	}
 }
 
 // startDial starts the per-peer dial loop for addr exactly once.
@@ -314,10 +330,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			logf("dial %s failed: %v (retrying in %s)", addr, err, delay)
 		} else {
 			pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-			e.mu.Lock()
-			e.peers[pc] = struct{}{}
-			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, e.register(pc)); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -382,6 +395,75 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 // peer says why alongside whatever it did collect. No live peer is not an
 // error: the search simply finds nothing.
 func (e *Engine) Search(text string) ([]QueryHit, error) {
+	return e.search(context.Background(), text)
+}
+
+// ErrNoSuitableHit reports that a search returned no hit a download can
+// start from: every QUERYHIT lacked a source port or address, or carried
+// no file with a name.
+var ErrNoSuitableHit = errors.New("gnutella: no suitable hit")
+
+// SearchAndDownload runs one search, takes the first usable hit it
+// returns, and fetches that file into dir. It is the single flow the P1
+// exit gate asks for: Search, selectHit, then Downloader.Fetch.
+//
+// A hit is usable when its QUERYHIT names a non-zero source port and a
+// specified address, and it carries a file with a non-empty name. Hits
+// are tried in the order Search returned them. If none is usable the
+// result is ErrNoSuitableHit, joined with the search error when there was
+// one. A search error alongside a usable hit is not reported: a write
+// failure to some peers does not invalidate a hit another peer answered.
+//
+// The download is Downloader.Fetch unchanged, so every Gnutella 1
+// invariant it enforces (size as the only check, truncation on mismatch,
+// one-component file names) holds here too. ctx bounds the search window
+// and the transfer.
+func (e *Engine) SearchAndDownload(ctx context.Context, text, dir string) (*DownloadJob, error) {
+	hits, searchErr := e.search(ctx, text)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	qh, hit, ok := selectHit(hits)
+	if !ok {
+		if searchErr != nil {
+			return nil, errors.Join(ErrNoSuitableHit, searchErr)
+		}
+		return nil, ErrNoSuitableHit
+	}
+	res, err := e.Downloader(qh, hit).Fetch(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	return &DownloadJob{
+		Hit:    hit,
+		Path:   res.Path,
+		Bytes:  res.Bytes,
+		Offset: res.Offset,
+	}, nil
+}
+
+// selectHit returns the first file a download can start from, scanning
+// QUERYHITs and their FileHits in the order given. The second return is
+// false when no hit qualifies.
+func selectHit(hits []QueryHit) (QueryHit, FileHit, bool) {
+	for _, qh := range hits {
+		if qh.Port == 0 || net.IP(qh.IP[:]).IsUnspecified() {
+			continue
+		}
+		for _, h := range qh.Hits {
+			if h.FileName != "" {
+				return qh, h, true
+			}
+		}
+	}
+	return QueryHit{}, FileHit{}, false
+}
+
+// search is Search under the caller's context. The collection window ends
+// at SearchTimeout or when ctx is done, whichever comes first; the hits
+// collected so far are returned either way. Search itself passes
+// context.Background(), so its observable behaviour is unchanged.
+func (e *Engine) search(ctx context.Context, text string) ([]QueryHit, error) {
 	q := Query{MinSpeed: 0, Search: text}
 	payload := EncodeQuery(q)
 	hdr := Header{
@@ -444,7 +526,11 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	// only delay an empty result.
 	if written.Load() > 0 {
 		timer := time.NewTimer(timeout)
-		<-timer.C
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+		}
 	}
 
 	errMu.Lock()
