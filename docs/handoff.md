@@ -6,6 +6,55 @@ blocker.
 
 ## Resolved in this cycle
 
+### Search-and-download in one call: `Engine.SearchAndDownload`
+
+P1's exit gate wants a search *and* a download; the two primitives already
+landed (`Search`, `Downloader.Fetch`) each proved their leg separately, so
+this slice composes them end to end. `Engine.SearchAndDownload(ctx, q, dir)`
+searches, picks the first usable hit, and fetches it, returning a
+`DownloadJob{Hit, Path, Size}` (`download_result.go`) that reports what was
+fetched. It is a report, not a handle: no job state, no retry, no
+persistence — the engine stays a library of primitives with one thin fuse
+on top.
+
+`Search`'s body moved to unexported `searchQuery(ctx, q)`; `Search` itself
+is now a wrapper passing `context.Background()`, so its observable
+behaviour is unchanged (the existing `search_test.go` suite passes
+untouched). `searchQuery` gained one context-awareness the old body did
+not have: cancelling the caller's context ends the collection window early
+and the hits collected so far are returned alongside `ctx.Err()`. With a
+never-ending context the window still runs to `SearchTimeout` exactly as
+before.
+
+Hit selection is deliberately the smallest thing that works: a hit is
+usable when it has a non-zero port, a specified IP (the two conditions
+`Fetch` itself refuses on) and at least one file; the first usable hit wins
+and is the only one contacted. There is no fallback to the next hit when a
+transfer fails — retry loops are out of scope — and `ErrNoSuitableHit`
+covers "no answer" and "only unusable answers" alike, writing nothing.
+
+The two-engine loopback test (`search_download_test.go`) runs engine B
+searching, engine A answering QUERYs, and a scripted 0.6 servent whose
+QUERYHIT names a loopback HTTP listener serving the payload; both legs are
+real TCP on 127.0.0.1. Engine A's catalogue is deliberately **empty**: a
+populated catalogue would advertise A's Gnutella listener as the download
+source (the QUERYHIT port is pinned to it), which no engine serves over
+HTTP, and would make the winner depend on answer arrival order. The empty
+catalogue makes the skip deterministic and still puts a second engine's
+QUERYHIT on the wire. Assertions: the job carries the servent's hit (and
+`OnQueryHit` saw it arrive), the bytes on disk equal the payload, the file
+size equals the QUERYHIT's declared size, a mismatched-length servent is
+refused with the destination left at its starting offset, and each
+unusable-answer shape (silent peer, port 0, no files) returns
+`ErrNoSuitableHit` and writes nothing.
+
+Both mandated mutations were observed red before reverting: dropping the
+body-length check in `Fetch` turned `TestSearchAndDownloadRefusesMismatchedLength`
+red (the short body was accepted and a job returned), and registering the
+search under a corrupted descriptor ID turned `TestSearchAndDownloadOverLoopback`
+red (`ErrNoSuitableHit` instead of a job). A third mutation, dropping the
+whole size check, is covered by the same test and was not needed separately.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -390,6 +439,48 @@ and the compression negotiation, but it is not the controlled differential
 loop this entry describes: it does not exercise a 0.4 refusal from the real
 client, and it depends on a third party's uptime rather than a local binary.
 The loop remains the wanted artifact.
+
+### The gtk-gnutella oracle leg for search→download is **SKIPPED, not passed**
+
+The composed exchange (QUERY/QUERYHIT over the peer link, then the HTTP
+GET of the advertised file) is proven by the scripted pair over loopback
+only. gtk-gnutella remains uninstallable here (no root, no sudo), so the
+differential leg did not run and nothing in this cycle claims it did. The
+loop is a config change away for a maintainer with a host that can install
+the client:
+
+1. Install gtk-gnutella and drop a known file (note its exact bytes and
+   size, e.g. a `head -c 1M /dev/urandom > share/torchie.bin`) into its
+   shared folder; wait for it to finish indexing.
+2. Let gtk-gnutella listen on its usual port (default 6346) and add that
+   address to sharza's config: `gnutella_enabled: true`,
+   `gnutella_listen: "127.0.0.1:6346"` (any free port),
+   `gnutella_peers: ["127.0.0.1:6346"]`. Either peer may dial the other;
+   gtk-gnutella's "connect to host" dialog pointed at sharza's
+   `gnutella_listen` works too.
+3. Drive the search leg with a small in-repo Go program (Search is not on
+   the RPC surface — that is a human gate): construct the engine with the
+   same options the daemon would use, wait for the peer, then call
+   `SearchAndDownload(ctx, Query{Search: "torchie"}, dir)`.
+4. The differential assertion is `cmp share/torchie.bin dir/torchie.bin`
+   (or checksums): gtk-gnutella declared the size it serves, so a match
+   proves the QUERYHIT round-trip and the GET against a real servent.
+   gtk-gnutella's own transfer log shows the served download.
+
+Expect sharza to appear as a leaf (`X-Ultrapeer: False`); if
+gtk-gnutella's leaf-slot policy refuses the connection, free a leaf slot
+or connect from the gtk-gnutella side. The engine already offers
+`Accept-Encoding: deflate`, which live ultrapeers require.
+
+### Hit selection in `SearchAndDownload` is first-usable-wins, with no fallback
+
+A transfer failure returns immediately; the second-best hit is never
+tried, and there is no re-search. That is the brief's "first usable hit"
+read as strictly as it can be read, and it is the right shape for a
+primitive: a caller that wants fallback wants a retry policy, and retry
+policies belong to whatever owns job state (the supervisor/RPC layer),
+which does not exist yet. Recorded so the next slice that wires the fuse
+into the RPC surface does not mistake the absence for an oversight.
 
 ### PONG replies use "request TTL minus one", not the 0.6 pong-caching policy
 

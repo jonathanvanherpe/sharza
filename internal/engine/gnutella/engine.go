@@ -369,6 +369,15 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 // Search sends one QUERY to every live peer, collects the QUERYHITs that
 // echo its descriptor ID within SearchTimeout, and returns them.
 //
+// It is searchQuery with a context that never ends, so the collection
+// window is the only bound; see searchQuery for the full contract.
+func (e *Engine) Search(text string) ([]QueryHit, error) {
+	return e.searchQuery(context.Background(), Query{MinSpeed: 0, Search: text})
+}
+
+// searchQuery sends one QUERY to every live peer, collects the QUERYHITs
+// that echo its descriptor ID within SearchTimeout, and returns them.
+//
 // The query is registered before it is written: a peer on a fast link can
 // answer before the write call returns, and an unregistered ID would drop
 // that answer. Only hits echoing this query's own ID are returned; a hit
@@ -377,12 +386,15 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 //
 // The collection window always runs to SearchTimeout, so a peer answering
 // first does not cut short the peers that have not answered yet; that is
-// what makes the timeout path return partial hits and no error. The error
-// return is the first write error, if any, so a search that reached no
-// peer says why alongside whatever it did collect. No live peer is not an
-// error: the search simply finds nothing.
-func (e *Engine) Search(text string) ([]QueryHit, error) {
-	q := Query{MinSpeed: 0, Search: text}
+// what makes the timeout path return partial hits and no error. The one
+// exception is the caller's context: cancelling it ends the window early,
+// and the hits collected so far are returned alongside ctx.Err(), so a
+// SearchAndDownload under a deadline is not pinned by its own peers.
+//
+// The error return is the first write error, if any, so a search that
+// reached no peer says why alongside whatever it did collect. No live
+// peer is not an error: the search simply finds nothing.
+func (e *Engine) searchQuery(ctx context.Context, q Query) ([]QueryHit, error) {
 	payload := EncodeQuery(q)
 	hdr := Header{
 		ID:     newDescriptorID(),
@@ -441,14 +453,68 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Wait out the collection window so late hits are collected. If no
 	// write succeeded there is no peer that can answer, so the wait would
-	// only delay an empty result.
+	// only delay an empty result. The caller's context ends the wait
+	// early: a cancelled search returns what it has, plus why it stopped.
 	if written.Load() > 0 {
 		timer := time.NewTimer(timeout)
-		<-timer.C
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			errMu.Unlock()
+		}
 	}
 
 	errMu.Lock()
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// ErrNoSuitableHit reports a search whose answers named nothing this
+// engine could fetch from: either no peer answered, or every answering
+// QUERYHIT was unusable (no dialable source address, or no file hits).
+var ErrNoSuitableHit = errors.New("gnutella: no suitable hit")
+
+// SearchAndDownload fuses one search and one transfer: it sends the
+// QUERY, waits out the collection window, picks the first usable hit,
+// and downloads it into dir. It is the smallest end-to-end form of "find
+// a file and get it" the engine offers; a caller that wants the raw hits
+// (to show them, filter them, or fetch several) uses Search and
+// Downloader directly.
+//
+// A hit is usable when it carries a dialable source address (a non-zero
+// port and a specified IP, exactly the two conditions Fetch itself
+// refuses) and at least one file. Hits that fail either check are
+// skipped, not fetched-and-retried: there is no retry loop here, so the
+// first usable hit is also the only one contacted. When no answer is
+// usable the call returns ErrNoSuitableHit and writes nothing.
+//
+// The transfer is the existing Downloader.Fetch with the caller's
+// context and the caller's directory: resume, size verification and
+// name sanitisation behave exactly as they do for a direct Fetch call.
+// A transfer failure is returned as-is; the next usable hit is not
+// tried.
+func (e *Engine) SearchAndDownload(ctx context.Context, q Query, dir string) (*DownloadJob, error) {
+	hits, err := e.searchQuery(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	for i := range hits {
+		qh := hits[i]
+		if qh.Port == 0 || net.IP(qh.IP[:]).IsUnspecified() || len(qh.Hits) == 0 {
+			continue
+		}
+		hit := qh.Hits[0]
+		res, err := e.Downloader(qh, hit).Fetch(ctx, dir)
+		if err != nil {
+			return nil, err
+		}
+		return &DownloadJob{Hit: &qh, Path: res.Path, Size: int64(hit.FileSize)}, nil
+	}
+	return nil, ErrNoSuitableHit
 }
