@@ -1,7 +1,6 @@
 ---
 description: Implements wire protocols for Sharza (eDonkey2000, Kad, Gnutella, Gnutella2). Use when the task involves binary framing, codecs, state machines, obfuscation, or block-level protocol interaction.
 mode: subagent
-model: opencode/big-pickle
 permission:
   edit:
     "*": allow

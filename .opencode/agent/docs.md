@@ -1,7 +1,6 @@
 ---
 description: Keeps Sharza's docs/ARCHITECTURE.md and docs/ROADMAP.md accurate after code changes. Use after a design change or when an agent needs to know why the code is shaped a certain way. Never restates code.
 mode: subagent
-model: opencode/big-pickle
 permission:
   edit:
     "*": allow

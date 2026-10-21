@@ -16,6 +16,8 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 import {
   route,
+  discoverModels,
+  TIERS,
   classifyDifficulty,
   reportCooldown,
   cooledDown,
@@ -62,6 +64,22 @@ test("easy tool work starts at the cheap tier, normal at the strong tier", async
 
   const normal = await route({ needsTools: true, difficulty: "normal" });
   assert.equal(normal.tier, "strong");
+});
+
+test("available OpenCode Go models precede non-Go fallbacks", async () => {
+  const available = new Set((await discoverModels()).map((model) => model.full));
+  if (available.size === 0) return; // Discovery outage is covered by route's fallback.
+
+  for (const [difficulty, tierName] of [["easy", "fast"], ["normal", "strong"]]) {
+    const tier = TIERS.find((candidate) => candidate.name === tierName);
+    const firstGo = tier.candidates.find(
+      (candidate) => candidate.startsWith("opencode-go/") && available.has(candidate),
+    );
+    if (!firstGo) continue;
+
+    const chosen = await route({ needsTools: true, difficulty });
+    assert.equal(chosen.model, firstGo, `${tierName} should prefer its first available Go model`);
+  }
 });
 
 test("tool-free work is sent to the free local tier", async () => {

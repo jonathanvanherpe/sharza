@@ -68,7 +68,6 @@
   },
   "agent": {
     "protocol-eng": {
-      "model": "opencode/big-pickle",
       "mode": "subagent",
       "description": "Implements wire protocols (eDonkey2000, Kad, Gnutella/G2). Use for framing, codecs, state machines, obfuscation, block-level protocol interaction.",
       "permission": {
@@ -84,7 +83,6 @@
       }
     },
     "test-eng": {
-      "model": "opencode/big-pickle",
       "mode": "subagent",
       "description": "Writes tests, fuzz targets and differential harnesses against oracles (amuled, gtk-gnutella, qBittorrent). Use for verification work.",
       "permission": {
@@ -92,7 +90,6 @@
       }
     },
     "reviewer": {
-      "model": "opencode/big-pickle",
       "mode": "subagent",
       "description": "Reviews changes for correctness, licence hygiene, SPDX headers, cgo leakage into the daemon, and protocol-spec fidelity. Read-only.",
       "permission": {
@@ -113,7 +110,6 @@
       }
     },
     "docs": {
-      "model": "opencode/big-pickle",
       "mode": "subagent",
       "description": "Keeps docs/ARCHITECTURE.md and docs/ROADMAP.md in sync with the code. Use after a design change, never to restate the code.",
       "permission": {

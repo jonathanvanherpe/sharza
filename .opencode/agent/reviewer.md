@@ -1,7 +1,6 @@
 ---
 description: Reviews Sharza changes for correctness, licence hygiene, SPDX headers, cgo leakage into the daemon, and protocol-spec fidelity. Read-only. Use before merging or when a change touches engines, scheduler or storage.
 mode: subagent
-model: opencode/big-pickle
 permission:
   edit: deny
 ---
