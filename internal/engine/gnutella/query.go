@@ -23,13 +23,22 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name, then, in 0.6, an optional 16-byte client ID (the
+// source's servent ID).
+//
+// The client ID is what a requester needs to address a PUSH to a source
+// that cannot accept inbound connections. It is present only when exactly
+// 16 bytes trail the last hit: a payload with no trailer, or some other
+// trailer length, decodes with HasClientID false.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	ClientID    [idSize]byte
+	HasClientID bool
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +112,9 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	if qh.HasClientID {
+		out = append(out, qh.ClientID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +156,11 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// 0.6 trailer: exactly 16 bytes is the client ID. Any other leftover
+	// length is not one, and is left undecoded rather than guessed at.
+	if pos <= len(payload) && len(payload)-pos == idSize {
+		copy(qh.ClientID[:], payload[pos:])
+		qh.HasClientID = true
+	}
 	return qh, nil
 }

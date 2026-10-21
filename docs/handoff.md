@@ -247,7 +247,117 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+### Gnutella push: the requester side, and the dial-back it needs
+
+`Engine.PushFetch` downloads a hit whose source cannot accept an inbound
+connection. It writes a 26-byte PUSH to the connection that delivered the
+hit, and the source dials back with `GIV <index>:<servent-id>/<name>`. The
+requester sends the same GET a direct download sends, over that socket, and
+the body goes through the shared `Downloader.receive`, so the size, truncation
+and name rules are the direct ones. `Downloader.Fetch` was split into
+`prepare`, `newRequest` and `receive` to make that sharing real, with the error
+text unchanged.
+
+Decisions worth recording:
+
+- **The source side had to exist for the test to mean anything.** The brief's
+  test needs bytes to arrive from a firewalled source, and nothing in the
+  engine served a file body. So `FileEntry` gained `Data`, and a PUSH naming
+  this engine's own servent ID makes it dial back, send the GIV and answer the
+  GET from the catalogue. This is the minimum the requester needs, not a
+  general serving path: there is still no direct HTTP server, so a direct GET
+  to a source is refused, which is the firewalled case the test asserts.
+- **"The peer that delivered the hit" is recorded, not searched for.** `Search`
+  returns bare QueryHits, so each QUERYHIT that carries a servent ID records
+  the connection it arrived on as that servent's route. A route whose
+  connection has closed is not used.
+- **The GIV is recognised before the handshake parse,** by a 4-byte peek on
+  inbound connections only. A dial-back socket is handed over with its reader,
+  so bytes buffered past the GIV line are read in order, and `serveConn`
+  returns without closing it: the waiting push owns it.
+- **Unsolicited GIVs are closed.** A GIV whose (servent ID, index) matches no
+  pending push is refused and its socket closed.
+- **Lock discipline.** The PUSH is written under `peerConn.mu`, as Search
+  writes its QUERY. The push registry has one mutex for its maps and no other
+  lock, and the dial-back socket has no second writer, so `peer.mu` is not
+  taken.
+
+Verified (2026-10-21): `go build ./...`, `go vet ./...`, `go test ./...` all
+pass, with the cgo-free daemon build and the SPDX check clean. The push tests
+pass under `-race` and five repeats. The two-engine test asserts a direct GET
+to the source fails and leaves no file, that the PUSH transfer's bytes equal
+the catalogue payload, and (in a separate test) that a PUSH with another
+servent's ID is ignored, with a positive control on the same connection so the
+negative cannot pass because the dial-back path is broken.
+
+Mutation checks, each reverted and confirmed by `diff`:
+
+| Mutation | Result |
+| --- | --- |
+| PUSH not written in `PushFetch` | red: the requester's wait ends on the caller's deadline |
+| `serveConn` does not detect `GIV` | red: both transfer tests fail |
+| client ID dropped from `EncodeQueryHit` | red: the codec test and both transfer tests fail |
+| PUSH servent-ID guard removed | red: the mismatched-ID test sees a dial-back |
+| declared 200 size check weakened | **survives**, see below |
+
+The last one survives because it is close to equivalent. For a 200 response,
+`net/http` already enforces the `Content-Length` framing, and the byte count
+in `receive` refuses the same mismatch and truncates the same way. The
+mutant changes which check fires, not the outcome, so no test is weakened by
+it. The direct suite also passes against it, for the same reason.
+
 ## Open questions
+
+### Push: what the requester side leaves open
+
+- **A real 0.6 QUERYHIT can carry a longer trailer, and the ID is then not
+  decoded.** The brief says to decode the client ID only when exactly 16 bytes
+  trail the last hit, so a QUERYHIT with a vendor code or flag bytes after the
+  ID decodes with `HasClientID` false and cannot be pushed. This is a
+  deliberate restriction, but it is the likeliest real-world gap. It needs a
+  decision on what trailer layouts to recognise, and it has not been checked
+  against a live gtk-gnutella hit, which is the oracle leg that remains
+  blocked.
+- **PUSH is not forwarded.** A PUSH is written only to the connection that
+  delivered the hit. A PUSH for a servent we are not directly connected to is
+  not routed through the network, and an inbound PUSH for someone else's ID is
+  ignored, not relayed. The route table is never pruned; it is bounded by the
+  servents heard from, and liveness is checked at use.
+- **The requester chooses where the source dials.** A PUSH's IP and port are
+  taken from the wire, and the engine dials them when the servent ID matches
+  its own. There is no allowlist, so a peer can aim a dial-back at any address
+  it names. This is inherent to the protocol, and it is recorded here so the
+  maintainer can decide whether to restrict it, for example to dial-backs
+  only for files that were actually served.
+- **The dial-back is not tracked by the engine's WaitGroup.** `dialBack` runs
+  on a goroutine that ends with the context, but `Run` may return before it
+  has finished. Nothing is leaked past the context, but shutdown does not wait
+  for it.
+- **There is a window in which a `Search` can write to a dial-back socket.**
+  An inbound connection is added to `e.peers` before `serveConn` runs and
+  removed only after it returns. A `Search` that runs between the accept and
+  the GIV line arriving would write its QUERY into the dial-back socket, which
+  the source would then misread as a GET. The handshake has the same window
+  for every inbound peer, so this is pre-existing in kind. Fixing it means
+  deciding when inbound peers become searchable, which affects all of them,
+  so it is left as a maintainer decision.
+- **The pusher side is minimal.** It always answers 200 with the whole file,
+  ignoring any `Range` the requester sent (the requester rewrites from zero,
+  which `receive` already handles). It serves only entries with `Data` set,
+  and `Data` is in-memory only. Only the hex servent-ID form of GIV is
+  accepted, IPv4 only, and the name in the GIV is informational.
+- **Push requires a routable listener.** A listener bound to `0.0.0.0` has no
+  address to put in the PUSH, so `PushFetch` refuses rather than sends one. A
+  daemon behind NAT must be given the address it advertises; nothing supplies
+  that yet.
+- **`query_test.go` is not gofmt-clean at HEAD.** It was already unformatted
+  before this slice and was left alone. `query.go` was formatted, since this
+  slice edited it.
+- **The oracle leg is still not run.** A push exchange with gtk-gnutella is the
+  remaining check, and it needs the controlled two-client loop, which cannot be
+  run on this host.
+- **Out of scope for this slice:** `browse`, wiring `PushFetch` into the RPC
+  surface (human gate), and the G2 side.
 
 ### Download client: decisions left open
 

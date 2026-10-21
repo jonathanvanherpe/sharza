@@ -51,7 +51,8 @@ const pongPayloadSize = 14
 // peer is one established-or-connecting TCP link.
 type peer struct {
 	conn    net.Conn
-	inbound bool // accepted by us, rather than dialed by us
+	pc      *peerConn // the engine's record of this link; route and write lock
+	inbound bool      // accepted by us, rather than dialed by us
 	opts    Options
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
@@ -61,9 +62,17 @@ type peer struct {
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+//
+// An inbound connection whose first bytes are "GIV " is not a handshake:
+// it is a firewalled source dialling back for a push we requested. That
+// socket is handed to the waiting push and serveConn returns nil without
+// closing it (see pushclient.go). The GIV check comes before the handshake
+// parse, because a GIV line would otherwise fail it.
+func serveConn(ctx context.Context, pc *peerConn, inbound bool, opts Options, laddr net.Addr) error {
+	conn := pc.conn
 	p := &peer{
 		conn:    conn,
+		pc:      pc,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
@@ -81,6 +90,9 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 	r := bufio.NewReader(conn)
 	next := io.Reader(r)
 	var err error
+	if inbound && p.isGIV(r) {
+		return p.acceptGIV(r)
+	}
 	if inbound {
 		next, err = p.accept(r)
 	} else {
@@ -93,6 +105,17 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 		defer c.Close()
 	}
 	return p.loop(ctx, next)
+}
+
+// isGIV reports whether an inbound connection opens with a push dial-back
+// ("GIV "). It only peeks, so a connection that is not one is still read
+// in full by the handshake parse that follows.
+func (p *peer) isGIV(r *bufio.Reader) bool {
+	if err := p.conn.SetReadDeadline(time.Now().Add(handshakeDeadline)); err != nil {
+		return false
+	}
+	b, err := r.Peek(4)
+	return err == nil && string(b) == "GIV "
 }
 
 // accept performs the server side of the 0.6 handshake. It returns the
@@ -268,16 +291,15 @@ func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 			p.logf("dropping %s from %s: TTL reached zero", typeName(hdr.Type), p.conn.RemoteAddr())
 			continue
 		}
-		if err := p.handle(hdr, buf); err != nil {
+		if err := p.handle(ctx, hdr, buf); err != nil {
 			return err
 		}
 	}
 }
 
-// handle processes one message. Routing and file transfer are out of
-// scope for this item, so Query, QueryHit and Push are acknowledged in
-// the log and ignored.
-func (p *peer) handle(hdr Header, payload []byte) error {
+// handle processes one message. ctx is the connection's context: a PUSH
+// for us starts a dial-back that must end with the engine.
+func (p *peer) handle(ctx context.Context, hdr Header, payload []byte) error {
 	switch hdr.Type {
 	case MsgPing:
 		return p.handlePing(hdr)
@@ -290,9 +312,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
-		return nil
+		return p.handlePush(ctx, payload)
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
 		return nil
@@ -442,6 +462,10 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
+		// The servent ID a requester addresses a PUSH to when it cannot
+		// reach us directly.
+		ClientID:    p.opts.servent,
+		HasClientID: true,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
@@ -471,6 +495,11 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
+	}
+	// Remember which connection this servent's hits arrived on, so a
+	// later PushFetch for one of its files writes the PUSH there.
+	if qh.HasClientID && p.opts.pushes != nil && p.pc != nil {
+		p.opts.pushes.setRoute(qh.ClientID, p.pc)
 	}
 	if p.opts.OnQueryHit != nil {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)

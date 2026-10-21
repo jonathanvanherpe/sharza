@@ -40,6 +40,12 @@ type FileEntry struct {
 	Index uint32
 	Size  uint32
 	Name  string
+
+	// Data is the file's bytes. It is served only to a GET that arrives
+	// over a push dial-back (see pushclient.go): this engine has no
+	// direct HTTP server, so a direct GET to it is refused. A nil Data
+	// keeps the entry advertised in QUERYHITs but unserved.
+	Data []byte
 }
 
 // Options tunes an Engine. Zero values select sane defaults.
@@ -93,6 +99,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushes is the engine's push registry (routes and pending
+	// dial-backs). Run sets it; callers do not.
+	pushes *pushRegistry
+
+	// servent is this engine's 16-byte servent ID: advertised in every
+	// QUERYHIT and the GUID a PUSH for this engine names. Run sets it.
+	servent [idSize]byte
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +154,11 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes holds the routes a PUSH is written along and the pushes
+	// waiting for a dial-back. servent is this engine's servent ID.
+	pushes  *pushRegistry
+	servent [idSize]byte
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +172,8 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
+		servent:  newDescriptorID(),
 	}
 }
 
@@ -183,6 +204,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.pushes = e.pushes
+	e.opts.servent = e.servent
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -227,7 +250,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, pc, true, e.opts, e.laddr); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +340,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, pc, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -451,4 +474,109 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// PushFetch downloads a hit whose source cannot accept an inbound
+// connection. It sends a PUSH, naming the source's servent ID and this
+// engine's listener, to the connection that delivered the hit; the
+// source dials back, and the transfer runs over that socket.
+//
+// The hit must carry a servent ID (QueryHit.HasClientID), since that is
+// what the PUSH is addressed to, and this engine must be listening on an
+// IPv4 address the source can reach: a PUSH that names 0.0.0.0 cannot be
+// dialled back, so it is refused rather than sent.
+//
+// The destination is decided before anything is sent: a file already
+// complete in dir returns without a PUSH, exactly as Fetch does. The size
+// and name rules are the direct download's, because both go through the
+// same Downloader.prepare and Downloader.receive.
+//
+// ctx bounds the whole operation. Waiting for the dial-back also ends
+// after pushWaitTimeout.
+func (e *Engine) PushFetch(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	if !qh.HasClientID {
+		return DownloadResult{}, errors.New("gnutella: push: queryhit carries no servent ID")
+	}
+	d := e.Downloader(qh, hit)
+	p, done, err := d.prepare(dir)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	if done {
+		return DownloadResult{Path: p.dest, Offset: p.offset, Complete: true}, nil
+	}
+
+	ta, ok := e.laddr.(*net.TCPAddr)
+	if !ok || ta.IP.To4() == nil || ta.IP.IsUnspecified() {
+		return DownloadResult{}, fmt.Errorf("gnutella: push: listener %v is not an IPv4 address the source can dial", e.laddr)
+	}
+	var ourIP [4]byte
+	copy(ourIP[:], ta.IP.To4())
+
+	pc := e.routeTo(qh.ClientID)
+	if pc == nil {
+		return DownloadResult{}, errNoRoute
+	}
+
+	// Register before the PUSH is written: the dial-back can arrive
+	// before the write call returns.
+	key := pushKey{id: qh.ClientID, index: hit.FileIndex}
+	ch := e.pushes.register(key)
+	defer e.pushes.cancel(key)
+
+	payload := EncodePush(Push{
+		ServentID: qh.ClientID,
+		IP:        ourIP,
+		Port:      uint16(ta.Port),
+		FileIndex: hit.FileIndex,
+	})
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    7,
+		Hops:   0,
+		Length: uint32(len(payload)),
+	}
+	buf := append(hdr.AppendTo(nil), payload...)
+
+	// The PUSH is an engine write, so it takes the connection's engine
+	// lock, as Search does.
+	pc.mu.Lock()
+	err = pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err == nil {
+		_, err = pc.conn.Write(buf)
+	}
+	pc.mu.Unlock()
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push: write: %w", err)
+	}
+
+	timer := time.NewTimer(pushWaitTimeout)
+	defer timer.Stop()
+	select {
+	case got := <-ch:
+		defer got.conn.Close()
+		return d.fetchPushed(ctx, p, got)
+	case <-ctx.Done():
+		return DownloadResult{}, fmt.Errorf("gnutella: push: waiting for dial-back: %w", ctx.Err())
+	case <-timer.C:
+		return DownloadResult{}, fmt.Errorf("gnutella: push: no dial-back within %s", pushWaitTimeout)
+	}
+}
+
+// routeTo returns the live connection a PUSH for servent id is written to:
+// the one that last delivered a hit from it. A route whose connection has
+// since closed is not returned, so a PUSH is never written to a dead peer.
+func (e *Engine) routeTo(id [idSize]byte) *peerConn {
+	pc := e.pushes.route(id)
+	if pc == nil {
+		return nil
+	}
+	e.mu.Lock()
+	_, live := e.peers[pc]
+	e.mu.Unlock()
+	if !live {
+		return nil
+	}
+	return pc
 }
