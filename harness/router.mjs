@@ -18,7 +18,11 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 
 /**
- * Capability tiers, best first.
+ * Capability tiers, best first. Go subscription models are deliberately
+ * preferred: easy work starts with Go's temporary free models, while normal
+ * work starts with the tested Haiku model and then moves to low-cost Go
+ * flash models with larger included-usage allowances. Non-Go providers are
+ * fallbacks, not accidental first choices.
  *
  * `tools: true` is a hard requirement for anything that edits code, because an
  * agent that cannot call a tool cannot build or verify anything.
@@ -30,21 +34,35 @@ export const TIERS = [
     candidates: [
       // Filled in from live discovery below; kept explicit so a maintainer
       // can pin a preference without editing discovery logic.
+      "opencode-go/claude-haiku-5-5",
+      "opencode-go/deepseek-v4.1-flash",
+      "opencode-go/mimo-v2.6-flash",
+      "opencode-go/glm-5.3-flash",
+      "opencode-go/gpt-6-luna",
+      "opencode-go/mimo-v2.6-pro",
+      "opencode-go/deepseek-v4-pro",
+      // Non-Go alternatives come only after the subscription models.
       "opencode/big-pickle",
       "google/gemini-3.5-flash",
       "google/gemini-3.1-pro-preview",
     ],
   },
   {
-    // The cheap tool-capable tier. Tried first for briefs the classifier
-    // finds easy, and used as the fallback when strong is unavailable.
-    // Free OpenCode models come first because they need no separate key and
-    // cost nothing; Gemini flash is the paid backstop.
+    // The low-cost tool-capable tier. Free Go models first, then its inexpensive
+    // paid flash models. Other providers are explicit last-resort fallbacks.
     name: "fast",
     tools: true,
     candidates: [
-      "opencode/muse-spark-1.3-contributor-free",
-      "opencode/nemotron-3-ultra-free",
+      "opencode-go/minimax-m3.1-flash-free",
+      "opencode-go/beam-free",
+      "opencode-go/longcat-2.5-preview-free",
+      "opencode-go/mimo-v2.6-flash",
+      "opencode-go/deepseek-v4.1-flash",
+      "opencode-go/glm-5.3-flash",
+      // Non-Go fallbacks are not counted against the Go subscription.
+      "opencode/glm-5.3-flash-free",
+      "opencode/deepseek-v4.1-flash-free",
+      "opencode/big-pickle",
       "google/gemini-3.7-flash",
       "google/gemini-2.5-flash",
     ],

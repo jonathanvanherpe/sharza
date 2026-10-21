@@ -53,10 +53,10 @@ from the environment, which the `sharza-dev.service` unit supplies via
 `router.mjs` discovers models at runtime via `opencode models` rather than
 hardcoding a list, because ids and availability change.
 
-| tier | tools | candidates |
+| tier | tools | candidate order |
 | --- | --- | --- |
-| `strong` | yes | `opencode/big-pickle`, then Gemini flash/pro |
-| `fast` | yes | free OpenCode models, then older Gemini flash |
+| `strong` | yes | Go Haiku 5.5, then Go DeepSeek/MiMo/GLM flash and other Go models; non-Go fallbacks last |
+| `fast` | yes | free Go MiniMax/Beam/LongCat, then low-cost Go flash models; non-Go fallbacks last |
 | `local-weak` | **no** | Ollama models |
 
 Which tier is tried first depends on the brief. `classifyDifficulty()` scores
@@ -64,6 +64,14 @@ each brief as `easy` or `normal` with a bias toward `normal`: an `easy` cycle
 starts at `fast`, a `normal` one starts at `strong`, and both climb only when
 the preferred tier is unreachable. The classifier is deliberately conservative
 and can be overridden with `SHARZA_DIFFICULTY=easy|normal`.
+
+The Go candidates are ordered by task difficulty and current model availability.
+OpenCode enforces the Go plan's model-specific usage allowances; on a quota
+failure, the affected model is cooled down for 30 minutes and the next cycle
+tries the next available candidate. The harness does not read or predict live
+allowance balances. Non-Go providers, including Google, are only configured as
+last-resort fallbacks. Project subagents inherit the routed model rather than
+pinning themselves to a separate provider.
 
 `local-weak` is marked tool-free on purpose. The local models are weak at tool
 use and will report having edited files they never touched. Handing one an

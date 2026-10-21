@@ -1,7 +1,6 @@
 ---
 description: Writes tests, fuzz targets and differential harnesses for Sharza against real oracle clients (amuled, gtk-gnutella, qBittorrent). Use for verification, regression work, or when a change needs proving.
 mode: subagent
-model: opencode/big-pickle
 permission:
   edit:
     "*": allow
