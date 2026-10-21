@@ -79,11 +79,12 @@ JSON events there) and writes the entry if the failure looks quota-shaped.
 
 ## Permissions
 
-The agent runs with `opencode run --auto`, which auto-approves anything *not
-explicitly denied*. The denials in `opencode.json` are therefore the real
-safety boundary, not the flag. They cover `sudo`, forced pushes, pushes to
-`main`, `rm -rf` of the repo or home, `dd`, `mkfs`, piping curl into a shell,
-and service stop/restart/disable.
+The agent runs with `opencode run --auto` from the repository working
+directory (V2 uses `cwd` as the project location; do not pass the removed V1
+`--dir` flag). `--auto` approves anything *not explicitly denied*. The denials
+in `opencode.json` are therefore the real safety boundary, not the flag. They
+cover `sudo`, forced pushes, pushes to `main`, `rm -rf` of the repo or home,
+`dd`, `mkfs`, piping curl into a shell, and service stop/restart/disable.
 
 Outside that, edits, builds, tests and pushes to `agent/*` branches are all
 allowed unattended, because an agent that stops to ask about every file write
