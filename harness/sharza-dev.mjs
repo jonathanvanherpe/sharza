@@ -180,7 +180,6 @@ function runAgent({ model, agent, prompt, sessionTitle, timeoutMs }) {
     "run",
     "--format", "json",
     "--auto",
-    "--dir", REPO,
     "--title", sessionTitle,
   ];
   if (model) args.push("--model", model);
@@ -190,6 +189,8 @@ function runAgent({ model, agent, prompt, sessionTitle, timeoutMs }) {
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn("opencode", args, {
+      // OpenCode V2 uses the process working directory as the project
+      // location; the V1 `--dir` flag is no longer accepted.
       cwd: REPO,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
