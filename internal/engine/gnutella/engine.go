@@ -90,9 +90,18 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// ServentID is this engine's 16-byte servent ID, advertised in
+	// QUERYHIT replies and used as the target of requester-side PUSH.
+	// Zero means "generate one in Run".
+	ServentID [idSize]byte
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushes is the registry of live connections keyed by remote
+	// address, used for requester-side PUSH. Run sets it.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +149,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes maps a connection's remote address to its *peer.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +165,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -183,6 +196,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.pushes = e.pushes
+	if e.opts.ServentID == ([idSize]byte{}) {
+		e.opts.ServentID = newDescriptorID()
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -360,9 +377,41 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	laddr := e.laddr
+	pushes := e.pushes
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	// Wire requester-side PUSH only when the hit carries a live push
+	// path (Via) and a non-zero servent ID (ClientID).
+	zero := true
+	for _, b := range qh.ClientID {
+		if b != 0 {
+			zero = false
+			break
+		}
+	}
+	if qh.Via != nil && !zero {
+		var ip4 [4]byte
+		var port uint16
+		if ta, ok := laddr.(*net.TCPAddr); ok {
+			if ip := ta.IP.To4(); ip != nil {
+				copy(ip4[:], ip)
+			}
+			port = uint16(ta.Port)
+		}
+		addr := qh.Via
+		cid := qh.ClientID
+		fi := hit.FileIndex
+		d.RequestPush = func() error {
+			return pushes.send(addr, Push{
+				ServentID: cid,
+				FileIndex: fi,
+				IP:        ip4,
+				Port:      port,
+			})
+		}
+	}
 	return d
 }
 
