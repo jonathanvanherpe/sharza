@@ -34,6 +34,12 @@ const (
 // see Options.SearchTimeout.
 const searchTimeout = 5 * time.Second
 
+// ErrNoSuitableHit is returned by SearchAndDownload when the search
+// collected hits but none of them was usable: every hit had a zero
+// port, an unspecified source address, or no non-empty file. No
+// transfer was attempted and no disk write occurred.
+var ErrNoSuitableHit = errors.New("gnutella: no suitable hit")
+
 // Options tunes an Engine. Zero values select sane defaults.
 // FileEntry is a file in the local catalogue for QUERY responses.
 type FileEntry struct {
@@ -64,6 +70,14 @@ type Options struct {
 	// Tests set it to point a cache at a listener on 127.0.0.1, since
 	// a test may not reach anything else.
 	cacheAllowLoopback bool
+
+	// advertisePort overrides the port a QUERYHIT advertises as its
+	// source. Zero means "use the listener port", which is what
+	// production does: a peer serves files from the same port it
+	// listens for Gnutella connections on. A non-zero value lets a test
+	// point the download at a separate servent (e.g. an httptest
+	// server) while the engine keeps its own listener port.
+	advertisePort uint16
 
 	// KeepAliveInterval is how often a silent connection receives an
 	// empty PING. Zero means the default 90 s.
@@ -381,8 +395,38 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 // return is the first write error, if any, so a search that reached no
 // peer says why alongside whatever it did collect. No live peer is not an
 // error: the search simply finds nothing.
+// Search is a thin wrapper over searchQuery for the common text-only
+// case. It uses a background context, so it always runs the full
+// collection window; pass a context to searchQuery/SearchAndDownload
+// when cancellation matters.
 func (e *Engine) Search(text string) ([]QueryHit, error) {
-	q := Query{MinSpeed: 0, Search: text}
+	return e.searchQuery(context.Background(), Query{MinSpeed: 0, Search: text})
+}
+
+// SearchContext is the context-aware form of Search for callers that
+// want the collection window to end early when ctx is cancelled.
+func (e *Engine) SearchContext(ctx context.Context, text string) ([]QueryHit, error) {
+	return e.searchQuery(ctx, Query{MinSpeed: 0, Search: text})
+}
+
+// searchQuery sends one QUERY built from q to every live peer, collects
+// the QUERYHITs that echo its descriptor ID within SearchTimeout (or
+// until ctx is cancelled), and returns them.
+//
+// The query is registered before it is written: a peer on a fast link can
+// answer before the write call returns, and an unregistered ID would drop
+// that answer. Only hits echoing this query's own ID are returned; a hit
+// under any other ID answers a different query and is left to the
+// OnQueryHit callback.
+//
+// The collection window always runs to SearchTimeout unless ctx is
+// cancelled, so a peer answering first does not cut short the peers that
+// have not answered yet; that is what makes the timeout path return
+// partial hits and no error. The error return is the first write error,
+// if any, or ctx.Err() when the wait was cancelled, so a search that
+// reached no peer says why alongside whatever it did collect. No live
+// peer is not an error: the search simply finds nothing.
+func (e *Engine) searchQuery(ctx context.Context, q Query) ([]QueryHit, error) {
 	payload := EncodeQuery(q)
 	hdr := Header{
 		ID:     newDescriptorID(),
@@ -441,14 +485,77 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Wait out the collection window so late hits are collected. If no
 	// write succeeded there is no peer that can answer, so the wait would
-	// only delay an empty result.
+	// only delay an empty result. A cancelled context ends the wait
+	// early.
+	cancelled := false
 	if written.Load() > 0 {
 		timer := time.NewTimer(timeout)
-		<-timer.C
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			cancelled = true
+		}
+		timer.Stop()
 	}
 
 	errMu.Lock()
 	err := firstErr
 	errMu.Unlock()
+	if cancelled && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	return reg.close(hdr.ID), err
+}
+
+// usableHit reports whether a (query hit, file hit) pair can be
+// downloaded: a non-zero source port, a specified source address, and a
+// file with a non-zero size. The check is deliberately cheap and touches
+// no disk.
+func usableHit(qh QueryHit, hit FileHit) bool {
+	if qh.Port == 0 {
+		return false
+	}
+	if net.IP(qh.IP[:]).IsUnspecified() {
+		return false
+	}
+	if hit.FileSize == 0 {
+		return false
+	}
+	return true
+}
+
+// firstUsableHit walks the collected hits in order and returns the first
+// (query hit, file hit) pair that usableHit accepts, together with ok.
+func firstUsableHit(hits []QueryHit) (QueryHit, FileHit, bool) {
+	for _, qh := range hits {
+		for _, h := range qh.Hits {
+			if usableHit(qh, h) {
+				return qh, h, true
+			}
+		}
+	}
+	return QueryHit{}, FileHit{}, false
+}
+
+// SearchAndDownload runs a search and, if a usable hit exists, fetches
+// the first usable file into dir. It composes Search (via searchQuery)
+// and Downloader.Fetch without reimplementing either: the selection
+// happens in memory and touches no disk, and an unusable hit is skipped
+// rather than fatal. Returns ErrNoSuitableHit when no hit was usable.
+func (e *Engine) SearchAndDownload(ctx context.Context, q Query, dir string) (*DownloadJob, error) {
+	hits, err := e.searchQuery(ctx, q)
+	if err != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	qh, hit, ok := firstUsableHit(hits)
+	if !ok {
+		return nil, ErrNoSuitableHit
+	}
+	d := e.Downloader(qh, hit)
+	res, err := d.Fetch(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	qhCopy := qh
+	return &DownloadJob{Hit: &qhCopy, Path: res.Path, Size: int64(hit.FileSize)}, nil
 }
