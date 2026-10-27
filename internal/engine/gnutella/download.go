@@ -80,6 +80,11 @@ type Downloader struct {
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
+
+	// RequestPush, when non-nil, asks the peer that advertised this hit
+	// to push the file to us. It is set by Engine.Downloader when the
+	// hit carried a servent ID and a delivery path.
+	RequestPush func() error
 }
 
 // DownloadResult reports a finished transfer.

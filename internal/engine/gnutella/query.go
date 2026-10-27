@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -30,6 +31,15 @@ type QueryHit struct {
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+
+	// ClientID is the 16-byte servent ID advertised by the source,
+	// carried trailing in the QUERYHIT when non-zero.
+	ClientID [idSize]byte
+
+	// Via is the address of the peer that delivered this QUERYHIT. It
+	// is not part of the wire format; it is stamped at receive time and
+	// used to route a PUSH back along the same path.
+	Via net.Addr
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +113,12 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// Trailing NUL-terminated extensions block (empty) plus the 16-byte
+	// servent ID when ClientID is non-zero.
+	if qh.ClientID != ([idSize]byte{}) {
+		out = append(out, 0)
+		out = append(out, qh.ClientID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +160,10 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// Trailing 16 bytes (after an optional NUL-terminated extensions
+	// block) are the servent ID when present.
+	if rem := payload[pos:]; len(rem) >= idSize {
+		copy(qh.ClientID[:], rem[len(rem)-idSize:])
+	}
 	return qh, nil
 }

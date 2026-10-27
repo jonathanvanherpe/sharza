@@ -90,9 +90,18 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// ServentID is this engine's 16-byte servent identifier, advertised
+	// in QUERYHITs and used as the target of PUSH. Run generates one
+	// when zero.
+	ServentID [idSize]byte
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushes is the engine's push-path registry. Run sets it; callers
+	// do not.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +149,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes correlates live peer connections with push paths.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +165,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -179,10 +192,19 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		return errors.New("gnutella: engine already running")
 	}
 	e.started = true
+	// Generate a servent ID if the caller did not supply one.
+	serventID := opts.ServentID
+	if serventID == ([idSize]byte{}) {
+		serventID = newDescriptorID()
+	}
 	e.opts = opts.withDefaults()
-	// Every peer gets this engine's registry, so a QUERYHIT delivered on
-	// any connection can be matched to the Search that is waiting for it.
+	e.opts.ServentID = serventID
+	// Every peer gets this engine's registries, so a QUERYHIT delivered
+	// on any connection can be matched to the Search that is waiting for
+	// it and push paths can be routed.
 	e.opts.searches = e.searches
+	e.pushes = newPushRegistry()
+	e.opts.pushes = e.pushes
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -360,9 +382,30 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	laddr := e.laddr
+	pushes := e.pushes
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	if qh.Via != nil && qh.ClientID != ([idSize]byte{}) {
+		d.RequestPush = func() error {
+			var ip [4]byte
+			var port uint16
+			if ta, ok := laddr.(*net.TCPAddr); ok {
+				if ip4 := ta.IP.To4(); ip4 != nil {
+					copy(ip[:], ip4)
+				}
+				port = uint16(ta.Port)
+			}
+			push := Push{
+				ServentID: qh.ClientID,
+				FileIndex: hit.FileIndex,
+				IP:        ip,
+				Port:      port,
+			}
+			return pushes.send(qh.Via, push)
+		}
+	}
 	return d
 }
 
