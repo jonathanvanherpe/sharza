@@ -34,6 +34,7 @@ export const TIERS = [
     candidates: [
       // Filled in from live discovery below; kept explicit so a maintainer
       // can pin a preference without editing discovery logic.
+      "opencode-go/beam-free",
       "opencode-go/claude-haiku-5-5",
       "opencode-go/deepseek-v4.1-flash",
       "opencode-go/mimo-v2.6-flash",
@@ -53,8 +54,8 @@ export const TIERS = [
     name: "fast",
     tools: true,
     candidates: [
-      "opencode-go/minimax-m3.1-flash-free",
       "opencode-go/beam-free",
+      "opencode-go/minimax-m3.1-flash-free",
       "opencode-go/longcat-2.5-preview-free",
       "opencode-go/mimo-v2.6-flash",
       "opencode-go/deepseek-v4.1-flash",
@@ -186,6 +187,21 @@ export async function route(req = {}) {
   const difficulty = req.difficulty === "easy" ? "easy" : "normal";
   const available = new Set((await discoverModels()).map((m) => m.full));
   const exclude = new Set(req.exclude ?? []);
+
+  // An explicit pin (SHARZA_MODEL) wins over tier routing, so the harness can
+  // be told to use one specific model without editing the candidate lists.
+  // It is still subject to cooldowns and to discovery: a cooled or unreachable
+  // pin falls through to the normal tier order below.
+  const pinned = process.env.SHARZA_MODEL;
+  if (pinned && !exclude.has(pinned) && (available.size === 0 || available.has(pinned))) {
+    return {
+      model: pinned,
+      tier: "pinned",
+      difficulty,
+      reason: `${pinned} pinned via SHARZA_MODEL`,
+      available: true,
+    };
+  }
 
   let order = ORDER_BY_DIFFICULTY[difficulty];
   if (req.prefer) {

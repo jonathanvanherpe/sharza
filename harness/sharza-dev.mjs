@@ -319,12 +319,19 @@ async function main(argv) {
   const dryRun = args.has("--dry-run");
   const forcedTask = valueOf("task");
 
+  // Pick a model up front so selection uses the same routed model as the
+  // build instead of opencode's configured default.
+  const initialExclude = await cooledDown();
+  const initialRoute = await route({ needsTools: true, difficulty: "normal", exclude: initialExclude });
+  const selectionModel = initialRoute.available ? initialRoute.model : undefined;
+
   // 1. Select.
   let task;
   if (forcedTask) {
     task = forcedTask;
   } else {
     const picked = await runAgent({
+      model: selectionModel,
       agent: null,
       prompt:
         "Run the /next-task command and output only the task brief it produces. " +
