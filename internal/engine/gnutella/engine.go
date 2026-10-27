@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// advertisePort is the port reported in outgoing QUERYHITs (and, by
+	// convention, the port a peer dials to fetch a file). Zero means
+	// "use the engine's listen port", which is the production default:
+	// the daemon serves files on the same port it speaks Gnutella on.
+	// Tests set it to an httptest servent's port so a QueryHit can name
+	// a separate HTTP listener without a real servent.
+	advertisePort uint16
 }
 
 func (o Options) withDefaults() Options {

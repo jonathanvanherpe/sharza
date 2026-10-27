@@ -436,9 +436,13 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 			copy(ip4[:], ip)
 		}
 	}
+	port := p.listenPort()
+	if p.opts.advertisePort != 0 {
+		port = p.opts.advertisePort
+	}
 	qh := QueryHit{
 		HitCount: uint8(len(hits)),
-		Port:     p.listenPort(),
+		Port:     port,
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
