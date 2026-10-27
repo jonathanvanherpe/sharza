@@ -80,6 +80,12 @@ type Downloader struct {
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
+
+	// RequestPush, when non-nil, asks the peer that delivered the hit to
+	// push (open a connection back to us for) this file. It is wired by
+	// the engine only for hits that carry a Via connection and a nonzero
+	// servent ID. Nil means no push path is available.
+	RequestPush func() error
 }
 
 // DownloadResult reports a finished transfer.

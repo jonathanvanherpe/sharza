@@ -90,9 +90,17 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// ServentID is this engine's 16-byte servent identifier, advertised
+	// in QUERYHITs and used as the push target identity. Zero means
+	// "generate one in Run".
+	ServentID [idSize]byte
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// pushes is the engine's push delivery registry. Run sets it.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +148,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes correlates live connections with push delivery paths.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +164,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -183,6 +195,12 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// Generate a servent ID if the caller did not supply one.
+	if e.opts.ServentID == [idSize]byte{} {
+		e.opts.ServentID = newDescriptorID()
+	}
+	// Every peer gets this engine's push registry.
+	e.opts.pushes = e.pushes
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -360,9 +378,38 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	laddr := e.laddr
+	pushes := e.pushes
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	// Wire a push request only when the hit names a path back to its
+	// servent: a Via connection and a nonzero servent ID.
+	if qh.Via != nil && qh.ClientID != [idSize]byte{} {
+		via := qh.Via
+		clientID := qh.ClientID
+		fileIndex := hit.FileIndex
+		d.RequestPush = func() error {
+			if pushes == nil {
+				return ErrNoPushPath
+			}
+			var ip [4]byte
+			var port uint16
+			if ta, ok := laddr.(*net.TCPAddr); ok {
+				if ip4 := ta.IP.To4(); ip4 != nil {
+					copy(ip[:], ip4)
+				}
+				port = uint16(ta.Port)
+			}
+			push := Push{
+				ServentID: clientID,
+				FileIndex: fileIndex,
+				IP:        ip,
+				Port:      port,
+			}
+			return pushes.send(via, push)
+		}
+	}
 	return d
 }
 
