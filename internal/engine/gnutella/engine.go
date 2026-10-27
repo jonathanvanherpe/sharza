@@ -84,6 +84,12 @@ type Options struct {
 	// the default 5 s.
 	SearchTimeout time.Duration
 
+	// advertisePort, when non-zero, is the port advertised in QUERYHIT
+	// responses in place of the listener port. Zero means "use the
+	// listener port", preserving production behaviour. Tests use it to
+	// point a download at a separate servent.
+	advertisePort uint16
+
 	// OnQueryHit is called for every QUERYHIT received from a peer,
 	// with the descriptor ID the hit echoed. The id lets a caller match
 	// the hit to the Search that asked for it; Engine.Search collects
