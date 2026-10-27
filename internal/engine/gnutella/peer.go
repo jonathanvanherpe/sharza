@@ -410,8 +410,10 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery responds to an inbound QUERY. It suppresses duplicates,
+// records the peer that forwarded the query as the reverse path for the
+// eventual QUERYHIT, answers from the local catalogue, and forwards the
+// query (TTL-1, Hops+1) to every peer except the sender when TTL > 1.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -419,6 +421,19 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+
+	// Duplicate suppression: a descriptor ID we have already seen is a
+	// query that is looping through the mesh and must not be processed
+	// or forwarded again.
+	if p.opts.Router != nil && !p.opts.Router.markSeen(hdr.ID) {
+		p.logf("duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+	// Record the upstream peer for the reverse-path QUERYHIT, if any.
+	if p.opts.Router != nil {
+		p.opts.Router.learn(hdr.ID, p.conn)
+	}
+
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -452,23 +467,67 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		Length: uint32(len(hitPayload)),
 	}
 	if respHdr.TTL == 0 {
-		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
+		respHdr.TTL = 1 // direct link; clamp like ping->pong
 	}
-	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if len(hits) > 0 {
+		p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
+		if err := p.writeMessage(respHdr, hitPayload); err != nil {
+			return err
+		}
+	}
+
+	// Horizon routing: forward the query to every peer except the
+	// sender when its TTL still has hops left.
+	if hdr.TTL > 1 && p.opts.Broadcast != nil {
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    hdr.TTL - 1,
+			Hops:   hdr.Hops + 1,
+			Length: hdr.Length,
+		}
+		buf := fwdHdr.AppendTo(nil)
+		buf = append(buf, payload...)
+		p.opts.Broadcast(buf, p.conn)
+	}
+	return nil
 }
 
-// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// handleQueryHit either forwards the hit along the recorded reverse path
+// (when one exists) or delivers it locally. Forwarding uses TTL-1 and
+// Hops+1; a hit with no recorded route is delivered to the in-flight
+// search registry and the OnQueryHit callback.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+
+	// Reverse-path routing: if a query with this descriptor ID was
+	// forwarded through us, send the hit back the way it came.
+	if p.opts.Router != nil {
+		if up, ok := p.opts.Router.upstream(hdr.ID); ok && up != nil {
+			if hdr.TTL > 1 && p.opts.WriteTo != nil {
+				fwdHdr := Header{
+					ID:     hdr.ID,
+					Type:   MsgQueryHit,
+					TTL:    hdr.TTL - 1,
+					Hops:   hdr.Hops + 1,
+					Length: hdr.Length,
+				}
+				buf := fwdHdr.AppendTo(nil)
+				buf = append(buf, payload...)
+				if err := p.opts.WriteTo(up, buf); err != nil {
+					p.logf("forward queryhit to %s failed: %v", up, err)
+				}
+			}
+			p.logf("queryhit from %s forwarded upstream: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+			return nil
+		}
+	}
+
+	// No route: deliver locally.
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}

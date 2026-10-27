@@ -93,6 +93,21 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// Router is the query router for this engine: descriptor-ID
+	// duplicate suppression and reverse-path (upstream) routing for
+	// QUERY/QUERYHIT beyond the direct link. Run sets it; callers do
+	// not.
+	Router *queryRouter
+
+	// Broadcast writes a message to every live peer connection except
+	// an optional excluded one, under each connection's write lock.
+	// Run sets it; callers (and peers) use it to flood a QUERY.
+	Broadcast func(msg []byte, except ...net.Conn)
+
+	// WriteTo writes a message to one peer connection under its write
+	// lock. Run sets it.
+	WriteTo func(conn net.Conn, msg []byte) error
 }
 
 func (o Options) withDefaults() Options {
@@ -136,6 +151,10 @@ type Engine struct {
 
 	peers map[*peerConn]struct{}
 
+	// connPeers maps a net.Conn to its peerConn so WriteTo can take
+	// the per-connection write lock. Run maintains it.
+	connPeers map[net.Conn]*peerConn
+
 	// searches correlates inbound QUERYHITs with the Search that asked
 	// for them, by descriptor ID.
 	searches *searchRegistry
@@ -150,8 +169,9 @@ type Engine struct {
 func New() *Engine {
 	return &Engine{
 		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
+		peers:      make(map[*peerConn]struct{}),
+		connPeers:  make(map[net.Conn]*peerConn),
+		dialed:     make(map[string]struct{}),
 		searches: newSearchRegistry(),
 	}
 }
@@ -183,7 +203,49 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.Router = newQueryRouter()
 	e.mu.Unlock()
+
+	e.opts.Broadcast = func(msg []byte, except ...net.Conn) {
+		exceptSet := make(map[net.Conn]struct{}, len(except))
+		for _, c := range except {
+			exceptSet[c] = struct{}{}
+		}
+		e.mu.Lock()
+		peers := make([]*peerConn, 0, len(e.peers))
+		for pc := range e.peers {
+			peers = append(peers, pc)
+		}
+		e.mu.Unlock()
+		for _, pc := range peers {
+			if _, skip := exceptSet[pc.conn]; skip {
+				continue
+			}
+			pc.mu.Lock()
+			_ = pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_, _ = pc.conn.Write(msg)
+			pc.mu.Unlock()
+		}
+	}
+	e.opts.WriteTo = func(conn net.Conn, msg []byte) error {
+		e.mu.Lock()
+		pc := e.connPeers[conn]
+		e.mu.Unlock()
+		if pc != nil {
+			pc.mu.Lock()
+			defer pc.mu.Unlock()
+			if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				return err
+			}
+			_, err := pc.conn.Write(msg)
+			return err
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		_, err := conn.Write(msg)
+		return err
+	}
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
 	if err != nil {
@@ -223,6 +285,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
 		e.mu.Lock()
 		e.peers[pc] = struct{}{}
+		e.connPeers[conn] = pc
 		e.mu.Unlock()
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
@@ -232,6 +295,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
+			delete(e.connPeers, c)
 			e.mu.Unlock()
 		}(conn, pc)
 	}
@@ -316,12 +380,14 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
+			e.connPeers[conn] = pc
 			e.mu.Unlock()
 			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
+			delete(e.connPeers, conn)
 			e.mu.Unlock()
 			delay = dialBackoff
 			select {
@@ -409,6 +475,12 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+	// Mark our own descriptor ID as seen so a query that loops back
+	// to us through the mesh is treated as a duplicate and dropped
+	// instead of re-answered and re-forwarded.
+	if e.opts.Router != nil {
+		e.opts.Router.markSeen(hdr.ID)
+	}
 
 	var (
 		wg       sync.WaitGroup
