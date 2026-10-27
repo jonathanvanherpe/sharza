@@ -79,6 +79,13 @@ type Options struct {
 	// Catalogue is the local file list used to answer incoming QUERYs.
 	Catalogue []FileEntry
 
+	// advertisePort overrides the port advertised in QUERYHITs built by
+	// handleQuery. Zero means "use the engine's listener port", which is
+	// production behaviour. Tests set it to point a QUERYHIT at a separate
+	// servent (e.g. an httptest server) so a search result can drive a
+	// download without the engine itself serving files.
+	advertisePort uint16
+
 	// SearchTimeout is the window Search waits for QUERYHITs after
 	// writing its QUERY, before returning the hits it has. Zero means
 	// the default 5 s.
