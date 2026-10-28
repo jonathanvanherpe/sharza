@@ -80,6 +80,10 @@ type Downloader struct {
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
+
+	// RequestPush, when set, asks the firewalled source to connect back
+	// and serve the file. Nil means no push path is available.
+	RequestPush func() error
 }
 
 // DownloadResult reports a finished transfer.

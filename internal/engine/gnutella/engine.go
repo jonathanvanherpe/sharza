@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// ServentID is the GUID this engine advertises as its source
+	// identity in QUERYHIT replies. Run generates one when zero.
+	ServentID [idSize]byte
+
+	// pushes is the engine's push-path registry. Run sets it; callers
+	// do not.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +148,10 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// pushes correlates servent IDs with the connection that can reach
+	// them, for outbound PUSH messages.
+	pushes *pushRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +165,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -183,6 +196,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.pushes = e.pushes
+	if e.opts.ServentID == [idSize]byte{} {
+		e.opts.ServentID = newDescriptorID()
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -360,9 +377,37 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	pushes := e.pushes
+	laddr := e.laddr
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	if qh.Via != nil && qh.ClientID != [idSize]byte{} {
+		d.RequestPush = func() error {
+			push := Push{
+				ClientID:     qh.ClientID,
+				ServentID:    qh.ClientID,
+				ServentGUID:  qh.ClientID,
+				GUID:         qh.ClientID,
+				ClientGUID:   qh.ClientID,
+				FileIndex:    hit.FileIndex,
+			}
+			if ta, ok := laddr.(*net.TCPAddr); ok {
+				if ip := ta.IP.To4(); ip != nil {
+					copy(push.IP[:], ip)
+					copy(push.Address[:], ip)
+					copy(push.Addr[:], ip)
+					copy(push.Host[:], ip)
+				}
+				push.Port = uint16(ta.Port)
+				push.ListenPort = uint16(ta.Port)
+			}
+			if pushes == nil {
+				return ErrNoPushPath
+			}
+			return pushes.send(qh.ClientID, push)
+		}
+	}
 	return d
 }
 

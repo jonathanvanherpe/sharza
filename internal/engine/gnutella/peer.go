@@ -69,6 +69,10 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 		laddr:   laddr,
 		logf:    opts.logf(),
 	}
+	if p.opts.pushes != nil {
+		p.opts.pushes.add(p)
+		defer p.opts.pushes.remove(p)
+	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetNoDelay(true)
@@ -442,6 +446,7 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
+		ClientID: p.opts.ServentID,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
@@ -468,6 +473,10 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	qh.Via = p.conn.RemoteAddr()
+	if p.opts.pushes != nil && qh.ClientID != [idSize]byte{} {
+		p.opts.pushes.add(p, qh.ClientID)
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
