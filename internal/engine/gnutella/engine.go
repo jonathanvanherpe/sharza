@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// seenQueries correlates forwarded QUERYs by descriptor ID, recording
+	// the origin peer for reverse-path QUERYHIT routing. Run sets it.
+	seenQueries *seenQueryCache
+
+	// engine is the owning engine, used by peer handlers to call back
+	// into forwarding and peer enumeration. Run sets it.
+	engine *Engine
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +148,10 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// seenQueries records forwarded QUERYs by descriptor ID, first-writer
+	// wins, so a QUERYHIT can be routed back to the origin peer.
+	seenQueries *seenQueryCache
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -149,10 +161,11 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:       make(chan struct{}),
+		peers:       make(map[*peerConn]struct{}),
+		dialed:      make(map[string]struct{}),
+		searches:    newSearchRegistry(),
+		seenQueries: newSeenQueryCache(),
 	}
 }
 
@@ -183,6 +196,11 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.seenQueries = e.seenQueries
+	e.opts.engine = e
+	if e.seenQueries == nil {
+		e.seenQueries = newSeenQueryCache()
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -225,15 +243,15 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.peers[pc] = struct{}{}
 		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
-				logf("inbound %s: %v", c.RemoteAddr(), err)
+			if err := serveConn(ctx, pc, true, e.opts, e.laddr); err != nil {
+				logf("inbound %s: %v", pc.conn.RemoteAddr(), err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
-		}(conn, pc)
+		}(pc)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -317,7 +335,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, pc, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -451,4 +469,20 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// peersExcept returns every live peer except origin. It is the building
+// block for QUERY forwarding, which writes to all neighbours but the one
+// the query came from.
+func (e *Engine) peersExcept(origin *peerConn) []*peerConn {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		if pc == origin {
+			continue
+		}
+		out = append(out, pc)
+	}
+	return out
 }

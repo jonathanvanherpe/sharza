@@ -56,29 +56,31 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+	pc      *peerConn   // engine-level peer identity for forwarding
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, pc *peerConn, inbound bool, opts Options, laddr net.Addr) error {
 	p := &peer{
-		conn:    conn,
+		conn:    pc.conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc:      pc,
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	if tc, ok := pc.conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetNoDelay(true)
 	}
 	// Closing the connection is how an idle readLoop, blocked in
 	// DecodeHeader, is told the context ended.
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stopClose := context.AfterFunc(ctx, func() { _ = pc.conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
+	r := bufio.NewReader(pc.conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {
@@ -410,14 +412,26 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery records the query as seen, forwards it to every other peer,
+// and only then answers from the local catalogue. A query whose descriptor
+// ID has already been seen is dropped outright, so a QUERY that loops
+// back to us is never answered or forwarded twice.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
 		p.logf("bad query from %s: %v", p.conn.RemoteAddr(), err)
 		// Don't close connection on bad query; just ignore.
 		return nil
+	}
+	origin := p.pc
+	// Drop duplicates before doing anything else.
+	if p.opts.seenQueries != nil && p.opts.seenQueries.has(hdr.ID) {
+		p.logf("dropping duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+	// Forward before answering, so the query can travel beyond this link.
+	if p.opts.engine != nil {
+		p.opts.engine.forwardQuery(origin, hdr, payload)
 	}
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
@@ -455,19 +469,43 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
+	// Answer the peer that sent us the query.
 	return p.writeMessage(respHdr, hitPayload)
 }
 
-// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// handleQueryHit routes a hit back along the recorded reverse path when one
+// exists, and otherwise delivers it to the local search registry and the
+// Options.OnQueryHit callback.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	// Reverse-path routing: if we recorded an origin peer for this
+	// descriptor ID, forward the hit there instead of treating it as
+	// our own answer.
+	if p.opts.seenQueries != nil {
+		if origin, ok := p.opts.seenQueries.lookup(hdr.ID); ok && origin != nil && origin != p.pc {
+			newHdr := hdr
+			if newHdr.TTL > 1 {
+				newHdr.TTL--
+			} else {
+				newHdr.TTL = 1
+			}
+			newHdr.Hops++
+			newHdr.Length = uint32(len(payload))
+			origin.mu.Lock()
+			defer origin.mu.Unlock()
+			if err := origin.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				return err
+			}
+			buf := newHdr.AppendTo(nil)
+			buf = append(buf, payload...)
+			_, err := origin.conn.Write(buf)
+			p.logf("routing queryhit to origin %s: id=%x hits=%d", origin.addr, hdr.ID, len(qh.Hits))
+			return err
+		}
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
