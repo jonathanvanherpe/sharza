@@ -275,8 +275,8 @@ func (p *peer) readLoop(ctx context.Context, r io.Reader) error {
 }
 
 // handle processes one message. Routing and file transfer are out of
-// scope for this item, so Query, QueryHit and Push are acknowledged in
-// the log and ignored.
+// scope for this item, so Query and QueryHit are acknowledged in the log;
+// Push is decoded and acknowledged by handlePush.
 func (p *peer) handle(hdr Header, payload []byte) error {
 	switch hdr.Type {
 	case MsgPing:
@@ -290,9 +290,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
-		return nil
+		return p.handlePush(hdr, payload)
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
 		return nil
@@ -476,5 +474,20 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	return nil
+}
+
+// handlePush decodes an inbound PUSH and acknowledges it. No file
+// transfer or proxy forwarding is performed in this slice; the message
+// is logged and the connection is kept open even when the payload is
+// malformed, so a bad Push cannot drop an otherwise healthy link.
+func (p *peer) handlePush(hdr Header, payload []byte) error {
+	push, err := DecodePush(payload)
+	if err != nil {
+		p.logf("bad push from %s: %v", p.conn.RemoteAddr(), err)
+		return nil
+	}
+	p.logf("push from %s: id=%x servent=%x fileindex=%d ip=%v port=%d ttl=%d hops=%d",
+		p.conn.RemoteAddr(), hdr.ID, push.ServentID, push.FileIndex, push.IPAddress, push.Port, hdr.TTL, hdr.Hops)
 	return nil
 }
