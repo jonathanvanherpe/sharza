@@ -78,6 +78,14 @@ type Downloader struct {
 	// Client performs the GET. Nil selects defaultDownloadClient.
 	Client *http.Client
 
+	// RequestPush is invoked at most once when Client.Do fails (and ctx
+	// is not cancelled), to ask the firewalled source to push. Nil
+	// disables the push request.
+	RequestPush func() error
+
+	// requestPushCalled records whether RequestPush has been invoked.
+	requestPushCalled bool
+
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
 }
@@ -191,6 +199,10 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if ctx.Err() == nil && d.RequestPush != nil && !d.requestPushCalled {
+			d.requestPushCalled = true
+			_ = d.RequestPush()
+		}
 		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()

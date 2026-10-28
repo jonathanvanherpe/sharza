@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -30,6 +31,8 @@ type QueryHit struct {
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+	ClientID [idSize]byte
+	Via      net.Addr
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +106,10 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	if qh.ClientID != ([idSize]byte{}) {
+		out = append(out, 0x00)
+		out = append(out, qh.ClientID[:]...)
+	}
 	return out
 }
 
@@ -144,5 +151,8 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	if pos <= len(payload) && len(payload)-pos >= idSize {
+		copy(qh.ClientID[:], payload[len(payload)-idSize:])
+	}
 	return qh, nil
 }
