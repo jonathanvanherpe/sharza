@@ -80,6 +80,14 @@ type Downloader struct {
 
 	// Logf receives log lines. Nil logs to stderr.
 	Logf func(format string, args ...any)
+
+	// RequestPush, when non-nil, asks the peer that advertised this hit
+	// to push the file to us. It is set by Engine.Downloader only when
+	// the hit carries a live push path and a non-zero servent ID.
+	RequestPush func() error
+
+	// requestPushCalled guards at-most-once invocation of RequestPush.
+	requestPushCalled bool
 }
 
 // DownloadResult reports a finished transfer.
@@ -191,6 +199,10 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if d.RequestPush != nil && ctx.Err() == nil && !d.requestPushCalled {
+			d.requestPushCalled = true
+			_ = d.RequestPush()
+		}
 		return DownloadResult{}, fmt.Errorf("gnutella: download %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
