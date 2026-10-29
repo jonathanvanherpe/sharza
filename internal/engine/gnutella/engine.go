@@ -93,6 +93,15 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// routes is the engine's query route table. Run sets it; callers do
+	// not. Inbound QUERYs are tracked through it for forwarding and
+	// reverse-path delivery of QUERYHITs.
+	routes *routeTable
+
+	// Forward propagates a QUERY (or any raw message) to all peers
+	// except the one named by exclude. Run sets it; callers do not.
+	Forward func(exclude net.Addr, data []byte)
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +149,10 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// routes correlates inbound QUERYs with their origin peer for
+	// forwarding and reverse-path delivery of QUERYHITs.
+	routes *routeTable
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +166,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		routes:   newRouteTable(),
 	}
 }
 
@@ -183,6 +197,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.routes = e.routes
+	e.opts.Forward = e.forwardToPeers
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -409,6 +425,12 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+	// Remember this descriptor ID in the route table with a nil origin,
+	// so returning QUERYHITs are delivered locally instead of being
+	// re-forwarded.
+	if e.routes != nil {
+		e.routes.remember(hdr.ID, nil)
+	}
 
 	var (
 		wg       sync.WaitGroup
@@ -451,4 +473,32 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	err := firstErr
 	errMu.Unlock()
 	return reg.close(hdr.ID), err
+}
+
+// forwardToPeers writes data to every live peer except the one whose
+// address equals exclude. It is the Forward callback wired into Options
+// by Run, used by handleQuery to propagate a QUERY. Writes are serialised
+// per peer through peerConn.mu.
+func (e *Engine) forwardToPeers(exclude net.Addr, data []byte) {
+	e.mu.Lock()
+	peers := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		peers = append(peers, pc)
+	}
+	e.mu.Unlock()
+
+	for _, pc := range peers {
+		if exclude != nil && pc.addr != nil && pc.addr.String() == exclude.String() {
+			continue
+		}
+		pc.mu.Lock()
+		err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err == nil {
+			_, err = pc.conn.Write(data)
+		}
+		pc.mu.Unlock()
+		if err != nil {
+			e.opts.Logf("forward to %v: %v", pc.addr, err)
+		}
+	}
 }

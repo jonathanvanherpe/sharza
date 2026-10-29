@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package gnutella
+
+import (
+	"sync"
+	"time"
+)
+
+// routeExpiry is how long a seen-query entry and its reverse route stay
+// valid. A QUERY that has not been answered within this window is
+// forgotten, so a later query with the same descriptor ID (rare but
+// possible after a restart or a very long-lived mesh) is not mistaken
+// for a duplicate.
+const routeExpiry = 5 * time.Minute
+
+// routeEntry is one remembered query: the peer it arrived from (nil for a
+// query this engine originated itself) and when it was first seen.
+type routeEntry struct {
+	origin *peer
+	seenAt time.Time
+}
+
+// routeTable holds the seen-query cache and the reverse routes for
+// Gnutella QUERY forwarding. A descriptor ID is recorded the first time a
+// QUERY carrying it is seen; a second QUERY with the same ID within the
+// expiry window is a duplicate and is dropped. The recorded origin peer is
+// where a QUERYHIT answering that query must be sent back.
+//
+// All fields are guarded by mu. Lock ordering: routeTable.mu is never
+// held while acquiring peer.mu; callers that need both take peer.mu
+// first and routeTable second, or copy out the *peer under routeTable.mu
+// and lock it afterwards.
+type routeTable struct {
+	mu      sync.Mutex
+	entries map[[idSize]byte]routeEntry
+}
+
+// newRouteTable returns an empty, ready-to-use route table.
+func newRouteTable() *routeTable {
+	return &routeTable{entries: make(map[[idSize]byte]routeEntry)}
+}
+
+// evictLocked removes entries older than routeExpiry. Caller holds mu.
+func (r *routeTable) evictLocked(now time.Time) {
+	for id, e := range r.entries {
+		if now.Sub(e.seenAt) > routeExpiry {
+			delete(r.entries, id)
+		}
+	}
+}
+
+// isDuplicate reports whether id has been seen within the expiry window.
+// It does not record anything.
+func (r *routeTable) isDuplicate(id [idSize]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked(time.Now())
+	_, ok := r.entries[id]
+	return ok
+}
+
+// remember records id as seen, associating it with origin. A nil origin
+// marks a query this engine originated, so returning QUERYHITs are
+// delivered locally rather than re-forwarded.
+func (r *routeTable) remember(id [idSize]byte, origin *peer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked(time.Now())
+	r.entries[id] = routeEntry{origin: origin, seenAt: time.Now()}
+}
+
+// origin returns the peer a QUERY with this id arrived from, or nil if
+// the id is unknown or this engine originated the query. An expired entry
+// yields nil.
+func (r *routeTable) origin(id [idSize]byte) *peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked(time.Now())
+	e, ok := r.entries[id]
+	if !ok {
+		return nil
+	}
+	return e.origin
+}

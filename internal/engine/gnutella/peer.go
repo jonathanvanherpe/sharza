@@ -411,7 +411,8 @@ func stripPort(hostport string) string {
 }
 
 // handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// the injectable local catalogue on Options, and, when TTL permits,
+// forwards the QUERY to the rest of the mesh.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -419,6 +420,18 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+
+	// Duplicate suppression: a QUERY we have already seen (within the
+	// expiry window) is dropped rather than re-processed or re-forwarded.
+	if p.opts.routes != nil && p.opts.routes.isDuplicate(hdr.ID) {
+		p.logf("dropping duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+	// Remember the origin peer for reverse-path delivery of QUERYHITs.
+	if p.opts.routes != nil {
+		p.opts.routes.remember(hdr.ID, p)
+	}
+
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -455,7 +468,25 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	// Forward to the rest of the mesh when the horizon allows. The
+	// origin peer (the one that sent us this QUERY) is excluded.
+	if hdr.TTL > 1 && p.opts.Forward != nil {
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    hdr.TTL - 1,
+			Hops:   hdr.Hops + 1,
+			Length: uint32(len(payload)),
+		}
+		buf := fwdHdr.AppendTo(nil)
+		buf = append(buf, payload...)
+		p.opts.Forward(p.conn.RemoteAddr(), buf)
+	}
+	return nil
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
@@ -469,6 +500,24 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+
+	// Reverse-path routing: if this QUERYHIT answers a query we
+	// forwarded, send it back to the peer that originated that query.
+	if p.opts.routes != nil {
+		if origin := p.opts.routes.origin(hdr.ID); origin != nil && origin != p {
+			fwdHdr := Header{
+				ID:     hdr.ID,
+				Type:   MsgQueryHit,
+				TTL:    hdr.TTL - 1,
+				Hops:   hdr.Hops + 1,
+				Length: uint32(len(payload)),
+			}
+			if err := origin.writeMessage(fwdHdr, payload); err != nil {
+				p.logf("forward queryhit to origin: %v", err)
+			}
+		}
+	}
+
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
