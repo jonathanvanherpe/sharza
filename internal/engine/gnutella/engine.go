@@ -93,6 +93,10 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// forwarder is the shared seen-message cache and reverse-path table
+	// for QUERY/QUERYHIT forwarding. Run sets it; callers do not.
+	forwarder *forwarder
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +144,10 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// forwarder is the shared seen-message cache and reverse-path table
+	// for QUERY/QUERYHIT forwarding.
+	forwarder *forwarder
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,16 +156,31 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
-	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+	e := &Engine{
+		ready:     make(chan struct{}),
+		peers:     make(map[*peerConn]struct{}),
+		dialed:    make(map[string]struct{}),
+		searches:  newSearchRegistry(),
 	}
+	e.forwarder = newForwarder(e.peersSnapshot)
+	return e
 }
 
 // Ready is closed once Run has bound the listener. It never closes if
 // Run fails before binding.
+// peersSnapshot returns a point-in-time slice of live peer connections.
+// It is the peer source handed to the forwarder so the forwarder can
+// iterate connections without holding an engine pointer.
+func (e *Engine) peersSnapshot() []*peerConn {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		out = append(out, pc)
+	}
+	return out
+}
+
 func (e *Engine) Ready() <-chan struct{} {
 	return e.ready
 }
@@ -183,6 +206,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// Every peer gets this engine's forwarder, so QUERY/QUERYHIT
+	// forwarding and the seen/reverse-path state are shared across
+	// connections, mirroring how searches is shared.
+	e.opts.forwarder = e.forwarder
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -227,7 +254,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, pc); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +344,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, pc); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()

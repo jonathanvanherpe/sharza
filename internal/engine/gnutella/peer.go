@@ -56,18 +56,24 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+
+	// pc is this connection's entry in the engine's live peer set, used
+	// by the forwarder to identify and exclude the origin and to write
+	// forwarded messages. Nil for peers constructed outside serveConn.
+	pc *peerConn
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, pc *peerConn) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc:      pc,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -410,8 +416,10 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery answers locally as today and, when TTL > 1 and the ID is
+// not already in the seen cache, forwards the QUERY to every connected
+// peer except the origin with TTL-1/Hops+1. The seen cache suppresses
+// duplicate forwarding.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -455,22 +463,81 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	fwd := p.opts.forwarder
+	seen := false
+	if fwd != nil {
+		seen = fwd.seen(hdr.ID)
+		if !seen {
+			fwd.markSeen(hdr.ID, time.Now().Add(2*time.Minute))
+		}
+		fwd.addReverse(hdr.ID, p.pc)
+	}
+
+	if fwd != nil && hdr.TTL > 1 && !seen {
+		for _, pc := range fwd.peers() {
+			if pc == nil || pc == p.pc {
+				continue
+			}
+			fh := Header{
+				ID:     hdr.ID,
+				Type:   MsgQuery,
+				TTL:    hdr.TTL - 1,
+				Hops:   hdr.Hops + 1,
+				Length: uint32(len(payload)),
+			}
+			pc.mu.Lock()
+			if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err == nil {
+				_, _ = pc.conn.Write(append(fh.AppendTo(nil), payload...))
+			}
+			pc.mu.Unlock()
+		}
+	}
+	return nil
 }
 
-// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// handleQueryHit delivers an inbound QUERYHIT locally when its ID is an
+// in-flight search, or forwards it back along the recorded reverse path.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+	inFlight := false
 	if p.opts.searches != nil {
-		p.opts.searches.deliver(hdr.ID, qh)
+		inFlight = p.opts.searches.isPending(hdr.ID)
+		if inFlight {
+			p.opts.searches.deliver(hdr.ID, qh)
+		}
+	}
+	if inFlight {
+		// still surface to callback below
+	} else if fwd := p.opts.forwarder; fwd != nil {
+		if origin, ok := fwd.origin(hdr.ID); ok && origin != nil && origin != p.pc {
+			respTTL := hdr.TTL
+			if respTTL > 0 {
+				respTTL--
+			}
+			if respTTL == 0 {
+				respTTL = 1
+			}
+			fh := Header{
+				ID:     hdr.ID,
+				Type:   MsgQueryHit,
+				TTL:    respTTL,
+				Hops:   hdr.Hops + 1,
+				Length: uint32(len(payload)),
+			}
+			origin.mu.Lock()
+			if err := origin.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err == nil {
+				_, _ = origin.conn.Write(append(fh.AppendTo(nil), payload...))
+			}
+			origin.mu.Unlock()
+		}
 	}
 	if p.opts.OnQueryHit != nil {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)

@@ -47,6 +47,15 @@ func (r *searchRegistry) register(id [idSize]byte) *pendingSearch {
 	return ps
 }
 
+// pending reports whether id is an in-flight search. Used to decide
+// whether an inbound QUERYHIT is delivered locally or forwarded.
+func (r *searchRegistry) isPending(id [idSize]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.pending[id]
+	return ok
+}
+
 // deliver appends a hit to the search registered under id. A hit whose
 // id matches no in-flight search is dropped: it answers a query this
 // engine did not ask, and attributing it here would report another
