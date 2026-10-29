@@ -140,6 +140,16 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// seenQueries is the duplicate-suppression set for forwarded QUERYs:
+	// a descriptor ID is recorded the first time it is seen, and a
+	// later QUERY carrying the same ID is dropped. Expiry is handled
+	// in forwarding.go.
+	seenQueries map[[idSize]byte]time.Time
+
+	// forwarding maps a QUERY's descriptor ID to the peer that sent it
+	// to us, so a QUERYHIT can be routed back along the reverse path.
+	forwarding map[[idSize]byte]*peerConn
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -149,10 +159,12 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:       make(chan struct{}),
+		peers:       make(map[*peerConn]struct{}),
+		dialed:      make(map[string]struct{}),
+		searches:    newSearchRegistry(),
+		seenQueries: make(map[[idSize]byte]time.Time),
+		forwarding:  make(map[[idSize]byte]*peerConn),
 	}
 }
 
@@ -227,7 +239,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, e); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +329,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, e); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -393,6 +405,10 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	}
 	buf := hdr.AppendTo(nil)
 	buf = append(buf, payload...)
+
+	// Record our own query so a copy that loops back to us is
+	// suppressed instead of being answered again.
+	e.markSeenQuery(hdr.ID)
 
 	e.mu.Lock()
 	peers := make([]*peerConn, 0, len(e.peers))
