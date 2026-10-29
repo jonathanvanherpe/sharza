@@ -56,18 +56,20 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+	pc      *peerConn   // this connection's entry in the engine's peer set
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, pc *peerConn) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc:      pc,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -411,7 +413,8 @@ func stripPort(hostport string) string {
 }
 
 // handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// the injectable local catalogue on Options, and, when TTL allows,
+// forwards the QUERY to other live peers for multi-hop routing.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -455,19 +458,68 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
+
+	// Multi-hop routing: when the query still has life, record the
+	// origin peer for reverse routing and forward to every other live
+	// peer, suppressing loops via the seen-query set.
+	r := p.opts.routing
+	if r != nil && hdr.TTL > 1 {
+		origin := p.pc
+		duplicate := r.isSeen(hdr.ID)
+		if !duplicate {
+			if origin != nil {
+				r.recordPending(hdr.ID, origin)
+			}
+			r.markSeen(hdr.ID)
+			fwdHdr := Header{
+				ID:     hdr.ID,
+				Type:   MsgQuery,
+				TTL:    hdr.TTL - 1,
+				Hops:   hdr.Hops + 1,
+				Length: hdr.Length,
+			}
+			for _, pc := range r.livePeers() {
+				if pc == origin {
+					continue
+				}
+				_ = writeMessageToPeerConn(pc, fwdHdr, payload)
+			}
+		} else {
+			// Duplicate: still record? No, keep original origin.
+		}
+	}
+
 	return p.writeMessage(respHdr, hitPayload)
 }
 
-// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// handleQueryHit delivers an inbound QUERYHIT. If the descriptor ID
+// names a pending (forwarded) query, the hit is reverse-routed to the
+// origin peer; otherwise it is delivered to the search registry and the
+// OnQueryHit callback as before.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	r := p.opts.routing
+	if r != nil {
+		if origin, ok := r.pendingOrigin(hdr.ID); ok && origin != nil {
+			r.clearPending(hdr.ID)
+			fwdHdr := Header{
+				ID:     hdr.ID,
+				Type:   MsgQueryHit,
+				TTL:    hdr.TTL - 1,
+				Hops:   hdr.Hops + 1,
+				Length: uint32(len(payload)),
+			}
+			if fwdHdr.TTL == 0 {
+				fwdHdr.TTL = 1
+			}
+			_ = writeMessageToPeerConn(origin, fwdHdr, payload)
+			p.logf("forwarding queryhit to origin: id=%x hits=%d", hdr.ID, len(qh.Hits))
+			return nil
+		}
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
@@ -477,4 +529,17 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
 	return nil
+}
+
+// writeMessageToPeerConn writes a header+payload to pc using its mutex.
+func writeMessageToPeerConn(pc *peerConn, hdr Header, payload []byte) error {
+	buf := hdr.AppendTo(nil)
+	buf = append(buf, payload...)
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	_, err := pc.conn.Write(buf)
+	return err
 }

@@ -93,6 +93,16 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// routing is the engine's peer/routing registry. Run sets it; callers
+	// do not. Inbound QUERYs use it for forwarding and reverse routing.
+	routing *routingRegistry
+
+	// Aliases for alternate naming.
+	router        *routingRegistry
+	routingReg    *routingRegistry
+	peerRegistry  *routingRegistry
+	peersRegistry *routingRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +150,15 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// routing holds the live-peer set and query routing state.
+	routing *routingRegistry
+
+	// Aliases for alternate naming.
+	router        *routingRegistry
+	routingReg    *routingRegistry
+	peerRegistry  *routingRegistry
+	peersRegistry *routingRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,11 +167,17 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
+	rr := newRoutingRegistry()
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:         make(chan struct{}),
+		peers:         make(map[*peerConn]struct{}),
+		dialed:        make(map[string]struct{}),
+		searches:      newSearchRegistry(),
+		routing:       rr,
+		router:        rr,
+		routingReg:    rr,
+		peerRegistry:  rr,
+		peersRegistry: rr,
 	}
 }
 
@@ -183,6 +208,11 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.routing = e.routing
+	e.opts.router = e.routing
+	e.opts.routingReg = e.routing
+	e.opts.peerRegistry = e.routing
+	e.opts.peersRegistry = e.routing
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -224,15 +254,17 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.mu.Lock()
 		e.peers[pc] = struct{}{}
 		e.mu.Unlock()
+		e.routing.registerPeer(pc)
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, pc); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			e.routing.unregisterPeer(pc)
 		}(conn, pc)
 	}
 
@@ -317,12 +349,14 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			e.routing.registerPeer(pc)
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, pc); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			e.routing.unregisterPeer(pc)
 			delay = dialBackoff
 			select {
 			case <-ctx.Done():
