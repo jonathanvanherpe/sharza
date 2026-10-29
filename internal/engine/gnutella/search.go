@@ -47,6 +47,15 @@ func (r *searchRegistry) register(id [idSize]byte) *pendingSearch {
 	return ps
 }
 
+// isRegistered reports whether id has an in-flight search on this node,
+// i.e. this node is the originator of the QUERY carrying id.
+func (r *searchRegistry) isRegistered(id [idSize]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.pending[id]
+	return ok
+}
+
 // deliver appends a hit to the search registered under id. A hit whose
 // id matches no in-flight search is dropped: it answers a query this
 // engine did not ask, and attributing it here would report another

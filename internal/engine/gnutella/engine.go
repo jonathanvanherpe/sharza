@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// forwarding is the shared forwarding table for QUERY/QUERYHIT
+	// routing. Run sets it; callers do not.
+	forwarding *forwardingTable
+
+	// peers returns the engine's current live peer connections. Run
+	// sets it; callers do not. Used for fan-out when forwarding.
+	peers func() []*peerConn
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +148,11 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// forwarding correlates forwarded QUERYs with the upstream peer
+	// that sent them, so QUERYHITs can be routed back along the
+	// reverse path.
+	forwarding *forwardingTable
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -149,10 +162,11 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:      make(chan struct{}),
+		peers:      make(map[*peerConn]struct{}),
+		dialed:     make(map[string]struct{}),
+		searches:   newSearchRegistry(),
+		forwarding: newForwardingTable(),
 	}
 }
 
@@ -183,6 +197,16 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.forwarding = e.forwarding
+	e.opts.peers = func() []*peerConn {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		out := make([]*peerConn, 0, len(e.peers))
+		for pc := range e.peers {
+			out = append(out, pc)
+		}
+		return out
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -227,7 +251,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, pc, true, e.opts, e.laddr); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +341,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, pc, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()

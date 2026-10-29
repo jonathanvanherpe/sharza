@@ -28,7 +28,7 @@ func TestDecodeQueryMalformed(t *testing.T) {
 	}{
 		{"too short", []byte{0x01}},
 		{"no nul", []byte{0x10, 0x27, 0x74, 0x65, 0x73, 0x74}}, // speed 0x2710, "test"
-		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},      // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
+		{"empty search with nul?", []byte{0x00, 0x00, 0x00}},   // speed 0, then just nul - but our code expects search bytes before nul; this gives search empty string after nul? payload[2:] is [0x00], so idx 0 is nul, search becomes empty string - valid
 	}
 	for _, c := range cases {
 		if c.name == "empty search with nul?" {

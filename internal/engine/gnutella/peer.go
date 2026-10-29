@@ -51,6 +51,7 @@ const pongPayloadSize = 14
 // peer is one established-or-connecting TCP link.
 type peer struct {
 	conn    net.Conn
+	pc      *peerConn
 	inbound bool // accepted by us, rather than dialed by us
 	opts    Options
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
@@ -61,13 +62,15 @@ type peer struct {
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, pc *peerConn, inbound bool, opts Options, laddr net.Addr) error {
+	conn := pc.conn
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc:      pc,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -410,15 +413,59 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery responds to an inbound QUERY. When TTL > 1 it is forwarded
+// to every live peer except the one that sent it, so a search reaches
+// beyond the direct link. The local catalogue is always consulted and
+// its QUERYHIT is sent back to the sender. Duplicate GUIDs are dropped
+// so a QUERY cannot loop in a mesh.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
-	if _, err := DecodeQuery(payload); err != nil {
+	q, err := DecodeQuery(payload)
+	if err != nil {
 		p.logf("bad query from %s: %v", p.conn.RemoteAddr(), err)
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+	_ = q
+
+	// Duplicate-GUID suppression: drop a QUERY we originated ourselves
+	// (so a looped-back query does not get reprocessed) or have already
+	// seen/forwarded.
+	if p.opts.searches != nil && p.opts.searches.isRegistered(hdr.ID) {
+		p.logf("dropping looped-back query %x from %s", hdr.ID, p.conn.RemoteAddr())
+		return nil
+	}
+	if p.opts.forwarding != nil {
+		if !p.opts.forwarding.record(hdr.ID, p.pc) {
+			p.logf("dropping duplicate query %x from %s", hdr.ID, p.conn.RemoteAddr())
+			return nil
+		}
+	}
+
+	// Forward to all peers except the originator when TTL allows.
+	if hdr.TTL > 1 && p.opts.peers != nil {
+		fwdTTL := hdr.TTL - 1
+		fwdHops := hdr.Hops + 1
+		peers := p.opts.peers()
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    fwdTTL,
+			Hops:   fwdHops,
+			Length: uint32(len(payload)),
+		}
+		buf := fwdHdr.AppendTo(nil)
+		buf = append(buf, payload...)
+		for _, pc2 := range peers {
+			if pc2 == nil || pc2 == p.pc {
+				continue
+			}
+			if err := pc2.writeBytes(buf); err != nil {
+				p.logf("forward query to %s failed: %v", pc2.addr, err)
+			}
+		}
+	}
+
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -469,12 +516,58 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
-	if p.opts.searches != nil {
+
+	// If this node originated the QUERY, deliver locally.
+	originator := false
+	if p.opts.searches != nil && p.opts.searches.isRegistered(hdr.ID) {
+		originator = true
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
+
+	if originator {
+		if p.opts.OnQueryHit != nil {
+			p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
+		}
+		p.logf("queryhit from %s: id=%x hits=%d (local)", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+		return nil
+	}
+
+	// Otherwise forward back along the recorded reverse path, if any.
+	if p.opts.forwarding != nil {
+		if entry, ok := p.opts.forwarding.lookup(hdr.ID); ok && entry.upstream != nil && entry.upstream != p.pc {
+			if hdr.TTL > 1 {
+				fwdTTL := hdr.TTL - 1
+				fwdHops := hdr.Hops + 1
+				respHdr := Header{
+					ID:     hdr.ID,
+					Type:   MsgQueryHit,
+					TTL:    fwdTTL,
+					Hops:   fwdHops,
+					Length: uint32(len(payload)),
+				}
+				buf := respHdr.AppendTo(nil)
+				buf = append(buf, payload...)
+				if err := entry.upstream.writeBytes(buf); err != nil {
+					p.logf("forward queryhit to %s failed: %v", entry.upstream.addr, err)
+				}
+			}
+		}
+	}
+
 	if p.opts.OnQueryHit != nil {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
 	return nil
+}
+
+// writeBytes writes raw bytes to a peer connection under its mutex.
+func (pc *peerConn) writeBytes(b []byte) error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	_, err := pc.conn.Write(b)
+	return err
 }
