@@ -69,6 +69,10 @@ func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, l
 		laddr:   laddr,
 		logf:    opts.logf(),
 	}
+	if opts.pushes != nil {
+		opts.pushes.add(p)
+		defer opts.pushes.removePeer(p)
+	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetNoDelay(true)
@@ -290,9 +294,7 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
-		return nil
+		return p.handlePush(hdr, payload)
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
 		return nil
@@ -442,6 +444,7 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,
+		ClientID: p.opts.ServentID,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
@@ -469,6 +472,13 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+	// Via is the peer connection that delivered this hit: a requester
+	// uses it (through the push registry) to reach the servent that
+	// advertised the file.
+	qh.Via = p.conn.RemoteAddr()
+	if qh.ClientID != ([idSize]byte{}) && p.opts.pushes != nil {
+		p.opts.pushes.add(qh.ClientID, p)
+	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
@@ -476,5 +486,53 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+	return nil
+}
+
+// handlePush processes a PUSH message (0x40). If the target servent ID
+// is this engine's own, the request is recorded as a dial-back request.
+// Otherwise it is forwarded along the registered push path when the TTL
+// allows.
+func (p *peer) handlePush(hdr Header, payload []byte) error {
+	push, err := DecodePush(payload)
+	if err != nil {
+		p.logf("bad push from %s: %v", p.conn.RemoteAddr(), err)
+		return nil
+	}
+	if push.ClientID == p.opts.ServentID {
+		if p.opts.OnPush != nil {
+			p.opts.OnPush(p.conn.RemoteAddr(), push)
+		}
+		if p.opts.pushes != nil {
+			p.opts.pushes.record(push)
+		}
+		p.logf("push for us from %s: file=%d addr=%s:%d",
+			p.conn.RemoteAddr(), push.FileIndex, net.IP(push.IP[:]), push.Port)
+		return nil
+	}
+	// Forwarding requires at least one hop of TTL left to spend.
+	if hdr.TTL <= 1 {
+		p.logf("dropping push for %x from %s: TTL exhausted", push.ClientID, p.conn.RemoteAddr())
+		return nil
+	}
+	if p.opts.pushes == nil {
+		return nil
+	}
+	if peer, ok := p.opts.pushes.lookup(push.ClientID); ok && peer != nil {
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgPush,
+			TTL:    hdr.TTL - 1,
+			Hops:   hdr.Hops + 1,
+			Length: uint32(len(payload)),
+		}
+		if err := peer.writeMessage(fwdHdr, payload); err != nil {
+			p.logf("forward push for %x: %v", push.ClientID, err)
+		} else {
+			p.logf("forwarded push for %x from %s", push.ClientID, p.conn.RemoteAddr())
+		}
+	} else {
+		p.logf("no push path for %x from %s", push.ClientID, p.conn.RemoteAddr())
+	}
 	return nil
 }

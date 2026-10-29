@@ -90,9 +90,23 @@ type Options struct {
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
 
+	// OnPush is called when a Push message targeting this engine's own
+	// servent ID is received, i.e. a request to dial back and serve a
+	// file. It is runtime-only.
+	OnPush func(peer net.Addr, p Push)
+
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// ServentID is this engine's 16-byte servent identifier. Run
+	// generates one when it is zero. It is copied into Options so peers
+	// can read it.
+	ServentID [idSize]byte
+
+	// pushes is the push-path registry. Run wires it into Options so
+	// peers can register and look up push paths.
+	pushes *pushRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +154,17 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// ServentID is this engine's 16-byte servent identifier. Run
+	// generates one when it is zero.
+	ServentID [idSize]byte
+
+	// pushes is the push-path registry.
+	pushes *pushRegistry
+
+	// pushRequests records dial-back requests received for this engine's
+	// own servent ID.
+	pushRequests []Push
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +178,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		pushes:   newPushRegistry(),
 	}
 }
 
@@ -183,6 +209,39 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// Servent ID: honour one supplied by the caller (on either the
+	// Engine or the Options), otherwise generate one.
+	if e.ServentID == ([idSize]byte{}) && opts.ServentID != ([idSize]byte{}) {
+		e.ServentID = opts.ServentID
+	}
+	if e.ServentID == ([idSize]byte{}) {
+		e.ServentID = newDescriptorID()
+	}
+	e.opts.ServentID = e.ServentID
+	// Push registry shared with peers.
+	if e.pushes == nil {
+		e.pushes = newPushRegistry()
+	}
+	e.opts.pushes = e.pushes
+	// Record dial-back requests both in the registry and on the Engine,
+	// and preserve any caller-supplied OnPush callback.
+	if e.opts.OnPush != nil {
+		userOnPush := e.opts.OnPush
+		e.opts.OnPush = func(peer net.Addr, p Push) {
+			e.pushes.record(p)
+			e.mu.Lock()
+			e.pushRequests = append(e.pushRequests, p)
+			e.mu.Unlock()
+			userOnPush(peer, p)
+		}
+	} else {
+		e.opts.OnPush = func(peer net.Addr, p Push) {
+			e.pushes.record(p)
+			e.mu.Lock()
+			e.pushRequests = append(e.pushRequests, p)
+			e.mu.Unlock()
+		}
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -360,9 +419,34 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	e.mu.Lock()
 	logf := e.opts.Logf
+	pushes := e.pushes
+	laddr := e.laddr
 	e.mu.Unlock()
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
+	d.RequestPush = func() error {
+		if pushes == nil {
+			return ErrNoPushPath
+		}
+		if qh.ClientID == ([idSize]byte{}) {
+			return ErrNoPushPath
+		}
+		var ip [4]byte
+		var port uint16
+		if ta, ok := laddr.(*net.TCPAddr); ok {
+			if ip4 := ta.IP.To4(); ip4 != nil {
+				copy(ip[:], ip4)
+			}
+			port = uint16(ta.Port)
+		}
+		push := Push{
+			ClientID:  qh.ClientID,
+			FileIndex: hit.FileIndex,
+			IP:        ip,
+			Port:      port,
+		}
+		return pushes.send(qh.ClientID, push)
+	}
 	return d
 }
 

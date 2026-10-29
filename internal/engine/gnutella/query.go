@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 )
 
 const (
@@ -23,13 +24,19 @@ type Query struct {
 // QueryHit represents a Gnutella QUERYHIT message (0x81).
 // Payload: 1-byte hit count, 2-byte port (LE), 4-byte IPv4 (BE),
 // 4-byte speed (LE), then per hit: 4-byte file index, 4-byte size,
-// NUL-terminated name.
+// NUL-terminated name, then a trailing 16-byte servent/client ID.
 type QueryHit struct {
 	HitCount uint8
 	Port     uint16 // little-endian
 	IP       [4]byte
 	Speed    uint32 // little-endian
 	Hits     []FileHit
+	// ClientID is the servent ID of the peer that can push this file.
+	// It is carried as a trailing 16-byte field on the wire.
+	ClientID [idSize]byte
+	// Via is the address of the peer connection that delivered this hit.
+	// It is runtime-only and is not encoded on the wire.
+	Via net.Addr
 }
 
 // FileHit is a single result in a QUERYHIT.
@@ -103,6 +110,8 @@ func EncodeQueryHit(qh QueryHit) []byte {
 		copy(hdr[8:], []byte(name))
 		out = append(out, hdr...)
 	}
+	// trailing servent/client ID (16 bytes), always present on the wire.
+	out = append(out, qh.ClientID[:]...)
 	return out
 }
 
@@ -144,5 +153,10 @@ func DecodeQueryHit(payload []byte) (QueryHit, error) {
 		}
 	}
 	qh.Hits = hits
+	// trailing servent/client ID, optional for backward compatibility
+	// with payloads that omit it.
+	if pos+idSize <= len(payload) {
+		copy(qh.ClientID[:], payload[pos:pos+idSize])
+	}
 	return qh, nil
 }
