@@ -56,18 +56,23 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+
+	eng *Engine   // owning engine, if any
+	pc  *peerConn // this connection's entry in engine.peers
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, eng *Engine, pc *peerConn) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		eng:     eng,
+		pc:      pc,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -419,7 +424,22 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
-	// Build QUERYHIT from catalogue.
+
+	// Duplicate suppression: a query we have already seen (either our own
+	// or one forwarded earlier) is dropped, not answered or re-forwarded.
+	if p.eng != nil && p.eng.isSeenQuery(hdr.ID) {
+		p.logf("suppressing duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+	if p.eng != nil {
+		p.eng.markSeenQuery(hdr.ID)
+		// Reverse path: remember who sent this query so a QUERYHIT can
+		// be routed back along the same hop.
+		p.eng.recordUpstream(hdr.ID, p.pc)
+	}
+
+	// Answer locally as today: build a QUERYHIT from the catalogue and
+	// send it back to the peer that asked.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
 	for _, fe := range cat {
@@ -429,7 +449,6 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 			FileName:  fe.Name,
 		})
 	}
-	// Get our IP to put in QUERYHIT (same logic as PONG).
 	var ip4 [4]byte
 	if ta, ok := p.conn.LocalAddr().(*net.TCPAddr); ok {
 		if ip := ta.IP.To4(); ip != nil {
@@ -440,22 +459,46 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		HitCount: uint8(len(hits)),
 		Port:     p.listenPort(),
 		IP:       ip4,
-		Speed:    0, // speed not specified; 0 is fine
+		Speed:    0,
 		Hits:     hits,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
-		ID:     hdr.ID, // echo descriptor ID
+		ID:     hdr.ID,
 		Type:   MsgQueryHit,
 		TTL:    hdr.TTL - 1,
 		Hops:   0,
 		Length: uint32(len(hitPayload)),
 	}
 	if respHdr.TTL == 0 {
-		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
+		respHdr.TTL = 1
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	// Forward the QUERY to every other peer when there is still horizon
+	// left, decrementing TTL and incrementing Hops per the spec.
+	if hdr.TTL > 1 && p.eng != nil {
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    hdr.TTL - 1,
+			Hops:   hdr.Hops + 1,
+			Length: uint32(len(payload)),
+		}
+		peers := p.eng.snapshotPeersExcept(p.pc)
+		for _, pc := range peers {
+			buf := fwdHdr.AppendTo(nil)
+			buf = append(buf, payload...)
+			pc.mu.Lock()
+			_ = pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_, _ = pc.conn.Write(buf)
+			pc.mu.Unlock()
+		}
+	}
+	return nil
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
@@ -468,6 +511,30 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	// Reverse-path routing: if we recorded an upstream for this descriptor
+	// ID, forward the hit back along the path the query took instead of
+	// delivering it locally.
+	if p.eng != nil {
+		if up := p.eng.upstreamFor(hdr.ID); up != nil {
+			if hdr.TTL > 1 {
+				fwdHdr := Header{
+					ID:     hdr.ID,
+					Type:   MsgQueryHit,
+					TTL:    hdr.TTL - 1,
+					Hops:   hdr.Hops + 1,
+					Length: uint32(len(payload)),
+				}
+				buf := fwdHdr.AppendTo(nil)
+				buf = append(buf, payload...)
+				up.mu.Lock()
+				_ = up.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				_, _ = up.conn.Write(buf)
+				up.mu.Unlock()
+			}
+			p.logf("routing queryhit upstream from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+			return nil
+		}
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
