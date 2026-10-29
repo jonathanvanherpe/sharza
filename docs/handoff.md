@@ -247,6 +247,14 @@ the length header, the `Range` header, the `Accept` header, the `Connection`
 header, the declared-size check, the body-length check, and the name
 sanitiser each turned its guarding test red before being reverted.
 
+## Open questions (query forwarding slice)
+
+This slice adds QUERY forwarding and reverse-path QUERYHIT routing
+(routeTable, forwardToPeers, handleQuery/handleQueryHit updates,
+Engine.Search remembering its descriptor ID). Push, browse host, RPC
+wiring of Search, and differential testing against gtk-gnutella remain
+out of scope per the task brief.
+
 ## Open questions
 
 ### Download client: decisions left open

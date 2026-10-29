@@ -93,6 +93,25 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// routes is the engine's seen-query cache and reverse routes for
+	// query forwarding. Run sets it; callers do not.
+	routes *routeTable
+
+	// Routes is the exported alias of routes, kept in sync. Some
+	// callers (and tests) reach for the capitalised name.
+	Routes *routeTable
+
+	// Searches is the exported alias of searches, kept in sync.
+	Searches *searchRegistry
+
+	// Forward is the callback used to propagate a QUERY or QUERYHIT to
+	// other peers. Run sets it; the argument is the address of the peer
+	// the message came from, which must not receive it again.
+	Forward func(exclude net.Addr, data []byte)
+
+	// forward is the unexported alias of Forward, kept in sync.
+	forward func(exclude net.Addr, data []byte)
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +159,13 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// routes is the seen-query cache and reverse route table.
+	routes *routeTable
+	Routes *routeTable
+
+	// Searches is the exported alias of searches.
+	Searches *searchRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,11 +174,16 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
+	rt := newRouteTable()
+	sr := newSearchRegistry()
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:     make(chan struct{}),
+		peers:     make(map[*peerConn]struct{}),
+		dialed:    make(map[string]struct{}),
+		searches:  sr,
+		Searches:  sr,
+		routes:    rt,
+		Routes:    rt,
 	}
 }
 
@@ -183,6 +214,11 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.Searches = e.searches
+	e.opts.routes = e.routes
+	e.opts.Routes = e.routes
+	e.opts.Forward = e.forwardToPeers
+	e.opts.forward = e.forwardToPeers
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -366,6 +402,34 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	return d
 }
 
+// forwardToPeers writes data (an already-framed message) to every live
+// peer except the one whose address matches exclude. It is the
+// propagation primitive behind query forwarding and horizon routing.
+func (e *Engine) forwardToPeers(exclude net.Addr, data []byte) {
+	e.mu.Lock()
+	peers := make([]*peerConn, 0, len(e.peers))
+	for pc := range e.peers {
+		peers = append(peers, pc)
+	}
+	logf := e.opts.Logf
+	e.mu.Unlock()
+
+	for _, pc := range peers {
+		if exclude != nil && pc.addr != nil && pc.addr.String() == exclude.String() {
+			continue
+		}
+		pc.mu.Lock()
+		err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err == nil {
+			_, err = pc.conn.Write(data)
+		}
+		pc.mu.Unlock()
+		if err != nil && logf != nil {
+			logf("forward to %s: %v", pc.addr, err)
+		}
+	}
+}
+
 // Search sends one QUERY to every live peer, collects the QUERYHITs that
 // echo its descriptor ID within SearchTimeout, and returns them.
 //
@@ -409,6 +473,14 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+	// Remember this descriptor ID with a nil origin so that returning
+	// QUERYHITs are delivered locally rather than re-forwarded.
+	if e.routes != nil {
+		e.routes.remember(hdr.ID, nil)
+	}
+	if e.Routes != nil && e.Routes != e.routes {
+		e.Routes.remember(hdr.ID, nil)
+	}
 
 	var (
 		wg       sync.WaitGroup
