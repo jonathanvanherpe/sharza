@@ -140,6 +140,16 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// seenQueries is the duplicate-suppression set for forwarded QUERYs,
+	// keyed by descriptor ID with an expiry. A query whose ID is already
+	// present is dropped without being answered or forwarded again.
+	seenQueries map[[idSize]byte]time.Time
+
+	// forwarding maps a QUERY descriptor ID to the upstream peer that
+	// sent us the query, so a QUERYHIT can be routed back along the
+	// reverse path.
+	forwarding map[[idSize]byte]forwardingEntry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -149,10 +159,12 @@ type Engine struct {
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:       make(chan struct{}),
+		peers:       make(map[*peerConn]struct{}),
+		dialed:      make(map[string]struct{}),
+		searches:    newSearchRegistry(),
+		seenQueries: make(map[[idSize]byte]time.Time),
+		forwarding:  make(map[[idSize]byte]forwardingEntry),
 	}
 }
 
@@ -227,7 +239,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, e); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +329,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, e); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -384,8 +396,12 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 func (e *Engine) Search(text string) ([]QueryHit, error) {
 	q := Query{MinSpeed: 0, Search: text}
 	payload := EncodeQuery(q)
+	id := newDescriptorID()
+	// Mark our own query as seen so a copy that loops back to us is
+	// suppressed instead of being answered by our own catalogue.
+	e.seenQuery(id)
 	hdr := Header{
-		ID:     newDescriptorID(),
+		ID:     id,
 		Type:   MsgQuery,
 		TTL:    7, // direct peer, TTL can be modest
 		Hops:   0,
