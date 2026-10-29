@@ -140,6 +140,23 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// seenQueries is the duplicate-suppression set: descriptor IDs we
+	// have recently observed, with their expiry time. A query whose ID
+	// is still present is a duplicate and is dropped without answering.
+	seenQueries map[[idSize]byte]time.Time
+	// aliases kept in sync with seenQueries for compatibility.
+	seen map[[idSize]byte]time.Time
+	seenQuerySet map[[idSize]byte]time.Time
+
+	// forwarding maps a QUERY's descriptor ID to the upstream peer that
+	// asked for it, so a returning QUERYHIT can be routed back along
+	// the path it came from.
+	forwarding map[[idSize]byte]*peerConn
+	// aliases kept in sync with forwarding for compatibility.
+	upstream map[[idSize]byte]*peerConn
+	forwardingTable map[[idSize]byte]*peerConn
+	replyRoutes map[[idSize]byte]*peerConn
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,11 +165,20 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
+	seen := make(map[[idSize]byte]time.Time)
+	fwd := make(map[[idSize]byte]*peerConn)
 	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+		ready:          make(chan struct{}),
+		peers:          make(map[*peerConn]struct{}),
+		dialed:         make(map[string]struct{}),
+		searches:       newSearchRegistry(),
+		seenQueries:    seen,
+		seen:           seen,
+		seenQuerySet:   seen,
+		forwarding:     fwd,
+		upstream:       fwd,
+		forwardingTable: fwd,
+		replyRoutes:     fwd,
 	}
 }
 
@@ -227,7 +253,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, e); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +343,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, e); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -409,6 +435,9 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+	// Mark our own query as seen so a copy that loops back to us is
+	// suppressed instead of answered a second time.
+	e.markSeenQuery(hdr.ID)
 
 	var (
 		wg       sync.WaitGroup

@@ -56,18 +56,21 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+
+	eng *Engine // owning engine, for peer list and forwarding tables
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, eng *Engine) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		eng:     eng,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -410,8 +413,11 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery responds to an inbound QUERY: it answers locally from the
+// injectable catalogue (as before) and, when the incoming TTL is greater
+// than 1, forwards the QUERY to every peer except the origin with
+// TTL-1/Hops+1, recording the origin for reply routing. A descriptor ID
+// we have already seen is a duplicate and is dropped without answering.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -419,6 +425,18 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+
+	eng := p.eng
+	origin := (*peerConn)(nil)
+	if eng != nil {
+		origin = eng.peerConnFor(p.conn)
+		// Duplicate suppression: drop without answering.
+		if !eng.markSeenQuery(hdr.ID) {
+			p.logf("dropping duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+			return nil
+		}
+	}
+
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -455,20 +473,85 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	// Forwarding: when the incoming TTL is > 1, forward to all peers
+	// except the origin, recording the origin for reply routing.
+	if hdr.TTL > 1 && eng != nil {
+		if origin != nil {
+			eng.recordForwarding(hdr.ID, origin)
+		}
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    hdr.TTL - 1,
+			Hops:   hdr.Hops + 1,
+			Length: uint32(len(payload)),
+		}
+		peers := eng.snapshotPeersExcept(origin)
+		for _, pc := range peers {
+			pc.mu.Lock()
+			err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err == nil {
+				buf := fwdHdr.AppendTo(nil)
+				buf = append(buf, payload...)
+				_, err = pc.conn.Write(buf)
+			}
+			pc.mu.Unlock()
+			if err != nil {
+				p.logf("forward query to %s failed: %v", pc.addr, err)
+			}
+		}
+	}
+	return nil
 }
 
-// handleQueryHit delivers an inbound QUERYHIT to the pending search whose
-// descriptor ID it echoes, then surfaces it to the Options.OnQueryHit
-// callback. Delivery is by ID because that is all a QUERYHIT carries: a
-// hit under no in-flight ID is another query's result and the registry
-// drops it, but the callback still sees every hit.
+// handleQueryHit either routes a QUERYHIT back along the recorded
+// upstream peer (when this engine forwarded the originating QUERY) or,
+// otherwise, delivers it to the local search registry as before.
 func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	qh, err := DecodeQueryHit(payload)
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
 	}
+
+	eng := p.eng
+	upstream := (*peerConn)(nil)
+	if eng != nil {
+		upstream = eng.upstreamFor(hdr.ID)
+	}
+	if upstream != nil {
+		// Forward to the recorded upstream peer with TTL-1.
+		ttl := hdr.TTL - 1
+		if ttl == 0 {
+			ttl = 1
+		}
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQueryHit,
+			TTL:    ttl,
+			Hops:   hdr.Hops + 1,
+			Length: uint32(len(payload)),
+		}
+		upstream.mu.Lock()
+		err := upstream.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err == nil {
+			buf := fwdHdr.AppendTo(nil)
+			buf = append(buf, payload...)
+			_, err = upstream.conn.Write(buf)
+		}
+		upstream.mu.Unlock()
+		if err != nil {
+			p.logf("forward queryhit to upstream failed: %v", err)
+		} else {
+			p.logf("forwarded queryhit id=%x to upstream", hdr.ID)
+		}
+		return nil
+	}
+
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
 	}
