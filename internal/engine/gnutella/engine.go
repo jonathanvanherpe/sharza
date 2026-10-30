@@ -93,6 +93,12 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// engine is the owning engine, set by Run. Unexported.
+	engine *Engine
+
+	// forwarding is the engine's forwarding registry, set by Run.
+	forwarding *forwardingRegistry
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +146,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// forwarding handles multi-hop QUERY/QUERYHIT routing.
+	forwarding *forwardingRegistry
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,12 +157,14 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
-	return &Engine{
+	e := &Engine{
 		ready:    make(chan struct{}),
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
 	}
+	e.forwarding = newForwardingRegistry(e)
+	return e
 }
 
 // Ready is closed once Run has bound the listener. It never closes if
@@ -183,6 +194,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.forwarding = e.forwarding
+	e.opts.engine = e
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -408,6 +421,9 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	}
 
 	// Register before any write: the answer can arrive first.
+	if e.forwarding != nil {
+		e.forwarding.MarkSeen(hdr.ID)
+	}
 	reg.register(hdr.ID)
 
 	var (

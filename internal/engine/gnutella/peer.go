@@ -419,6 +419,12 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+	// Duplicate suppression: a descriptor ID we have already seen is not
+	// answered or forwarded again.
+	if p.opts.forwarding != nil && p.opts.forwarding.Seen(hdr.ID) {
+		p.logf("suppressing duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -455,7 +461,13 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	err := p.writeMessage(respHdr, hitPayload)
+	// Multi-hop forwarding: after answering locally, forward the QUERY to
+	// every other peer so the search reaches past the direct link.
+	if p.opts.forwarding != nil {
+		p.opts.forwarding.ForwardQuery(p, hdr, payload)
+	}
+	return err
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
@@ -468,6 +480,12 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	// Reverse-path routing happens before delivery to the registry or
+	// callback, so a QUERYHIT that arrived from a downstream peer is sent
+	// back along the link the original QUERY came in on.
+	if p.opts.forwarding != nil {
+		p.opts.forwarding.RouteQueryHit(p, hdr, payload)
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
