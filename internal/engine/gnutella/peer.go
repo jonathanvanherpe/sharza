@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -429,16 +430,31 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 			FileName:  fe.Name,
 		})
 	}
-	// Get our IP to put in QUERYHIT (same logic as PONG).
+	// Get our IP to put in QUERYHIT (same logic as PONG), unless an
+	// explicit download address was configured, in which case advertise
+	// that instead so the querying peer fetches from the right source.
+	port := p.listenPort()
 	var ip4 [4]byte
-	if ta, ok := p.conn.LocalAddr().(*net.TCPAddr); ok {
+	if addr := p.opts.DownloadAddr; addr != "" {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				if v4 := ip.To4(); v4 != nil {
+					copy(ip4[:], v4)
+				}
+			}
+			if n, err := strconv.Atoi(portStr); err == nil && n > 0 && n <= 65535 {
+				port = uint16(n)
+			}
+		}
+	} else if ta, ok := p.conn.LocalAddr().(*net.TCPAddr); ok {
 		if ip := ta.IP.To4(); ip != nil {
 			copy(ip4[:], ip)
 		}
 	}
 	qh := QueryHit{
 		HitCount: uint8(len(hits)),
-		Port:     p.listenPort(),
+		Port:     port,
 		IP:       ip4,
 		Speed:    0, // speed not specified; 0 is fine
 		Hits:     hits,

@@ -79,6 +79,14 @@ type Options struct {
 	// Catalogue is the local file list used to answer incoming QUERYs.
 	Catalogue []FileEntry
 
+	// DownloadAddr, when non-empty, is the host:port advertised in the
+	// IP/Port fields of QUERYHITs built from Catalogue, i.e. where the
+	// advertised files can be fetched over HTTP. Empty (the default)
+	// advertises this engine's own listener address, which is correct
+	// for a servent that serves downloads on its Gnutella port. Tests set
+	// it to point at an httptest server carrying the file bytes.
+	DownloadAddr string
+
 	// SearchTimeout is the window Search waits for QUERYHITs after
 	// writing its QUERY, before returning the hits it has. Zero means
 	// the default 5 s.
