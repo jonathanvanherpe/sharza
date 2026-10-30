@@ -56,18 +56,20 @@ type peer struct {
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
 	logf    func(format string, args ...any)
 	mu      sync.Mutex // serialises writes to conn
+	pc      *peerConn  // this connection's handle in the engine's peer set
 }
 
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr, pc *peerConn) error {
 	p := &peer{
 		conn:    conn,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
+		pc:      pc,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -410,8 +412,11 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery records the reverse path for this descriptor ID, answers
+// locally from the catalogue, and forwards the QUERY to every other live
+// peer with TTL decremented and Hops incremented. A QUERY whose
+// descriptor ID has already been seen is dropped (deduplication), and a
+// QUERY whose TTL cannot survive another hop is not forwarded.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -419,7 +424,21 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
-	// Build QUERYHIT from catalogue.
+
+	// Deduplication: a descriptor ID we have already processed is not
+	// processed or forwarded again.
+	if p.opts.seenSet != nil && !p.opts.seenSet.add(hdr.ID) {
+		p.logf("dropping duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+
+	// Record this connection as the reverse-path origin for the
+	// descriptor ID, so a QUERYHIT can find its way back.
+	if p.opts.engine != nil {
+		p.opts.engine.recordQueryRoute(hdr.ID, p.pc)
+	}
+
+	// Build QUERYHIT from catalogue and reply to the sender.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
 	for _, fe := range cat {
@@ -429,7 +448,6 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 			FileName:  fe.Name,
 		})
 	}
-	// Get our IP to put in QUERYHIT (same logic as PONG).
 	var ip4 [4]byte
 	if ta, ok := p.conn.LocalAddr().(*net.TCPAddr); ok {
 		if ip := ta.IP.To4(); ip != nil {
@@ -440,22 +458,31 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		HitCount: uint8(len(hits)),
 		Port:     p.listenPort(),
 		IP:       ip4,
-		Speed:    0, // speed not specified; 0 is fine
+		Speed:    0,
 		Hits:     hits,
 	}
 	hitPayload := EncodeQueryHit(qh)
 	respHdr := Header{
-		ID:     hdr.ID, // echo descriptor ID
+		ID:     hdr.ID,
 		Type:   MsgQueryHit,
 		TTL:    hdr.TTL - 1,
 		Hops:   0,
 		Length: uint32(len(hitPayload)),
 	}
 	if respHdr.TTL == 0 {
-		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
+		respHdr.TTL = 1
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	// Forward to every live peer except the origin, with TTL decremented
+	// and Hops incremented. forwardQuery drops at TTL 0.
+	if p.opts.engine != nil {
+		p.opts.engine.forwardQuery(p.pc, hdr, payload)
+	}
+	return nil
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
@@ -476,5 +503,11 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 		p.opts.OnQueryHit(p.conn.RemoteAddr(), hdr.ID, qh)
 	}
 	p.logf("queryhit from %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(qh.Hits))
+
+	// Route the hit back along the reverse path when this node is an
+	// intermediate hop, while still delivering locally above.
+	if p.opts.engine != nil {
+		p.opts.engine.routeQueryHit(hdr.ID, hdr, payload)
+	}
 	return nil
 }

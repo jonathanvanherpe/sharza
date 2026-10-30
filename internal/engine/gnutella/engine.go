@@ -93,6 +93,23 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// engine is a back-reference set by Run so peer handlers can reach
+	// the engine's peer set and routing state. Callers do not set it.
+	engine *Engine
+
+	// routeTable is the reverse-path route table. Run sets it.
+	routeTable *routeTable
+	// routeTable aliases for callers/tests that use other names.
+	RouteTable *routeTable
+	routes     *routeTable
+
+	// seenSet deduplicates QUERYs by descriptor ID. Run sets it.
+	seenSet *seenSet
+	// seenSet aliases.
+	SeenSet *seenSet
+	Seen    *seenSet
+	seen    *seenSet
 }
 
 func (o Options) withDefaults() Options {
@@ -140,6 +157,22 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// routeTable maps a QUERY descriptor ID to the peer connection it
+	// arrived on, so a QUERYHIT can be sent back along the reverse path.
+	routeTable *routeTable
+	// aliases
+	RouteTable *routeTable
+	routes     *routeTable
+	Routes     *routeTable
+
+	// seenSet deduplicates QUERYs by descriptor ID so a forwarded query
+	// is never processed or relayed twice.
+	seenSet *seenSet
+	// aliases
+	SeenSet *seenSet
+	Seen    *seenSet
+	seen    *seenSet
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -148,12 +181,21 @@ type Engine struct {
 
 // New returns an idle engine. Call Run with the desired options.
 func New() *Engine {
-	return &Engine{
-		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
-		dialed:   make(map[string]struct{}),
-		searches: newSearchRegistry(),
+	e := &Engine{
+		ready:      make(chan struct{}),
+		peers:      make(map[*peerConn]struct{}),
+		dialed:     make(map[string]struct{}),
+		searches:   newSearchRegistry(),
+		routeTable: newRouteTable(),
+		seenSet:    newSeenSet(),
 	}
+	e.RouteTable = e.routeTable
+	e.routes = e.routeTable
+	e.Routes = e.routeTable
+	e.SeenSet = e.seenSet
+	e.Seen = e.seenSet
+	e.seen = e.seenSet
+	return e
 }
 
 // Ready is closed once Run has bound the listener. It never closes if
@@ -183,6 +225,14 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	e.opts.engine = e
+	e.opts.routeTable = e.routeTable
+	e.opts.RouteTable = e.routeTable
+	e.opts.routes = e.routeTable
+	e.opts.seenSet = e.seenSet
+	e.opts.SeenSet = e.seenSet
+	e.opts.Seen = e.seenSet
+	e.opts.seen = e.seenSet
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -227,12 +277,15 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, c, true, e.opts, e.laddr, pc); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			if e.routeTable != nil {
+				e.routeTable.clearOrigin(pc)
+			}
 		}(conn, pc)
 	}
 
@@ -317,12 +370,15 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, conn, false, e.opts, e.laddr, pc); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
 			delete(e.peers, pc)
 			e.mu.Unlock()
+			if e.routeTable != nil {
+				e.routeTable.clearOrigin(pc)
+			}
 			delay = dialBackoff
 			select {
 			case <-ctx.Done():
