@@ -117,13 +117,6 @@ func (o Options) logf() func(format string, args ...any) {
 	return o.withDefaults().Logf
 }
 
-// Engine accepts and maintains Gnutella 0.6 peer connections.
-type peerConn struct {
-	conn net.Conn
-	addr net.Addr
-	mu   sync.Mutex
-}
-
 type Engine struct {
 	mu      sync.Mutex
 	started bool
@@ -134,7 +127,11 @@ type Engine struct {
 	ready chan struct{}
 	wg    sync.WaitGroup
 
-	peers map[*peerConn]struct{}
+	peers    map[*peer]struct{}
+
+	// forwards is the query-forwarding registry: seen-set for
+	// duplicate suppression and reverse-path map for QUERYHIT routing.
+	forwards *forwardRegistry
 
 	// searches correlates inbound QUERYHITs with the Search that asked
 	// for them, by descriptor ID.
@@ -150,7 +147,8 @@ type Engine struct {
 func New() *Engine {
 	return &Engine{
 		ready:    make(chan struct{}),
-		peers:    make(map[*peerConn]struct{}),
+		peers:    make(map[*peer]struct{}),
+		forwards: newForwardRegistry(),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
 	}
@@ -220,20 +218,13 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("gnutella: accept: %w", err)
 		}
-		pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-		e.mu.Lock()
-		e.peers[pc] = struct{}{}
-		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(c net.Conn, pc *peerConn) {
+		go func(c net.Conn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, e, c, true, e.opts, e.laddr); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
-			e.mu.Lock()
-			delete(e.peers, pc)
-			e.mu.Unlock()
-		}(conn, pc)
+		}(conn)
 	}
 
 	// Wait is safe from Add-after-Wait because every goroutine that
@@ -313,16 +304,9 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 		if err != nil {
 			logf("dial %s failed: %v (retrying in %s)", addr, err, delay)
 		} else {
-			pc := &peerConn{conn: conn, addr: conn.RemoteAddr()}
-			e.mu.Lock()
-			e.peers[pc] = struct{}{}
-			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, e, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
-			e.mu.Lock()
-			delete(e.peers, pc)
-			e.mu.Unlock()
 			delay = dialBackoff
 			select {
 			case <-ctx.Done():
@@ -395,7 +379,7 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	buf = append(buf, payload...)
 
 	e.mu.Lock()
-	peers := make([]*peerConn, 0, len(e.peers))
+	peers := make([]*peer, 0, len(e.peers))
 	for pc := range e.peers {
 		peers = append(peers, pc)
 	}
@@ -418,15 +402,9 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 	)
 	for _, pc := range peers {
 		wg.Add(1)
-		go func(pc *peerConn) {
+		go func(pc *peer) {
 			defer wg.Done()
-			pc.mu.Lock()
-			defer pc.mu.Unlock()
-			err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if err == nil {
-				_, err = pc.conn.Write(buf)
-			}
-			if err != nil {
+			if err := pc.write(buf); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
