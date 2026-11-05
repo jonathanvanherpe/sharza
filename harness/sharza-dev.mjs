@@ -407,7 +407,7 @@ async function main(argv) {
         "Waiting for pending PR(s) before next task:\n" + pendingSummary,
         { title: "Sharza harness", priority: "default", tags: ["hourglass"] },
       );
-      await sleep(300_000);
+      await sleep(3_600_000);
       return 0;
     }
   }
