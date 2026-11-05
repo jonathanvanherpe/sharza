@@ -186,6 +186,54 @@ function apiRequest({ method, path, token, body, timeoutMs = 20_000 }) {
   });
 }
 
+
+/**
+ * Fetch the current state of a pull request.
+ *
+ * @returns {Promise<{ok: boolean, state: string, merged: boolean, url?: string, error?: string}>}
+ */
+export async function pullRequestState({ owner, repo, number, token, timeoutMs = 20_000 }) {
+  const res = await apiRequest({
+    method: "GET",
+    path: `/repos/${owner}/${repo}/pulls/${number}`,
+    token,
+    timeoutMs,
+  });
+  if (res.status < 200 || res.status >= 300 || !res.json) {
+    return { ok: false, state: "unknown", merged: false, error: res.raw };
+  }
+  return {
+    ok: true,
+    state: res.json.state ?? "unknown",
+    merged: Boolean(res.json.merged),
+    url: res.json.html_url,
+  };
+}
+
+
+
+/**
+ * Assign users to a pull request (via the issues endpoint, which is how
+ * GitHub models PR assignees).
+ *
+ * @returns {Promise<{ok: boolean, error?: string}>}
+ */
+export async function assignPullRequest({ owner, repo, number, assignees, token, timeoutMs = 20_000 }) {
+  if (!token || !assignees || assignees.length === 0) return { ok: true };
+  const res = await apiRequest({
+    method: "POST",
+    path: `/repos/${owner}/${repo}/issues/${number}/assignees`,
+    token,
+    timeoutMs,
+    body: { assignees },
+  });
+  if (res.status < 200 || res.status >= 300) {
+    return { ok: false, error: res.raw };
+  }
+  return { ok: true };
+}
+
+
 /** DNS lookup that only ever returns IPv4 addresses. See the file header. */
 function ipv4Only(hostname, options, callback) {
   const done = typeof options === "function" ? options : callback;

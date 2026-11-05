@@ -27,7 +27,7 @@ import path from "node:path";
 
 import { notify, sleep } from "./ntfy.mjs";
 import { route, reportCooldown, cooledDown, classifyDifficulty } from "./router.mjs";
-import { createPullRequest, parseRemote, compareUrl, resolveGitHubToken } from "./github.mjs";
+import { createPullRequest, parseRemote, compareUrl, resolveGitHubToken, pullRequestState, assignPullRequest } from "./github.mjs";
 
 const exec = promisify(execFile);
 
@@ -298,7 +298,8 @@ async function main(argv) {
     return hit ? hit.slice(name.length + 3) : null;
   };
 
-  const state = loadState();
+  let state = loadState();
+  const pendingPRs = Array.isArray(state.pendingPRs) ? [...state.pendingPRs] : [];
 
   if (args.has("--test-notify")) {
     const res = await notify("Sharza harness test notification. Nothing to do.", {
@@ -319,6 +320,47 @@ async function main(argv) {
   const dryRun = args.has("--dry-run");
   const forcedTask = valueOf("task");
 
+  const token = resolveGitHubToken();
+  let remoteInfo = null;
+  if (gitSucceeds(["remote", "get-url", "origin"])) {
+    remoteInfo = parseRemote(git(["remote", "get-url", "origin"]));
+  }
+
+  // Refresh pending PR state: drop merged/closed ones and notify.
+  if (remoteInfo && token && pendingPRs.length > 0) {
+    const stillOpen = [];
+    for (const pr of pendingPRs) {
+      const st = await pullRequestState({
+        owner: remoteInfo.owner,
+        repo: remoteInfo.repo,
+        number: pr.number,
+        token,
+      });
+      if (st.merged) {
+        await notify(`PR #${pr.number} merged.\n${pr.task}`, {
+          title: "Sharza harness",
+          priority: "default",
+          tags: ["white_check_mark"],
+          url: pr.url,
+        });
+      } else if (st.state === "closed") {
+        await notify(`PR #${pr.number} closed without merge.\n${pr.task}`, {
+          title: "Sharza harness",
+          priority: "high",
+          tags: ["x"],
+          url: pr.url,
+        });
+      } else {
+        stillOpen.push(pr);
+      }
+    }
+    if (stillOpen.length !== pendingPRs.length) {
+      pendingPRs.length = 0;
+      pendingPRs.push(...stillOpen);
+      saveState({ ...loadState(), pendingPRs });
+    }
+  }
+
   // Pick a model up front so selection uses the same routed model as the
   // build instead of opencode's configured default.
   const initialExclude = await cooledDown();
@@ -326,6 +368,18 @@ async function main(argv) {
   const selectionModel = initialRoute.available ? initialRoute.model : undefined;
 
   // 1. Select.
+  // If a PR is pending, tell the selector to only proceed when the next
+  // item is independent of it; otherwise have it say WAIT so we can sleep
+  // instead of re-deriving the same task.
+  const pendingSummary = pendingPRs.map((pr) => `- #${pr.number}: ${pr.task}`).join("\n");
+  const selectionPrompt = pendingPRs.length > 0 && !forcedTask
+    ? "There are pending pull requests:\n" + pendingSummary +
+      "\n\nRun the /next-task command. If the selected item is independent of " +
+      "ALL of them (no overlapping files, subsystems, or protocol area), output " +
+      "only the task brief. Otherwise output exactly WAIT and nothing else."
+    : "Run the /next-task command and output only the task brief it produces. " +
+      "Do not start implementing anything.";
+
   let task;
   if (forcedTask) {
     task = forcedTask;
@@ -333,9 +387,7 @@ async function main(argv) {
     const picked = await runAgent({
       model: selectionModel,
       agent: null,
-      prompt:
-        "Run the /next-task command and output only the task brief it produces. " +
-        "Do not start implementing anything.",
+      prompt: selectionPrompt,
       sessionTitle: "sharza: select next task",
       timeoutMs: 900_000,
     });
@@ -348,6 +400,15 @@ async function main(argv) {
       });
       console.error(picked.stderr || "no task brief produced");
       return 1;
+    }
+    if (task === "WAIT") {
+      console.log("next task is not independent of pending PR(s); waiting");
+      await notify(
+        "Waiting for pending PR(s) before next task:\n" + pendingSummary,
+        { title: "Sharza harness", priority: "default", tags: ["hourglass"] },
+      );
+      await sleep(300_000);
+      return 0;
     }
   }
 
@@ -474,6 +535,7 @@ async function main(argv) {
       cycles: state.cycles + 1,
       lastTask: task,
       lastResult: why,
+      pendingPRs,
       history: [
         ...(state.history ?? []),
         { at: new Date().toISOString(), branch, task: task.split("\n")[0], result: why },
@@ -509,22 +571,31 @@ async function main(argv) {
   let prUrl = null;
   let prError = null;
   if (pushed) {
-    const token = resolveGitHubToken();
     const remote = parseRemote(git(["remote", "get-url", "origin"]));
     if (!remote) {
       prError = "could not parse the origin remote URL";
     } else if (!token) {
       prError = "no GITHUB_TOKEN (or GH_TOKEN) is set";
     } else {
+      const notifyUser = process.env.GITHUB_NOTIFY_USER || remote.owner;
       const pr = await createPullRequest({
         owner: remote.owner,
         repo: remote.repo,
         head: branch,
         base: "main",
         title: `${id}: ${task.split("\n")[0]}`,
-        body: buildPrBody({ task, verify }),
+        body: buildPrBody({ task, verify }) + "\n\n@" + notifyUser,
         token,
       });
+      if (pr.ok && pr.number) {
+        await assignPullRequest({
+          owner: remote.owner,
+          repo: remote.repo,
+          number: pr.number,
+          assignees: [notifyUser],
+          token,
+        });
+      }
       if (pr.ok) {
         prCreated = true;
         prUrl = pr.url;
@@ -533,6 +604,10 @@ async function main(argv) {
       }
     }
     if (!prUrl && remote) prUrl = compareUrl({ owner: remote.owner, repo: remote.repo, head: branch });
+  }
+
+  if (pushed && prCreated && pr.number) {
+    pendingPRs.push({ number: pr.number, url: prUrl, task: task.split("\n")[0], at: new Date().toISOString() });
   }
 
   const landed = pushed
@@ -546,6 +621,7 @@ async function main(argv) {
     cycles: state.cycles + 1,
     lastTask: task,
     lastResult: `branch ${branch} ${landed}${prUrl ? ` - ${prUrl}` : ""}`,
+    pendingPRs,
     history: [
       ...(state_.history ?? []),
       {
