@@ -51,6 +51,7 @@ const pongPayloadSize = 14
 // peer is one established-or-connecting TCP link.
 type peer struct {
 	conn    net.Conn
+	pc      *peerConn
 	inbound bool // accepted by us, rather than dialed by us
 	opts    Options
 	laddr   net.Addr // our listen address, used in Listen-IP and PONG
@@ -61,24 +62,25 @@ type peer struct {
 // serveConn runs one connection until the context ends, the peer dies,
 // or a protocol violation is seen, and returns why it stopped. A nil
 // return means the context was cancelled or the peer left cleanly.
-func serveConn(ctx context.Context, conn net.Conn, inbound bool, opts Options, laddr net.Addr) error {
+func serveConn(ctx context.Context, pc *peerConn, inbound bool, opts Options, laddr net.Addr) error {
 	p := &peer{
-		conn:    conn,
+		conn:    pc.conn,
+		pc:      pc,
 		inbound: inbound,
 		opts:    opts,
 		laddr:   laddr,
 		logf:    opts.logf(),
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	if tc, ok := pc.conn.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetNoDelay(true)
 	}
 	// Closing the connection is how an idle readLoop, blocked in
 	// DecodeHeader, is told the context ended.
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stopClose := context.AfterFunc(ctx, func() { _ = pc.conn.Close() })
 	defer stopClose()
 
-	r := bufio.NewReader(conn)
+	r := bufio.NewReader(pc.conn)
 	next := io.Reader(r)
 	var err error
 	if inbound {
@@ -410,8 +412,8 @@ func stripPort(hostport string) string {
 	return hostport
 }
 
-// handleQuery responds to an inbound QUERY with a QUERYHIT built from
-// the injectable local catalogue on Options.
+// handleQuery answers an inbound QUERY from the local catalogue and
+// forwards it to every other peer when its TTL allows another hop.
 func (p *peer) handleQuery(hdr Header, payload []byte) error {
 	// Decode QUERY to be good citizens (even if we don't filter by search).
 	if _, err := DecodeQuery(payload); err != nil {
@@ -419,6 +421,14 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		// Don't close connection on bad query; just ignore.
 		return nil
 	}
+
+	// Loop suppression: a query we have already seen (by descriptor ID)
+	// is dropped rather than answered or forwarded again.
+	if p.opts.routing != nil && p.opts.routing.markSeen(hdr.ID) {
+		p.logf("dropping duplicate query from %s: id=%x", p.conn.RemoteAddr(), hdr.ID)
+		return nil
+	}
+
 	// Build QUERYHIT from catalogue.
 	cat := p.opts.Catalogue
 	hits := make([]FileHit, 0, len(cat))
@@ -452,10 +462,39 @@ func (p *peer) handleQuery(hdr Header, payload []byte) error {
 		Length: uint32(len(hitPayload)),
 	}
 	if respHdr.TTL == 0 {
-		respHdr.TTL = 1 // direct link; clamp like ping->pong? but spec allows TTL decrement
+		respHdr.TTL = 1 // direct link; clamp like ping->pong
 	}
 	p.logf("replying queryhit to %s: id=%x hits=%d", p.conn.RemoteAddr(), hdr.ID, len(hits))
-	return p.writeMessage(respHdr, hitPayload)
+	if err := p.writeMessage(respHdr, hitPayload); err != nil {
+		return err
+	}
+
+	// Forwarding: when TTL allows another hop, record the reverse path
+	// and send the query to every peer except the one it came from.
+	if fwdTTL, ok := forwardTTL(hdr.TTL); ok {
+		if p.opts.routing != nil {
+			p.opts.routing.setReverse(hdr.ID, p.pc)
+		}
+		hops := forwardHops(hdr.Hops)
+		fwdHdr := Header{
+			ID:     hdr.ID,
+			Type:   MsgQuery,
+			TTL:    fwdTTL,
+			Hops:   hops,
+			Length: uint32(len(payload)),
+		}
+		fwdBuf := fwdHdr.AppendTo(nil)
+		fwdBuf = append(fwdBuf, payload...)
+		if p.opts.LivePeers != nil {
+			for _, pc := range p.opts.LivePeers() {
+				if pc == p.pc {
+					continue
+				}
+				_ = pc.write(fwdBuf)
+			}
+		}
+	}
+	return nil
 }
 
 // handleQueryHit delivers an inbound QUERYHIT to the pending search whose
@@ -468,6 +507,26 @@ func (p *peer) handleQueryHit(hdr Header, payload []byte) error {
 	if err != nil {
 		p.logf("bad queryhit from %s: %v", p.conn.RemoteAddr(), err)
 		return nil
+	}
+	// If this hit answers a query we forwarded, route it back along the
+	// reverse path instead of delivering it locally.
+	if p.opts.routing != nil {
+		if upstream, ok := p.opts.routing.getReverse(hdr.ID); ok {
+			if fwdTTL, ok2 := forwardTTL(hdr.TTL); ok2 {
+				fwdHdr := Header{
+					ID:     hdr.ID,
+					Type:   MsgQueryHit,
+					TTL:    fwdTTL,
+					Hops:   forwardHops(hdr.Hops),
+					Length: uint32(len(payload)),
+				}
+				fwdBuf := fwdHdr.AppendTo(nil)
+				fwdBuf = append(fwdBuf, payload...)
+				_ = upstream.write(fwdBuf)
+			}
+			p.logf("forwarding queryhit upstream: id=%x hits=%d", hdr.ID, len(qh.Hits))
+			return nil
+		}
 	}
 	if p.opts.searches != nil {
 		p.opts.searches.deliver(hdr.ID, qh)
