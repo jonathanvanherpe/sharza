@@ -27,7 +27,7 @@ import path from "node:path";
 
 import { notify, sleep } from "./ntfy.mjs";
 import { route, reportCooldown, cooledDown, classifyDifficulty } from "./router.mjs";
-import { createPullRequest, parseRemote, compareUrl } from "./github.mjs";
+import { createPullRequest, parseRemote, compareUrl, resolveGitHubToken } from "./github.mjs";
 
 const exec = promisify(execFile);
 
@@ -509,7 +509,7 @@ async function main(argv) {
   let prUrl = null;
   let prError = null;
   if (pushed) {
-    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+    const token = resolveGitHubToken();
     const remote = parseRemote(git(["remote", "get-url", "origin"]));
     if (!remote) {
       prError = "could not parse the origin remote URL";

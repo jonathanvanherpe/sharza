@@ -19,6 +19,9 @@
 
 import https from "node:https";
 import dns from "node:dns";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const API_HOST = "api.github.com";
 
@@ -46,6 +49,39 @@ export function parseRemote(url) {
   const [owner, repo] = clean.split("/");
   if (!owner || !repo) return null;
   return { owner, repo };
+}
+
+/**
+ * Resolve a GitHub token from the environment or a project-local, gitignored
+ * file, so a token can be kept with the repo without being committed.
+ *
+ * Lookup order: $GITHUB_TOKEN, $GH_TOKEN, then
+ *   harness/.state/github.env  (GITHUB_TOKEN=... or GH_TOKEN=...)
+ *   harness/.state/github.token (bare token)
+ *
+ * @returns {string}
+ */
+export function resolveGitHubToken() {
+  if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN.trim();
+  if (process.env.GH_TOKEN) return process.env.GH_TOKEN.trim();
+
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const candidates = [
+    path.join(root, "harness", ".state", "github.env"),
+    path.join(root, "harness", ".state", "github.token"),
+  ];
+  for (const file of candidates) {
+    let raw;
+    try {
+      raw = readFileSync(file, "utf8").trim();
+    } catch {
+      continue;
+    }
+    const m = raw.match(/^(?:GITHUB_TOKEN|GH_TOKEN)\s*=\s*(.+)$/m);
+    if (m) return m[1].trim().replace(/^['"]|['"]$/g, "");
+    if (/^(ghp_|github_pat_|gho_|ghu_|ghs_)/.test(raw)) return raw;
+  }
+  return "";
 }
 
 /** The URL a human can open to turn a pushed branch into a PR. */
