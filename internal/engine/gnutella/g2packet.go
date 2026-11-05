@@ -48,23 +48,23 @@ var ErrG2Trailing = errors.New("gnutella: trailing bytes after G2 packet")
 // cleanly into child packets.
 var ErrG2BadCompound = errors.New("gnutella: malformed compound G2 payload")
 
-// ErrG2ZeroHeader is returned when the first byte of a packet is zero.
-var ErrG2ZeroHeader = errors.New("gnutella: zero G2 packet header")
-
 // G2Packet is a Gnutella2 tree-structured packet. Type is the
-// variable-length type code (1..8 bytes). Payload holds the raw body of a
-// leaf packet; for a compound packet the parsed children are in Children
-// and Payload is nil. Compound marks a payload that contains nested child
-// packets; BigEndian selects big-endian length encoding.
+// variable-length type code (1..8 bytes, stored as a string so the
+// trailing NUL padding of the on-wire QWORD is not part of it on the
+// Go side? No: the exact bytes are preserved, including any NULs, so
+// round-tripping is exact). Compound marks a payload that contains
+// nested child packets; BigEndian selects big-endian length encoding.
+// Payload holds the raw body of a leaf packet; Children holds the parsed
+// children of a compound packet.
 type G2Packet struct {
-	Type      []byte
-	Payload   []byte
+	Type      string
 	Compound  bool
 	BigEndian bool
+	Payload   []byte
 	Children  []*G2Packet
 }
 
-// cloneBytes returns a copy of b (nil for nil input).
+// cloneBytes returns a copy of b.
 func cloneBytes(b []byte) []byte {
 	if b == nil {
 		return nil
@@ -74,12 +74,17 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
+// typeBytes returns the type code as bytes.
+func (p *G2Packet) typeBytes() []byte {
+	return []byte(p.Type)
+}
+
 // encodeG2Packet encodes a single packet to bytes.
 func encodeG2Packet(p *G2Packet) ([]byte, error) {
 	if p == nil {
 		return nil, errors.New("gnutella: nil G2 packet")
 	}
-	tb := p.Type
+	tb := []byte(p.Type)
 	if len(tb) == 0 || len(tb) > MaxG2TypeLen {
 		return nil, fmt.Errorf("gnutella: G2 type code length %d out of range", len(tb))
 	}
@@ -144,7 +149,7 @@ func decodeG2Packet(data []byte) (*G2Packet, int, error) {
 	}
 	first := data[0]
 	if first == 0 {
-		return nil, 0, ErrG2ZeroHeader
+		return nil, 0, errors.New("gnutella: zero G2 packet header")
 	}
 	nLenLen := int((first & 0xC0) >> 6)
 	if nLenLen == 0 || nLenLen > 3 {
@@ -182,7 +187,7 @@ func decodeG2Packet(data []byte) (*G2Packet, int, error) {
 	}
 
 	pkt := &G2Packet{
-		Type:      cloneBytes(data[typeStart:typeEnd]),
+		Type:      string(data[typeStart:typeEnd]),
 		Compound:  compound,
 		BigEndian: bigEndian,
 	}
@@ -190,13 +195,14 @@ func decodeG2Packet(data []byte) (*G2Packet, int, error) {
 	payload := data[typeEnd:total]
 
 	if compound {
+		// Parse children.
 		off := 0
 		for off < len(payload) {
 			child, n, err := decodeG2Packet(payload[off:])
 			if err != nil {
 				return nil, 0, fmt.Errorf("%w: %v", ErrG2BadCompound, err)
 			}
-			if n <= 0 || n > len(payload)-off {
+			if n <= 0 {
 				return nil, 0, ErrG2BadCompound
 			}
 			pkt.Children = append(pkt.Children, child)
@@ -210,7 +216,7 @@ func decodeG2Packet(data []byte) (*G2Packet, int, error) {
 	return pkt, total, nil
 }
 
-// EncodeG2Packet encodes p to bytes.
+// EncodeG2Packet encodes p (or *p) to bytes.
 func EncodeG2Packet(v any) ([]byte, error) {
 	switch x := v.(type) {
 	case *G2Packet:
@@ -281,3 +287,5 @@ func (p *G2Packet) DecodeInto(data []byte) error {
 	*p = *got
 	return nil
 }
+
+
