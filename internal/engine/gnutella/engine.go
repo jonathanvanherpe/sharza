@@ -93,6 +93,14 @@ type Options struct {
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
 	searches *searchRegistry
+
+	// routing is the engine's query forwarding table. Run sets it;
+	// callers do not. Inbound QUERYs are forwarded through it.
+	routing *routingTable
+
+	// LivePeers returns the engine's live peer connections. Run populates
+	// it; callers do not. Used by peers to forward queries.
+	LivePeers func() []*peerConn
 }
 
 func (o Options) withDefaults() Options {
@@ -124,6 +132,17 @@ type peerConn struct {
 	mu   sync.Mutex
 }
 
+// write sends b to the peer connection, serialising concurrent writers.
+func (pc *peerConn) write(b []byte) error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	_, err := pc.conn.Write(b)
+	return err
+}
+
 type Engine struct {
 	mu      sync.Mutex
 	started bool
@@ -140,6 +159,9 @@ type Engine struct {
 	// for them, by descriptor ID.
 	searches *searchRegistry
 
+	// routing is the engine's query forwarding table.
+	routing *routingTable
+
 	// dialed records every address a dial loop has been started for,
 	// so a host listed by both the config and a webcache (or by two
 	// caches) gets one loop, not two competing connections.
@@ -153,6 +175,7 @@ func New() *Engine {
 		peers:    make(map[*peerConn]struct{}),
 		dialed:   make(map[string]struct{}),
 		searches: newSearchRegistry(),
+		routing:  newRoutingTable(),
 	}
 }
 
@@ -183,6 +206,20 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	// Every peer gets this engine's registry, so a QUERYHIT delivered on
 	// any connection can be matched to the Search that is waiting for it.
 	e.opts.searches = e.searches
+	// Every peer gets this engine's forwarding table, so QUERYs can be
+	// forwarded and QUERYHITs routed back along the reverse path.
+	e.opts.routing = e.routing
+	// Every peer can reach the live peer set, so forwarding can target
+	// peers other than the one the message came from.
+	e.opts.LivePeers = func() []*peerConn {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		out := make([]*peerConn, 0, len(e.peers))
+		for pc := range e.peers {
+			out = append(out, pc)
+		}
+		return out
+	}
 	e.mu.Unlock()
 
 	ln, err := net.Listen("tcp", e.opts.Listen)
@@ -227,7 +264,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go func(c net.Conn, pc *peerConn) {
 			defer e.wg.Done()
-			if err := serveConn(ctx, c, true, e.opts, e.laddr); err != nil {
+			if err := serveConn(ctx, pc, true, e.opts, e.laddr); err != nil {
 				logf("inbound %s: %v", c.RemoteAddr(), err)
 			}
 			e.mu.Lock()
@@ -317,7 +354,7 @@ func (e *Engine) dialLoop(ctx context.Context, addr string) {
 			e.mu.Lock()
 			e.peers[pc] = struct{}{}
 			e.mu.Unlock()
-			if err := serveConn(ctx, conn, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
+			if err := serveConn(ctx, pc, false, e.opts, e.laddr); err != nil && ctx.Err() == nil {
 				logf("peer %s: %v", addr, err)
 			}
 			e.mu.Lock()
@@ -409,6 +446,11 @@ func (e *Engine) Search(text string) ([]QueryHit, error) {
 
 	// Register before any write: the answer can arrive first.
 	reg.register(hdr.ID)
+	// Mark our own descriptor ID as seen so a looped copy of our
+	// query that comes back to us is dropped instead of re-answered.
+	if e.opts.routing != nil {
+		e.opts.routing.markSeen(hdr.ID)
+	}
 
 	var (
 		wg       sync.WaitGroup
