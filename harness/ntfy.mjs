@@ -14,6 +14,11 @@ import dns from "node:dns";
 import { URL } from "node:url";
 
 const DEFAULT_TOPIC = process.env.NTFY_TOPIC || "sharza";
+const PRIORITY_MAP = { min: 1, low: 2, default: 3, high: 4, urgent: 5 };
+function priorityNumber(p) {
+  if (typeof p === "number") return p;
+  return PRIORITY_MAP[String(p).toLowerCase()] ?? 3;
+}
 const DEFAULT_URL = process.env.NTFY_URL || "https://ntfy.sh";
 
 /**
@@ -26,13 +31,16 @@ const DEFAULT_URL = process.env.NTFY_URL || "https://ntfy.sh";
 export async function notify(message, opts = {}) {
   const base = opts.baseUrl ?? DEFAULT_URL;
   const topic = opts.topic ?? DEFAULT_TOPIC;
-  const target = new URL(`${base.replace(/\/$/, "")}/${encodeURIComponent(topic)}`);
+  // Publish via the JSON API at the server root, so ntfy parses the
+  // topic/title/message/etc. from the body instead of treating the whole
+  // JSON blob as the message text.
+  const target = new URL(`${base.replace(/\/$/, "")}/`);
 
   const body = JSON.stringify({
     topic,
     title: opts.title ?? "Sharza",
     message,
-    priority: opts.priority ?? "default",
+    priority: priorityNumber(opts.priority ?? "default"),
     tags: opts.tags ?? [],
     ...(opts.url ? { click: opts.url } : {}),
   });
