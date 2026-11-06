@@ -81,6 +81,12 @@ type Config struct {
 	// without a hand-maintained peer list. Each must be an http(s) URL.
 	GnutellaCaches []string `json:"gnutella_caches"`
 
+	// GnutellaKHLHosts lists host:port endpoints of G2 KHL / `ukhl:`
+	// host caches. Each is queried once at startup for host addresses,
+	// exactly like GnutellaCaches, and every host it returns is fed into
+	// the same dial machinery. Endpoints are supplied as host:port; no
+	// `ukhl:` URL resolution happens here.
+	GnutellaKHLHosts []string `json:"gnutella_khl_hosts"`
 	// ConfigPath records where this Config was loaded from, so a worker
 	// can be spawned against the same file. Empty means built-in
 	// defaults. Not serialised: it describes where we came from, not
@@ -211,6 +217,11 @@ func (c *Config) Validate() error {
 	}
 	for i, addr := range c.GnutellaPeers {
 		if err := validateAddr(fmt.Sprintf("gnutella_peers[%d]", i), addr, true); err != nil {
+			return err
+		}
+	}
+	for i, addr := range c.GnutellaKHLHosts {
+		if err := validateAddr(fmt.Sprintf("gnutella_khl_hosts[%d]", i), addr, true); err != nil {
 			return err
 		}
 	}
