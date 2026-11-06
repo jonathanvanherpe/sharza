@@ -147,7 +147,7 @@ function saveState(state) {
  * One notification per pause, sent here where the decision is made, so a
  * service restart during the window does not page the maintainer again.
  */
-async function pauseForQuota({ reason, model, task, branch }) {
+async function pauseForQuota({ reason, model, task, branch, sessionID }) {
   const until = new Date(Date.now() + RESOURCE_PAUSE_MS).toISOString();
   saveState({ ...loadState(), pausedUntil: until });
   console.log(`${reason}${model ? ` (${model})` : ""}; pausing the harness 6h (until ${until})`);
@@ -157,7 +157,9 @@ async function pauseForQuota({ reason, model, task, branch }) {
       (task ? `\nTask: ${task.split("\n")[0]}` : "") +
       (branch ? `\nBranch: ${branch}` : "") +
       `\n\nNo cycles will run until the pause expires.`,
-    { title: "Sharza harness", priority: "high", tags: ["zzz"] },
+    // Tapping the notification opens the run that hit the wall, so the retry
+    // that exhausted the quota can be read in the app instead of guessed at.
+    { title: "Sharza harness", priority: "high", tags: ["zzz"], url: appDeepLink(sessionID) },
   );
   return until;
 }
@@ -252,6 +254,7 @@ function runAgent({ model, agent, prompt, sessionTitle, timeoutMs }) {
         exitCode: null,
         stdout,
         stderr: stderr || err.message,
+        sessionID: streamSessionID(stdout),
         durationMs: Date.now() - started,
       });
     });
@@ -263,6 +266,7 @@ function runAgent({ model, agent, prompt, sessionTitle, timeoutMs }) {
         exitCode: code,
         stdout,
         stderr,
+        sessionID: streamSessionID(stdout),
         durationMs: Date.now() - started,
       });
     });
@@ -287,6 +291,54 @@ function lastAssistantText(stdout) {
     }
   }
   return text;
+}
+
+/**
+ * The session id opencode reports on every event of its JSON stream.
+ *
+ * Every event carries it, including the first `step_start`, which is emitted
+ * before the first model call. That matters for the failure paths: the run
+ * that could not select a task is exactly the one worth opening from the
+ * notification, and it produced no assistant text to find it by. Reading it
+ * from the stream costs nothing and avoids a second lookup against the server.
+ *
+ * Exported for tests; `sharza-dev.mjs` is the only caller in production.
+ */
+export function streamSessionID(stdout) {
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let ev;
+    try {
+      ev = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const id = ev.sessionID ?? ev.properties?.sessionID ?? ev.part?.sessionID;
+    if (typeof id === "string" && id.startsWith("ses")) return id;
+  }
+  return null;
+}
+
+/**
+ * Deep link into a session in OpenCode Mobile.
+ *
+ * Same format the job-search harness sends (`opencodemobile://session/<id>` with
+ * the project directory as a query parameter); expo-router treats everything
+ * after the scheme as the route path, so "session" lands in the host position
+ * and the id in the path, routing to the app's session screen. `APP_SCHEME`
+ * is overridable for the same reason it is there: so a test or a different
+ * client can point somewhere else without editing this file.
+ *
+ * Returns undefined when the id is unknown, because ntfy would otherwise send
+ * a Click that opens the app at nothing.
+ */
+export function appDeepLink(sessionID) {
+  if (!sessionID) return undefined;
+  const scheme = process.env.APP_SCHEME ?? "opencodemobile://";
+  const id = encodeURIComponent(sessionID);
+  const project = encodeURIComponent(REPO);
+  return `${scheme}session/${id}?project=${project}`;
 }
 
 async function verifyGate() {
@@ -479,11 +531,23 @@ async function main(argv) {
         console.error(picked.stderr || "no task brief produced");
         return 1;
       }
-      await notify("Sharza harness could not pick a task. Needs a look.", {
-        title: "Sharza harness",
-        priority: "high",
-        tags: ["warning"],
-      });
+      // Even when selection didn't exhaust, we still emitted a session ID.
+      // Attach a deep link so a tap on the notification opens the exact run.
+      const sid = streamSessionID(picked.stdout);
+      if (sid) {
+        await notify("Sharza harness could not pick a task. Needs a look.", {
+          title: "Sharza harness",
+          priority: "high",
+          tags: ["warning"],
+          url: appDeepLink(sid),
+        });
+      } else {
+        await notify("Sharza harness could not pick a task. Needs a look.", {
+          title: "Sharza harness",
+          priority: "high",
+          tags: ["warning"],
+        });
+      }
       console.error(picked.stderr || "no task brief produced");
       return 1;
     }
@@ -583,7 +647,7 @@ async function main(argv) {
     );
 
     // Ride the quota, do not just fail against it: if the run died on a 429
-    // or equivalent, record the model so the next cycle skips it. The tail of
+    // or equivalent, record the model so the next cycle routes around it. The tail of
     // stdout is included because opencode reports provider errors as JSON
     // events there, not on stderr.
     const cooled = await reportCooldown(chosen.model, {
@@ -595,15 +659,46 @@ async function main(argv) {
       reasons.push(`cooldown recorded for ${chosen.model}`);
     }
 
-    // Exhaustion of the plan's allowance is not a per-model 429: every
-    // candidate draws on the same quota, so routing to the next tier would
-    // only spend another run discovering the same wall. Pause instead.
+    // Did the run exhaust the plan's allowance? If so pause the whole
+    // harness for six hours rather than letting the loop pick another
+    // candidate and spend another agent against a depleted quota.
     exhausted = resourceExhaustion({
       stderr: run.stderr,
       stdout: run.stdout.slice(-8_000),
       silent: !lastAssistantText(run.stdout).trim(),
     });
     if (exhausted) reasons.push(`quota exhausted: ${exhausted}`);
+
+    // Send a notification that includes the session deep-link, so a click
+    // can open the run that just died. The streamSessionID helper reads it
+    // from the JSON event stream that opencode already emitted.
+    const sid = run.sessionID ?? streamSessionID(stdout);
+    if (exhausted && sid) {
+      console.log(`sessionID=${sid} from stream; attaching OpenCode deep link`);
+      await pauseForQuota({
+        reason: `cycle ${id} could not run: ${exhausted}`,
+        model: chosen.model,
+        task,
+        branch,
+        sessionID: sid,
+      });
+    } else if (!exhausted && sid) {
+      console.log(`sessionID=${sid} from stream; attaching OpenCode deep link`);
+      await notify(
+        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}\n`,
+        { title: "Sharza harness", priority: "high", tags: ["x"], url: appDeepLink(sid) },
+      );
+    } else {
+      // Fallback: no id in the stream, fall back to plain notify.
+      await notify(
+        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
+        {
+          title: "Sharza harness",
+          priority: "high",
+          tags: ["x"],
+        },
+      );
+    }
   }
   if (failed.length > 0) {
     reasons.push(`verify failed: ${failed.map((f) => f.label).join(", ")}`);
@@ -626,12 +721,14 @@ async function main(argv) {
         branch,
       });
     } else {
+      const sid = run.sessionID ?? streamSessionID(stdout);
       await notify(
         `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
         {
           title: "Sharza harness",
           priority: "high",
           tags: ["x"],
+          url: sid ? appDeepLink(sid) : undefined,
         },
       );
     }

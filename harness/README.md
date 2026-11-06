@@ -96,7 +96,17 @@ learn the same thing. `resourceExhaustion()` recognises the wall
 (`Go usage limit exceeded`, `usage limit reached`, `RESOURCE_EXHAUSTED`, the
 Console budget wording, and a watchdog kill on a run that answered nothing at
 all) and `sharza-dev.mjs` records `pausedUntil: now + 6h` in
-`harness/.state/state.json` and notifies once. The next `--once` blocks at the
+`harness/.state/state.json` and notifies once with an `opencodemobile://`
+deep link, so a tap on the notification opens the run that just died instead of
+a generic error. The next `--once` blocks at the top of `main()` for the
+remainder instead of selecting a task, so the service loop keeps running with
+no agents against an empty allowance. The pause is in state rather than in
+memory so it survives a service restart, and `--status` shows the time left.
+`--dry-run` and `--task` are explicit human runs: they report the pause and
+proceed, and leave it in place so inspecting the harness does not cancel the
+wait the loop is honouring.
+
+A notification that includes a session deep link (`opencodemobile://session/<id>?project=...`) so a tap on the notification opens the run that just died. The next `--once` blocks at the
 top of `main()` for the remainder instead of selecting a task, so the service
 loop keeps running with no agents against an empty allowance. The pause is in
 state rather than in memory so it survives a service restart, and `--status`

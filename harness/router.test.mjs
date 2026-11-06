@@ -171,3 +171,61 @@ test("an exhaustion failure cools the model for the same six hours as the pause"
   );
   assert.equal(RESOURCE_PAUSE_MS, 6 * 3_600_000);
 });
+
+test("the OpenCode allowance wall is recognised as exhaustion, a slow build is not", () => {
+  // Both strings below are real: the first is what this opencode build logs
+  // when the Go allowance runs out, the second is the Gemini quota wording.
+  assert.ok(
+    resourceExhaustion({
+      stderr: "AI.Error: Go usage limit exceeded",
+    }),
+    "the Go usage-limit error must count as exhaustion",
+  );
+  assert.ok(
+    resourceExhaustion({
+      stdout:
+        '{"type":"session.error","error":"You exceeded your current quota, please check your plan"}',
+    }),
+    "a provider quota error in the event stream must count",
+  );
+
+  assert.equal(
+    resourceExhaustion({ stderr: "--- FAIL: TestKHL (0.02s)\nbuild failed" }),
+    null,
+    "a failing test must never pause the harness",
+  );
+  assert.equal(
+    resourceExhaustion({ stderr: "429 Too Many Requests" }),
+    null,
+    "a per-model 429 stays a cooldown: the next candidate may still work",
+  );
+});
+
+test("a watchdog kill only counts as exhaustion when the run answered nothing", () => {
+  const killed = {
+    stderr: "[harness] timed out after 900000ms, killing agent",
+  };
+  assert.equal(
+    resourceExhaustion({ ...killed, silent: true }),
+    "the run timed out without producing any answer",
+    "a silent timeout is the quota-stall shape and must pause",
+  );
+  assert.equal(
+    resourceExhaustion({ ...killed, silent: false }),
+    null,
+    "a run that answered and was killed at the limit is slow, not out of quota",
+  );
+});
+
+test("an exhaustion failure cools the model for the same six hours as the pause", async () => {
+  const model = "opencode/quota-test";
+  await reportCooldown(model, { stderr: "AI.Error: Go usage limit exceeded" });
+
+  const until = JSON.parse(readFileSync(COOLDOWN, "utf8"))[model].until;
+  const hours = (until - Date.now()) / 3_600_000;
+  assert.ok(
+    hours > 5.9 && hours <= 6,
+    `an exhausted quota should cool the model for ~6h, got ${hours.toFixed(2)}h`,
+  );
+  assert.equal(RESOURCE_PAUSE_MS, 6 * 3_600_000);
+});
