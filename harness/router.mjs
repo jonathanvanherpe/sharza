@@ -244,6 +244,81 @@ export async function route(req = {}) {
   };
 }
 
+/** Lowercased haystack of everything a failed run left behind. */
+function failureSignals(err = {}) {
+  return [err.body, err.message, err.stderr, err.stdout]
+    .filter((s) => typeof s === "string" && s.length > 0)
+    .join("\n")
+    .toLowerCase();
+}
+
+/**
+ * How long the whole harness stops after the plan's allowance runs out.
+ *
+ * Six hours, because the allowance is not something a retry replenishes. The
+ * Go allowance meters on rolling/weekly/monthly windows, so a cycle started
+ * five minutes after the wall appears spends a run rediscovering it, and a
+ * service loop that retries forever produces a stream of agents that all fail
+ * the same way. Sleeping is the honest response: nothing is lost by waiting,
+ * and everything spent on retries is wasted.
+ */
+export const RESOURCE_PAUSE_MS = 6 * 3_600_000;
+
+/**
+ * Detect exhaustion of the OpenCode allowance, which routing cannot fix.
+ *
+ * This is deliberately narrower than the quota check in `reportCooldown`. A
+ * 429 is a per-model allowance and the documented policy is to ride it by
+ * picking the next candidate. Exhausting the plan is different: every
+ * candidate draws on the same allowance, so walking the tier list spends an
+ * agent per candidate to learn the same thing.
+ *
+ * The strings are the ones this opencode build actually emits, taken from
+ * `~/.local/share/opencode/log/opencode.log` and the binary's own error text:
+ * `AI.Error: Go usage limit exceeded`, `usage limit reached`, `RESOURCE_EXHAUSTED`,
+ * plus the Console budget wording. Matching them is guessing at an
+ * implementation detail, so the set is kept broad and the behaviour is a
+ * pause, which is recoverable, rather than a permanent downgrade.
+ *
+ * `err.silent` means the run produced no assistant text at all. That matters
+ * for the watchdog case: a run that answered for two hours and was killed at
+ * the limit is slow, not out of quota and keeps the ordinary cooldown path,
+ * while one killed after answering nothing is the shape of a rejected request
+ * being retried. On this host the later is usually the allowance.
+ *
+ * @param {{status?: number, body?: string, message?: string, stderr?: string, stdout?: string, silent?: boolean}} err
+ * @returns {string|null} a short human-readable reason, or null when this is
+ *   not an exhaustion failure
+ */
+export function resourceExhaustion(err = {}) {
+  const signals = failureSignals(err);
+  if (!signals) return null;
+
+  if (signals.includes("go usage limit exceeded")) return "the OpenCode Go usage limit was exceeded";
+  if (signals.includes("usage limit reached") || signals.includes("usage limit")) {
+    return "the provider reported a usage limit";
+  }
+  if (signals.includes("resource_exhausted") || signals.includes("resourceexhausted")) {
+    return "the provider reported resource exhaustion";
+  }
+  if (/\bquota exceeded\b/.test(signals) || signals.includes("exceeded your current quota")) {
+    return "the provider reported an exceeded quota";
+  }
+  if (signals.includes("insufficient quota") || signals.includes("insufficient balance")) {
+    return "the account has insufficient quota";
+  }
+  if (signals.includes("limit exhausted") || signals.includes("budget exceeded")) {
+    return "the allowance is exhausted";
+  }
+  if (signals.includes("is out of credits") || signals.includes("package has expired")) {
+    return "the workspace is out of credits";
+  }
+  if (err.silent && signals.includes("[harness] timed out")) {
+    return "the run timed out without producing any answer";
+  }
+  return null;
+}
+
 /**
  * Report a rate-limit or quota failure for a model, so the next cycle can
  * prefer something else.
@@ -252,17 +327,21 @@ export async function route(req = {}) {
  * look quota-shaped. The caller uses the return value so "did we act on this"
  * is decided once, here, rather than guessed again at the call site.
  *
+ * A timeout is recorded too, so a model that just timed out is not the first
+ * candidate next time. That is separate from the global pause in
+ * `sharza-dev.mjs`: the cooldown steers the next cycle, the pause stops there
+ * being a next cycle for six hours.
+ *
  * @param {string} model
  * @param {{status?: number, body?: string, message?: string, stderr?: string, stdout?: string}} err
  * @returns {Promise<boolean>}
  */
 export async function reportCooldown(model, err = {}) {
-  const signals = [err.body, err.message, err.stderr, err.stdout]
-    .filter((s) => typeof s === "string" && s.length > 0)
-    .join("\n")
-    .toLowerCase();
+  const signals = failureSignals(err);
+  const exhausted = resourceExhaustion(err);
 
   const quotaish =
+    exhausted !== null ||
     err.status === 429 ||
     err.status === 503 ||
     signals.includes("rate limit") ||
@@ -272,6 +351,8 @@ export async function reportCooldown(model, err = {}) {
     signals.includes("resourceexhausted") ||
     signals.includes("overloaded") ||
     signals.includes("too many requests") ||
+    signals.includes("timed out") ||
+    signals.includes("timeout") ||
     /\b429\b/.test(signals);
 
   if (!quotaish) return false;
@@ -289,7 +370,10 @@ export async function reportCooldown(model, err = {}) {
   } catch {
     state = {};
   }
-  state[model] = { until: Date.now() + 30 * 60_000, at: new Date().toISOString() };
+  // An exhausted allowance is not worth retrying before the harness wakes up:
+  // the same six hours that the pause covers. A per-model rate limit is.
+  const cooldownMs = exhausted ? RESOURCE_PAUSE_MS : 30 * 60_000;
+  state[model] = { until: Date.now() + cooldownMs, at: new Date().toISOString() };
   writeFileSync(path, JSON.stringify(state, null, 2));
   return true;
 }

@@ -26,7 +26,14 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { notify, sleep } from "./ntfy.mjs";
-import { route, reportCooldown, cooledDown, classifyDifficulty } from "./router.mjs";
+import {
+  route,
+  reportCooldown,
+  cooledDown,
+  classifyDifficulty,
+  resourceExhaustion,
+  RESOURCE_PAUSE_MS,
+} from "./router.mjs";
 import { createPullRequest, parseRemote, compareUrl, resolveGitHubToken, pullRequestState, assignPullRequest } from "./github.mjs";
 
 const exec = promisify(execFile);
@@ -126,6 +133,33 @@ function loadState() {
 function saveState(state) {
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+/**
+ * Stop the harness for six hours after the quota runs out.
+ *
+ * The pause is written to state rather than kept in memory so it survives the
+ * service restarting, and it is honoured at the top of `main()` rather than by
+ * exiting: the loop wrapper retries `--once` every few minutes, and exiting
+ * early would turn the retries into a stream of processes that each select a
+ * task and spend a run discovering the same exhausted quota.
+ *
+ * One notification per pause, sent here where the decision is made, so a
+ * service restart during the window does not page the maintainer again.
+ */
+async function pauseForQuota({ reason, model, task, branch }) {
+  const until = new Date(Date.now() + RESOURCE_PAUSE_MS).toISOString();
+  saveState({ ...loadState(), pausedUntil: until });
+  console.log(`${reason}${model ? ` (${model})` : ""}; pausing the harness 6h (until ${until})`);
+
+  await notify(
+    `Sharza harness paused until ${until} (6h).\n${reason}${model ? `\nModel: ${model}` : ""}` +
+      (task ? `\nTask: ${task.split("\n")[0]}` : "") +
+      (branch ? `\nBranch: ${branch}` : "") +
+      `\n\nNo cycles will run until the pause expires.`,
+    { title: "Sharza harness", priority: "high", tags: ["zzz"] },
+  );
+  return until;
 }
 
 function git(args, opts = {}) {
@@ -313,6 +347,13 @@ async function main(argv) {
 
   if (args.has("--status")) {
     console.log(JSON.stringify(state, null, 2));
+    const pausedUntilMs = Date.parse(state.pausedUntil ?? "");
+    if (Number.isFinite(pausedUntilMs) && pausedUntilMs > Date.now()) {
+      console.log(
+        `paused until ${new Date(pausedUntilMs).toISOString()} ` +
+          `(${Math.round((pausedUntilMs - Date.now()) / 60000)}m left) after quota exhaustion`,
+      );
+    }
     const cooldown = await cooledDown();
     if (cooldown.length > 0) console.log(`in cooldown: ${cooldown.join(", ")}`);
     return 0;
@@ -320,6 +361,36 @@ async function main(argv) {
 
   const dryRun = args.has("--dry-run");
   const forcedTask = valueOf("task");
+
+  // A run that died on the OpenCode Go quota puts the whole harness to sleep
+  // for six hours instead of letting the service loop retry it. Sleeping in
+  // this process is what makes that a pause: any retry the loop starts inside
+  // the window blocks here, so no task is selected and no second agent is
+  // spawned against a quota that has no room for either of them. The loop
+  // itself is untouched; it only ever calls --once.
+  //
+  // --dry-run and --task are explicit human invocations, so they report the
+  // pause and proceed rather than hanging for hours with nothing to show.
+  const pausedUntilMs = Date.parse(state.pausedUntil ?? "");
+  const pauseRemainingMs = Number.isFinite(pausedUntilMs) ? pausedUntilMs - Date.now() : 0;
+  if (pauseRemainingMs > 0) {
+    const until = new Date(pausedUntilMs).toISOString();
+    if (dryRun || forcedTask) {
+      // An explicit human run reports the pause and proceeds, and deliberately
+      // leaves it in place: peeking at the harness should not cancel the wait
+      // the automated loop is honouring.
+      console.log(`paused until ${until} after quota exhaustion; proceeding anyway (explicit run)`);
+    } else {
+      console.log(
+        `paused until ${until} after quota exhaustion; sleeping ` +
+          `${Math.round(pauseRemainingMs / 60000)}m instead of starting another cycle`,
+      );
+      await sleep(pauseRemainingMs);
+      // The pause is spent; drop it so a later failure starts a fresh one.
+      state = { ...loadState(), pausedUntil: null };
+      saveState(state);
+    }
+  }
 
   const token = resolveGitHubToken();
   let remoteInfo = null;
@@ -386,6 +457,28 @@ async function main(argv) {
     });
     task = lastAssistantText(picked.stdout).trim();
     if (!task) {
+      // Selection failing is the cheapest possible tell that the plan has no
+      // quota left: it is the first model call of the cycle and it produced
+      // nothing at all. Spinning the loop through selection every five minutes
+      // is what this branch exists to prevent, so an exhausted (or timed-out,
+      // which on this host usually means exhausted) selection run pauses the
+      // harness instead of notifying and retrying.
+      //
+      // `silent: true` because getting here means no brief was produced: a
+      // re-derivation handed a 15-minute budget that answered nothing is the
+      // stall shape, not a slow task.
+      const exhausted = !picked.ok
+        ? resourceExhaustion({
+            stderr: picked.stderr,
+            stdout: picked.stdout.slice(-8_000),
+            silent: true,
+          })
+        : null;
+      if (exhausted) {
+        await pauseForQuota({ reason: `could not select a task: ${exhausted}`, model: selectionModel });
+        console.error(picked.stderr || "no task brief produced");
+        return 1;
+      }
       await notify("Sharza harness could not pick a task. Needs a look.", {
         title: "Sharza harness",
         priority: "high",
@@ -483,6 +576,7 @@ async function main(argv) {
   // it passes every automated check while missing the point of the brief.
   const agentFailed = !run.ok;
   const reasons = [];
+  let exhausted = null;
   if (agentFailed) {
     reasons.push(
       `agent exited ${run.exitCode ?? "by signal"}${run.stderr ? `: ${run.stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`,
@@ -500,6 +594,16 @@ async function main(argv) {
       console.log(`${chosen.model} looks rate-limited; recorded a 30m cooldown`);
       reasons.push(`cooldown recorded for ${chosen.model}`);
     }
+
+    // Exhaustion of the plan's allowance is not a per-model 429: every
+    // candidate draws on the same quota, so routing to the next tier would
+    // only spend another run discovering the same wall. Pause instead.
+    exhausted = resourceExhaustion({
+      stderr: run.stderr,
+      stdout: run.stdout.slice(-8_000),
+      silent: !lastAssistantText(run.stdout).trim(),
+    });
+    if (exhausted) reasons.push(`quota exhausted: ${exhausted}`);
   }
   if (failed.length > 0) {
     reasons.push(`verify failed: ${failed.map((f) => f.label).join(", ")}`);
@@ -512,24 +616,39 @@ async function main(argv) {
     const why = reasons.join("; ");
     console.log(`\nnot committing: ${why}`);
 
-    await notify(
-      `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
-      {
-        title: "Sharza harness",
-        priority: "high",
-        tags: ["x"],
-      },
-    );
+    if (exhausted) {
+      // One notification, not two: the pause message is the useful one, and
+      // it already says which cycle and branch did not land.
+      await pauseForQuota({
+        reason: `cycle ${id} could not run: ${exhausted}`,
+        model: chosen.model,
+        task,
+        branch,
+      });
+    } else {
+      await notify(
+        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
+        {
+          title: "Sharza harness",
+          priority: "high",
+          tags: ["x"],
+        },
+      );
+    }
 
+    // Reload rather than reusing the state read at the top of main: a pause
+    // written above must survive this write, and the object here is otherwise
+    // the pre-cycle snapshot.
+    const fresh = loadState();
     saveState({
-      ...state,
+      ...fresh,
       cycles: state.cycles + 1,
       lastTask: task,
       lastResult: why,
       pendingPRs,
       waitDelayMs,
       history: [
-        ...(state.history ?? []),
+        ...(fresh.history ?? []),
         { at: new Date().toISOString(), branch, task: task.split("\n")[0], result: why },
       ].slice(-50),
     });

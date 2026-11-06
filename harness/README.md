@@ -20,6 +20,10 @@ node harness/sharza-dev.mjs --test-notify # send one real notification
 
 State lives in `harness/.state/` and is gitignored.
 
+A cycle that fails on an exhausted OpenCode allowance pauses the harness for six
+hours (`pausedUntil` in state) instead of letting the service loop spawn another
+agent every five minutes; see *Model routing* below.
+
 ## One cycle
 
 1. **Select.** A strong model runs `/next-task` and returns a brief. If the
@@ -66,12 +70,12 @@ the preferred tier is unreachable. The classifier is deliberately conservative
 and can be overridden with `SHARZA_DIFFICULTY=easy|normal`.
 
 The Go candidates are ordered by task difficulty and current model availability.
-OpenCode enforces the Go plan's model-specific usage allowances; on a quota
-failure, the affected model is cooled down for 30 minutes and the next cycle
-tries the next available candidate. The harness does not read or predict live
-allowance balances. Non-Go providers, including Google, are only configured as
-last-resort fallbacks. Project subagents inherit the routed model rather than
-pinning themselves to a separate provider.
+OpenCode enforces the Go plan's model-specific usage allowances; on a per-model
+quota failure, the affected model is cooled down for 30 minutes and the next
+cycle tries the next available candidate. The harness does not read or predict
+live allowance balances. Non-Go providers, including Google, are only
+configured as last-resort fallbacks. Project subagents inherit the routed model
+rather than pinning themselves to a separate provider.
 
 `local-weak` is marked tool-free on purpose. The local models are weak at tool
 use and will report having edited files they never touched. Handing one an
@@ -84,6 +88,21 @@ enforce; on a 429 or equivalent the model goes into a 30-minute cooldown in
 records that cooldown itself: when a build run fails, `reportCooldown()` scans
 the run's stderr and the tail of stdout (opencode reports provider errors as
 JSON events there) and writes the entry if the failure looks quota-shaped.
+
+Exhausting the plan's allowance is different, and is the one case that stops
+the harness rather than routing around it. Every candidate spends the same
+allowance, so walking the tier list would buy one failed agent per candidate to
+learn the same thing. `resourceExhaustion()` recognises the wall
+(`Go usage limit exceeded`, `usage limit reached`, `RESOURCE_EXHAUSTED`, the
+Console budget wording, and a watchdog kill on a run that answered nothing at
+all) and `sharza-dev.mjs` records `pausedUntil: now + 6h` in
+`harness/.state/state.json` and notifies once. The next `--once` blocks at the
+top of `main()` for the remainder instead of selecting a task, so the service
+loop keeps running with no agents against an empty allowance. The pause is in
+state rather than in memory so it survives a service restart, and `--status`
+shows the time left. `--dry-run` and `--task` are explicit human runs: they
+report the pause and proceed, and leave it in place so inspecting the harness
+does not cancel the wait the loop is honouring.
 
 ## Permissions
 
