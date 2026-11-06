@@ -570,6 +570,7 @@ async function main(argv) {
   let prCreated = false;
   let prUrl = null;
   let prError = null;
+  let prNumber = null;
   if (pushed) {
     const remote = parseRemote(git(["remote", "get-url", "origin"]));
     if (!remote) {
@@ -588,6 +589,7 @@ async function main(argv) {
         token,
       });
       if (pr.ok && pr.number) {
+        prNumber = pr.number;
         await assignPullRequest({
           owner: remote.owner,
           repo: remote.repo,
@@ -606,8 +608,8 @@ async function main(argv) {
     if (!prUrl && remote) prUrl = compareUrl({ owner: remote.owner, repo: remote.repo, head: branch });
   }
 
-  if (pushed && prCreated && pr.number) {
-    pendingPRs.push({ number: pr.number, url: prUrl, task: task.split("\n")[0], at: new Date().toISOString() });
+  if (pushed && prCreated && prNumber) {
+    pendingPRs.push({ number: prNumber, url: prUrl, task: task.split("\n")[0], at: new Date().toISOString() });
   }
 
   const landed = pushed
