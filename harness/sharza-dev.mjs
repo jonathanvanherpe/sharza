@@ -338,19 +338,9 @@ async function main(argv) {
         token,
       });
       if (st.merged) {
-        await notify(`PR #${pr.number} merged. https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} \n${pr.task}`, {
-          title: "Sharza harness",
-          priority: "default",
-          tags: ["white_check_mark"],
-          url: pr.url,
-        });
+        // Silently drop merged PRs from pending state; no notification.
       } else if (st.state === "closed") {
-        await notify(`PR #${pr.number} closed without merge. https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} \n${pr.task}`, {
-          title: "Sharza harness",
-          priority: "high",
-          tags: ["x"],
-          url: pr.url,
-        });
+        // Silently drop closed PRs from pending state; no notification.
       } else {
         stillOpen.push(pr);
       }
