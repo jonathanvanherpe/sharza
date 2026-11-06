@@ -337,14 +337,14 @@ async function main(argv) {
         token,
       });
       if (st.merged) {
-        await notify(`PR #${pr.number} merged.\n${pr.task}`, {
+        await notify(`PR #${pr.number} merged. https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} \n${pr.task}`, {
           title: "Sharza harness",
           priority: "default",
           tags: ["white_check_mark"],
           url: pr.url,
         });
       } else if (st.state === "closed") {
-        await notify(`PR #${pr.number} closed without merge.\n${pr.task}`, {
+        await notify(`PR #${pr.number} closed without merge. https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} \n${pr.task}`, {
           title: "Sharza harness",
           priority: "high",
           tags: ["x"],
@@ -403,9 +403,10 @@ async function main(argv) {
     }
     if (task === "WAIT") {
       console.log("next task is not independent of pending PR(s); waiting");
+      const waitMsg = pendingPRs.map((pr) => `- PR #${pr.number}: https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} — ${pr.task}`).join("\n");
       await notify(
-        "Waiting for pending PR(s) before next task:\n" + pendingSummary,
-        { title: "Sharza harness", priority: "default", tags: ["hourglass"] },
+        "Waiting for pending PR(s) before next task:\n" + waitMsg,
+        { title: "Sharza harness", priority: "default", tags: ["hourglass"], url: pendingPRs[0]?.url },
       );
       await sleep(3_600_000);
       return 0;
