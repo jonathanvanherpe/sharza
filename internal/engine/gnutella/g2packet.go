@@ -195,20 +195,27 @@ func decodeG2Packet(data []byte) (*G2Packet, int, error) {
 	payload := data[typeEnd:total]
 
 	if compound {
-		// Parse children.
+		// Parse children. Trailing bytes that do not form a complete
+		// child packet are kept as the packet's payload, so compound
+		// packets may carry inline data after their nested children
+		// (as KHL hub entries do).
 		off := 0
 		for off < len(payload) {
 			child, n, err := decodeG2Packet(payload[off:])
 			if err != nil {
-				return nil, 0, fmt.Errorf("%w: %v", ErrG2BadCompound, err)
+				break
 			}
 			if n <= 0 {
-				return nil, 0, ErrG2BadCompound
+				break
 			}
 			pkt.Children = append(pkt.Children, child)
 			off += n
 		}
-		pkt.Payload = nil
+		if off < len(payload) {
+			pkt.Payload = cloneBytes(payload[off:])
+		} else {
+			pkt.Payload = nil
+		}
 	} else {
 		pkt.Payload = cloneBytes(payload)
 	}
