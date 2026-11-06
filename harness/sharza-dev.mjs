@@ -404,11 +404,6 @@ async function main(argv) {
     }
     if (task === "WAIT") {
       console.log("next task is not independent of pending PR(s); waiting");
-      const waitMsg = pendingPRs.map((pr) => `- PR #${pr.number}: https://github.com/${remoteInfo.owner}/${remoteInfo.repo}/pull/${pr.number} — ${pr.task}`).join("\n");
-      await notify(
-        "Waiting for pending PR(s) before next task:\n" + waitMsg,
-        { title: "Sharza harness", priority: "default", tags: ["hourglass"], url: pendingPRs[0]?.url },
-      );
       await sleep(3_600_000);
       return 0;
     }
