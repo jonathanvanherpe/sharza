@@ -17,6 +17,7 @@ Selection rules, in order:
    half-closed; the phases are ordered by verifiability for a reason.
 3. **Prefer the smallest item that moves a phase's exit gate.** Not the most
    interesting item, the smallest one that produces evidence.
+4. **Avoid pending work.** If open pull requests exist, do not pick an item that touches the same files or subsystem as one of them, or that would conflict with a pending branch. Choose a disjoint item or output `WAIT`.
 
 Then output:
 

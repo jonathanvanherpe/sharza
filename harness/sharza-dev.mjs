@@ -375,8 +375,9 @@ async function main(argv) {
   const selectionPrompt = pendingPRs.length > 0 && !forcedTask
     ? "There are pending pull requests:\n" + pendingSummary +
       "\n\nRun the /next-task command. If the selected item is independent of " +
-      "ALL of them (no overlapping files, subsystems, or protocol area), output " +
-      "only the task brief. Otherwise output exactly WAIT and nothing else."
+      "ALL of them (no overlapping files, subsystems, protocol area, and no " +
+      "conflict with a pending branch), output only the task brief. Otherwise " +
+      "output exactly WAIT and nothing else."
     : "Run the /next-task command and output only the task brief it produces. " +
       "Do not start implementing anything.";
 
