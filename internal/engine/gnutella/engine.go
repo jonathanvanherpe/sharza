@@ -65,6 +65,18 @@ type Options struct {
 	// a test may not reach anything else.
 	cacheAllowLoopback bool
 
+	// KHLHosts lists UDP host:port endpoints of G2 KHL / `ukhl:` host
+	// caches. Each is queried once at Run start, exactly like Caches,
+	// and every host it returns is fed into the same dial machinery.
+	// Endpoint addresses are supplied by the caller; resolving or
+	// polling `ukhl:` URLs is out of scope for this slice.
+	KHLHosts []string
+
+	// khlAllowLoopback relaxes the KHL host filter so that a loopback
+	// address from an endpoint is kept. Production never sets it.
+	// Tests set it to point an endpoint at a listener on 127.0.0.1.
+	khlAllowLoopback bool
+
 	// KeepAliveInterval is how often a silent connection receives an
 	// empty PING. Zero means the default 90 s.
 	KeepAliveInterval time.Duration
@@ -243,6 +255,13 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 		e.wg.Add(1)
 		go e.cacheLoop(ctx, cacheURL)
 	}
+	// KHL endpoints are fetched concurrently with serving, exactly
+	// like caches: one slow or dead endpoint delays only its own
+	// hosts, never the listener.
+	for _, endpoint := range e.opts.KHLHosts {
+		e.wg.Add(1)
+		go e.khlLoop(ctx, endpoint)
+	}
 
 	// Closing the listener is how Accept is unblocked when the context
 	// ends; connections themselves are closed by each serveConn.
@@ -335,6 +354,33 @@ func (e *Engine) fetchCache(ctx context.Context, cacheURL string) (CacheResult, 
 		return fetchHosts(ctx, cacheURL, true)
 	}
 	return FetchHosts(ctx, cacheURL)
+}
+
+// khlLoop fetches one KHL endpoint and hands every host it returns to
+// startDial. A failure is logged and dropped: the client does not retry
+// (the dial loops own retrying), and one bad endpoint must not stop the
+// engine or the other endpoints.
+func (e *Engine) khlLoop(ctx context.Context, endpoint string) {
+	defer e.wg.Done()
+	logf := e.opts.Logf
+
+	hosts, err := e.fetchKHL(ctx, endpoint)
+	if err != nil {
+		logf("khl %s: %v", endpoint, err)
+		return
+	}
+	logf("khl %s: %d host(s)", endpoint, len(hosts))
+	for _, h := range hosts {
+		e.startDial(ctx, h.Addr)
+	}
+}
+
+// fetchKHL is fetchKHLHosts with the engine's loopback policy applied.
+func (e *Engine) fetchKHL(ctx context.Context, endpoint string) ([]KHLHost, error) {
+	if e.opts.khlAllowLoopback {
+		return fetchKHLHosts(ctx, endpoint, true)
+	}
+	return FetchKHLHosts(ctx, endpoint)
 }
 
 // dialLoop keeps one outbound peer connected. It retries forever with
