@@ -323,6 +323,9 @@ func TestGnutellaDefaultsToDisabled(t *testing.T) {
 	if len(c.GnutellaPeers) != 0 {
 		t.Errorf("default gnutella_peers = %v, want empty", c.GnutellaPeers)
 	}
+	if len(c.GnutellaKHLHosts) != 0 {
+		t.Errorf("default gnutella_khl_hosts = %v, want empty", c.GnutellaKHLHosts)
+	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("Default().Validate() = %v, want nil", err)
 	}
@@ -393,7 +396,7 @@ func TestGnutellaPeersValidation(t *testing.T) {
 // crash-at-startup loop over a typo.
 func TestGnutellaAddressesValidatedWhileDisabled(t *testing.T) {
 	t.Parallel()
-	c := &Config{StateDir: t.TempDir(), GnutellaListen: "127.0.0.1:notaport", GnutellaPeers: []string{"nohost:6346"}}
+	c := &Config{StateDir: t.TempDir(), GnutellaListen: "127.0.0.1:notaport", GnutellaPeers: []string{"nohost:6346"}, GnutellaKHLHosts: []string{"nohost:6346"}}
 	c.applyDefaults()
 	if err := c.Validate(); err == nil {
 		t.Error("bad gnutella addresses accepted with gnutella_enabled false, want rejection")
@@ -483,5 +486,50 @@ func TestLoadReadsGnutellaCaches(t *testing.T) {
 	}
 	if len(c.GnutellaCaches) != 1 || c.GnutellaCaches[0] != "http://cache.example.org/gwc.php" {
 		t.Errorf("gnutella_caches = %v, want the one URL", c.GnutellaCaches)
+	}
+}
+
+// Mirror of TestGnutellaPeersValidation for KHL host endpoints, which use
+// the same host:port shape as peers.
+func TestGnutellaKHLHostsValidation(t *testing.T) {
+	t.Parallel()
+	for _, ok := range []string{"127.0.0.1:6346", "khl.example.org:6346", "[::1]:6346"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaKHLHosts: []string{ok}}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Errorf("gnutella_khl_hosts [%q] rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{":6346", "1.2.3.4", "127.0.0.1:70000"} {
+		c := &Config{StateDir: t.TempDir(), GnutellaKHLHosts: []string{bad}}
+		c.applyDefaults()
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("gnutella_khl_hosts [%q] was accepted, want rejection", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "gnutella_khl_hosts") {
+			t.Errorf("gnutella_khl_hosts [%q] error does not name the field: %v", bad, err)
+		}
+	}
+}
+
+// JSON key round-trips under DisallowUnknownFields.
+func TestLoadReadsGnutellaKHLHosts(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "sharza.json")
+	body := `{
+  "state_dir": "/tmp/sharza-test-state",
+  "gnutella_khl_hosts": ["127.0.0.1:6346", "10.0.0.9:6346"]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.GnutellaKHLHosts) != 2 || c.GnutellaKHLHosts[1] != "10.0.0.9:6346" {
+		t.Errorf("gnutella_khl_hosts = %v, want both addresses", c.GnutellaKHLHosts)
 	}
 }

@@ -183,9 +183,10 @@ func runWorkerRole(ctx context.Context, r role.Role, cfg *config.Config) error {
 		return nil
 	}
 	return gnutella.New().Run(ctx, gnutella.Options{
-		Listen: cfg.GnutellaListen,
-		Peers:  cfg.GnutellaPeers,
-		Caches: cfg.GnutellaCaches,
+		Listen:   cfg.GnutellaListen,
+		Peers:    cfg.GnutellaPeers,
+		Caches:   cfg.GnutellaCaches,
+		KHLHosts: cfg.GnutellaKHLHosts,
 	})
 }
 
