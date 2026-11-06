@@ -292,8 +292,14 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 	case MsgQueryHit:
 		return p.handleQueryHit(hdr, payload)
 	case MsgPush:
-		p.logf("ignoring %s from %s: routing and transfer are out of scope",
-			typeName(hdr.Type), p.conn.RemoteAddr())
+		if push, err := DecodePush(payload); err != nil {
+			p.logf("bad push from %s: %v", p.conn.RemoteAddr(), err)
+			return nil
+		} else {
+			p.logf("push from %s: servent=%x file=%d ip=%d.%d.%d.%d port=%d",
+				p.conn.RemoteAddr(), push.ServentID, push.FileIndex,
+				push.IP[0], push.IP[1], push.IP[2], push.IP[3], push.Port)
+		}
 		return nil
 	default:
 		p.logf("ignoring unknown payload type 0x%02x from %s", hdr.Type, p.conn.RemoteAddr())
