@@ -300,6 +300,7 @@ async function main(argv) {
 
   let state = loadState();
   const pendingPRs = Array.isArray(state.pendingPRs) ? [...state.pendingPRs] : [];
+  let waitDelayMs = typeof state.waitDelayMs === "number" ? state.waitDelayMs : 60_000;
 
   if (args.has("--test-notify")) {
     const res = await notify("Sharza harness test notification. Nothing to do.", {
@@ -357,7 +358,8 @@ async function main(argv) {
     if (stillOpen.length !== pendingPRs.length) {
       pendingPRs.length = 0;
       pendingPRs.push(...stillOpen);
-      saveState({ ...loadState(), pendingPRs });
+      waitDelayMs = 60_000;
+      saveState({ ...loadState(), pendingPRs, waitDelayMs });
     }
   }
 
@@ -403,8 +405,10 @@ async function main(argv) {
       return 1;
     }
     if (task === "WAIT") {
-      console.log("next task is not independent of pending PR(s); waiting");
-      await sleep(3_600_000);
+      console.log(`next task is not independent of pending PR(s); waiting ${Math.round(waitDelayMs / 60000)}m`);
+      await sleep(waitDelayMs);
+      const nextDelay = Math.min(waitDelayMs * 2, 3_600_000);
+      saveState({ ...loadState(), pendingPRs, waitDelayMs: nextDelay });
       return 0;
     }
   }
@@ -533,6 +537,7 @@ async function main(argv) {
       lastTask: task,
       lastResult: why,
       pendingPRs,
+      waitDelayMs,
       history: [
         ...(state.history ?? []),
         { at: new Date().toISOString(), branch, task: task.split("\n")[0], result: why },
@@ -607,6 +612,7 @@ async function main(argv) {
 
   if (pushed && prCreated && prNumber) {
     pendingPRs.push({ number: prNumber, url: prUrl, task: task.split("\n")[0], at: new Date().toISOString() });
+    waitDelayMs = 60_000;
   }
 
   const landed = pushed
@@ -621,6 +627,7 @@ async function main(argv) {
     lastTask: task,
     lastResult: `branch ${branch} ${landed}${prUrl ? ` - ${prUrl}` : ""}`,
     pendingPRs,
+    waitDelayMs,
     history: [
       ...(state_.history ?? []),
       {
