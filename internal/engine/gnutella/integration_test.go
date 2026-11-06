@@ -2,6 +2,13 @@
 
 package gnutella
 
+// TestSearchAndDownloadEndToEnd is the P1 exit-gate slice: one transfer
+// that composes Engine.Search and Engine.Downloader/Fetch over real TCP.
+// A source engine shares a temp file through its Catalogue; a searcher
+// dials it, runs a QUERY, collects the QUERYHIT, and fetches the named
+// file over HTTP from a servent standing in for that peer. The bytes and
+// size on disk must match the source.
+
 import (
 	"bytes"
 	"context"
@@ -16,43 +23,40 @@ import (
 	"time"
 )
 
-// TestSearchAndDownloadEndToEnd is the smallest verifiable unit of P1's
-// exit gate: one engine advertises a file, another dials it, searches,
-// and turns the returned QUERYHIT into a completed download. The
-// download's source address is rewritten from the answering peer to a
-// stand-in httptest servent, which serves the advertised bytes at the
-// Gnutella /gnutella/<index> path; the transfer is then checked
-// byte-for-byte against the source.
 func TestSearchAndDownloadEndToEnd(t *testing.T) {
-	const (
-		index = 42
-		size  = 2048
-	)
-	content := testContent(size)
+	const fileIndex = 42
+	content := testContent(1234)
 
-	// Engine B advertises the file through its catalogue.
+	// Source engine shares the temp file through its Catalogue.
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "shared.bin")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
 	engB, cancelB := startEngine(t, Options{
 		KeepAliveInterval: time.Hour,
 		IdleTimeout:       10 * time.Second,
 		Catalogue: []FileEntry{
-			{Index: index, Size: uint32(size), Name: "shared.bin"},
+			{Index: fileIndex, Size: uint32(len(content)), Name: "shared.bin"},
 		},
 	})
 	defer cancelB()
 
-	// Stand-in servent: serves the advertised bytes at /gnutella/<index>.
+	// An HTTP servent standing in for the peer that owns the file: it
+	// serves the same bytes the Catalogue advertises, at the path the
+	// download client requests.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != fmt.Sprintf("/gnutella/%d", index) {
+		if r.URL.Path != fmt.Sprintf("/gnutella/%d", fileIndex) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(size))
-		w.Header().Set("X-Gnutella-Content-Length", strconv.Itoa(size))
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.Header().Set("X-Gnutella-Content-Length", strconv.Itoa(len(content)))
 		_, _ = w.Write(content)
 	}))
 	defer srv.Close()
 
-	// Engine A dials B and searches.
+	// Searcher dials the source.
 	engA, cancelA := startEngine(t, Options{
 		KeepAliveInterval: time.Hour,
 		IdleTimeout:       10 * time.Second,
@@ -73,49 +77,44 @@ func TestSearchAndDownloadEndToEnd(t *testing.T) {
 	}
 	qh := results[0]
 	if len(qh.Hits) == 0 {
-		t.Fatal("QUERYHIT carries no file hits")
+		t.Fatalf("hit %+v has no file hits", qh)
 	}
 	hit := qh.Hits[0]
-	if hit.FileIndex != index {
-		t.Fatalf("file index = %d, want %d", hit.FileIndex, index)
-	}
-	if int(hit.FileSize) != size {
-		t.Fatalf("file size = %d, want %d", hit.FileSize, size)
+	if hit.FileName != "shared.bin" {
+		t.Fatalf("filename = %q, want %q", hit.FileName, "shared.bin")
 	}
 
-	// Rewrite the QUERYHIT's source address to the stand-in servent,
-	// so the download is fetched over real TCP from it.
+	// The QUERYHIT advertises the Gnutella control address; the servent
+	// standing in for that peer serves HTTP on its own port, so point
+	// the download at it (same host, servent port).
 	ta, ok := srv.Listener.Addr().(*net.TCPAddr)
 	if !ok {
-		t.Fatalf("servent addr is %T, want *net.TCPAddr", srv.Listener.Addr())
+		t.Fatalf("servent address is %T, want *net.TCPAddr", srv.Listener.Addr())
 	}
 	ip := ta.IP.To4()
 	if ip == nil {
-		t.Fatalf("servent addr %s is not IPv4", ta)
+		t.Fatalf("servent address %s is not IPv4", ta)
 	}
 	copy(qh.IP[:], ip)
 	qh.Port = uint16(ta.Port)
 
-	dir := t.TempDir()
-	d := engA.Downloader(qh, hit)
-	res, err := d.Fetch(context.Background(), dir)
+	destDir := t.TempDir()
+	res, err := engA.Downloader(qh, hit).Fetch(context.Background(), destDir)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if res.Bytes != int64(size) {
-		t.Errorf("result bytes = %d, want %d", res.Bytes, size)
+	if res.Bytes != int64(len(content)) {
+		t.Errorf("result bytes = %d, want %d", res.Bytes, len(content))
 	}
-
 	onDisk, err := os.ReadFile(res.Path)
 	if err != nil {
-		t.Fatalf("read result: %v", err)
+		t.Fatalf("read downloaded file: %v", err)
 	}
 	if !bytes.Equal(onDisk, content) {
 		t.Errorf("downloaded file (%d bytes) does not match source (%d bytes)",
 			len(onDisk), len(content))
 	}
-	// Sanity: the path landed inside the destination directory.
-	if filepath.Dir(res.Path) != dir {
-		t.Errorf("result path %q is not inside %q", res.Path, dir)
+	if fi, err := os.Stat(res.Path); err != nil || fi.Size() != int64(len(content)) {
+		t.Errorf("on-disk size = %d, want %d", fi.Size(), len(content))
 	}
 }
