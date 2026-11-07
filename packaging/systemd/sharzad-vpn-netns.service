@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Prepares the network namespace Sharza's workers run inside when VPN
+# isolation is in use. It is the only privileged unit in the set: the
+# daemon itself stays unprivileged, and this unit runs once at boot to
+# create /run/netns/sharza-vpn, after which Vopono moves the tunnel's
+# tun device into it.
+#
+# See docs/VPN.md for the full setup.
+
+[Unit]
+Description=Sharza VPN network namespace preparation
+Before=sharzad.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Root is required here and only here: creating a network namespace needs
+# CAP_SYS_ADMIN. The daemon never runs with these privileges.
+User=root
+ExecStart=/usr/bin/ip netns add sharza-vpn
+# Tolerate the namespace already existing (reboot, manual re-run).
+ExecStart=-/bin/true
+ExecStop=/usr/bin/ip netns del sharza-vpn
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
