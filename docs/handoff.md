@@ -399,3 +399,22 @@ pin it. The 0.6 draft's pong-caching scheme (a cached PONG answers any PING
 with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
+
+### GTK_GNUTELLA_BIN oracle test landed (P1 exit gate)
+
+`internal/engine/gnutella/oracle_gtkgnutella_test.go` adds `TestGTK_GnutellaOracle`,
+env-gated on `GTK_GNUTELLA_BIN`. It skips loudly when the binary is absent or
+non-executable. When present it runs a controlled loopback search+download
+against a `--topless` gtk-gnutella instance in an isolated `GTK_GNUTELLA_DIR`,
+with `max_ultrapeers = 0` so no public swarm is contacted.
+
+Open questions / blockers for a host that has the binary:
+- The config_gnet booleans are written as `0`/`FALSE`-style tokens; if
+  gtk-gnutella's property parser rejects them the instance may still try to
+  bootstrap. Verify `online_mode` parsing on a real binary and adjust tokens if
+  needed.
+- Library scan timing is assumed (5 s sleep); a slow scan could make the search
+  miss the seeded file. The test does not poll for scan completion.
+- gtk-gnutella's HTTP serving path and `X-Gnutella-Content-Length` handling are
+  assumed to match the servent convention the scripted tests use; a mismatch
+  would surface as a Fetch failure rather than a skip.
