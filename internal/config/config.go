@@ -87,6 +87,12 @@ type Config struct {
 	// the same dial machinery. Endpoints are supplied as host:port; no
 	// `ukhl:` URL resolution happens here.
 	GnutellaKHLHosts []string `json:"gnutella_khl_hosts"`
+
+	// VpnNetnsPath is the network namespace workers run inside when VPN
+	// isolation is in use. It is prepared by the privileged
+	// sharzad-vpn-netns.service unit (see docs/VPN.md). Empty disables
+	// VPN isolation and workers run in the root namespace.
+	VpnNetnsPath string `json:"vpn_netns_path"`
 	// ConfigPath records where this Config was loaded from, so a worker
 	// can be spawned against the same file. Empty means built-in
 	// defaults. Not serialised: it describes where we came from, not
@@ -128,6 +134,8 @@ func (c *Config) applyDefaults() {
 	if c.GnutellaListen == "" {
 		c.GnutellaListen = "0.0.0.0:6346"
 	}
+	// VpnNetnsPath defaults to empty (disabled) rather than a path, so a
+	// fresh daemon never assumes a namespace that was never prepared.
 }
 
 const rpcSocketName = "sharzad.sock"
@@ -230,6 +238,11 @@ func (c *Config) Validate() error {
 	for i, cache := range c.GnutellaCaches {
 		if err := validateURL(fmt.Sprintf("gnutella_caches[%d]", i), cache); err != nil {
 			return err
+		}
+	}
+	if c.VpnNetnsPath != "" {
+		if !filepath.IsAbs(c.VpnNetnsPath) {
+			return fmt.Errorf("vpn_netns_path %q must be an absolute path", c.VpnNetnsPath)
 		}
 	}
 	return nil
