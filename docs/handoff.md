@@ -249,6 +249,17 @@ sanitiser each turned its guarding test red before being reverted.
 
 ## Open questions
 
+### P4 first slice: ed2k framing only
+
+`internal/engine/ed2k` now carries the TCP frame codec (protocol byte, size,
+opcode, payload) and the OP_REJECT / OP_SERVERMESSAGE / OP_OFFERFILES opcodes
+with their wire structs and encode/decode helpers, plus a FuzzEd2kFrame target.
+Deliberately not included in this slice, each its own piece of work: server
+connection/login, low-id/high-id handling, Kad bootstrap/routing, obfuscation,
+AICH, `.part.met` parsing, range mapping onto the canonical block map, and any
+daemon/worker or RPC/store wiring. Tag encoding supports only the normal (non
+small-tag) form; small-tag (0x80) variants are not handled yet.
+
 ### Download client: decisions left open
 
 - **Resume is implicit.** `Fetch(ctx, dir)` continues whatever partial file
