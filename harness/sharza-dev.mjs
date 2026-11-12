@@ -91,7 +91,7 @@ const VERIFY_COMMANDS = GO
   ? [
       { cmd: GO, args: ["build", "./..."], label: "build" },
       { cmd: GO, args: ["vet", "./..."], label: "vet" },
-      { cmd: GO, args: ["test", "./...", "-count=1"], label: "test" },
+      { cmd: GO, args: ["test", "-race", "./...", "-count=1"], label: "test (race)" },
       {
         cmd: GO,
         args: ["build", "./..."],
