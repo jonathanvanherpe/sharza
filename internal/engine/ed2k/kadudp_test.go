@@ -5,6 +5,7 @@ package ed2k
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -136,9 +137,12 @@ func TestKadUDPCloseStopsLoop(t *testing.T) {
 }
 
 func TestKadUDPStructLiteral(t *testing.T) {
+	var mu sync.Mutex
 	var received bool
 	var got *KadPacket
 	h := func(remote net.Addr, pkt *KadPacket) {
+		mu.Lock()
+		defer mu.Unlock()
 		got = pkt
 		received = true
 	}
@@ -161,10 +165,20 @@ func TestKadUDPStructLiteral(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !received {
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		r := received
+		mu.Unlock()
+		if r {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !received || got == nil {
+	mu.Lock()
+	r := received
+	g := got
+	mu.Unlock()
+	if !r || g == nil {
 		t.Fatal("packet not received via struct literal")
 	}
 }
