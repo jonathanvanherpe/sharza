@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jonathanvanherpe/sharza/internal/config"
+	"github.com/jonathanvanherpe/sharza/internal/engine/ed2k"
 	"github.com/jonathanvanherpe/sharza/internal/engine/gnutella"
 	"github.com/jonathanvanherpe/sharza/internal/logring"
 	"github.com/jonathanvanherpe/sharza/internal/role"
@@ -173,21 +174,32 @@ func runWorker(ctx context.Context, r role.Role, cfgPath string) error {
 // an engine idles until the context ends: alive and quiet is exactly
 // what the supervisor expects of an enabled-but-unimplemented role.
 func runWorkerRole(ctx context.Context, r role.Role, cfg *config.Config) error {
-	if r != role.G2 {
+	switch r {
+	case role.G2:
+		if !cfg.GnutellaEnabled {
+			fmt.Fprintln(os.Stderr, "sharzad: gnutella disabled")
+			<-ctx.Done()
+			return nil
+		}
+		return gnutella.New().Run(ctx, gnutella.Options{
+			Listen:   cfg.GnutellaListen,
+			Peers:    cfg.GnutellaPeers,
+			Caches:   cfg.GnutellaCaches,
+			KHLHosts: cfg.GnutellaKHLHosts,
+		})
+	case role.ED2K:
+		if len(cfg.Ed2kServers) == 0 {
+			fmt.Fprintln(os.Stderr, "sharzad: ed2k disabled")
+			<-ctx.Done()
+			return nil
+		}
+		return ed2k.New().Run(ctx, ed2k.Options{
+			Servers: cfg.Ed2kServers,
+		})
+	default:
 		<-ctx.Done()
 		return nil
 	}
-	if !cfg.GnutellaEnabled {
-		fmt.Fprintln(os.Stderr, "sharzad: gnutella disabled")
-		<-ctx.Done()
-		return nil
-	}
-	return gnutella.New().Run(ctx, gnutella.Options{
-		Listen:   cfg.GnutellaListen,
-		Peers:    cfg.GnutellaPeers,
-		Caches:   cfg.GnutellaCaches,
-		KHLHosts: cfg.GnutellaKHLHosts,
-	})
 }
 
 func awaitSupervisor(ctx context.Context, cfg *config.Config) error {
