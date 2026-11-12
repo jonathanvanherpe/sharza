@@ -806,7 +806,6 @@ func cloneSearchResults(in []KadSearchResult) []KadSearchResult {
 
 // Type aliases for naming flexibility.
 type (
-	KadUDP            = KadPacket
 	KadDatagram       = KadPacket
 	KadHeader         = KadPacket
 	KadPacketHeader   = KadPacket
