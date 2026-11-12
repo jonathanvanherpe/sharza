@@ -88,6 +88,10 @@ type Config struct {
 	// `ukhl:` URL resolution happens here.
 	GnutellaKHLHosts []string `json:"gnutella_khl_hosts"`
 
+	// Ed2kServers lists host:port addresses of eDonkey servers the engine
+	// dials and logs into.
+	Ed2kServers []string `json:"ed2k_servers"`
+
 	// VpnNetnsPath is the network namespace workers run inside when VPN
 	// isolation is in use. It is prepared by the privileged
 	// sharzad-vpn-netns.service unit (see docs/VPN.md). Empty disables
@@ -237,6 +241,11 @@ func (c *Config) Validate() error {
 	// be caught here, not by a worker that dies at its first fetch.
 	for i, cache := range c.GnutellaCaches {
 		if err := validateURL(fmt.Sprintf("gnutella_caches[%d]", i), cache); err != nil {
+			return err
+		}
+	}
+	for i, addr := range c.Ed2kServers {
+		if err := validateAddr(fmt.Sprintf("ed2k_servers[%d]", i), addr, true); err != nil {
 			return err
 		}
 	}
