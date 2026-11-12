@@ -411,6 +411,14 @@ with a matching hash, TTL + Hops = 7) is the maintainer's call to revisit
 before anything resembling routing or horizon logic lands. The mutation tests
 would then need updating in the same change.
 
+### P3 rate limiting: per-job limiting left as follow-up
+
+`internal/engine/bt` now applies global upload/download rate limits through
+`bt.Options` (`UploadRateLimit`/`DownloadRateLimit`, bytes/sec, 0 = unlimited)
+onto the anacrolix client config. Per-torrent/per-job limiters are out of
+scope: anacrolix exposes none at torrent level, so that is a separate slice
+that would need per-torrent wrapping or scheduler-level throttling.
+
 ### GTK_GNUTELLA_BIN oracle test landed (P1 exit gate)
 
 `internal/engine/gnutella/oracle_gtkgnutella_test.go` adds `TestGTK_GnutellaOracle`,
