@@ -252,6 +252,14 @@ func OpcodeName(op byte) string {
 		return "OP_SERVERMESSAGE"
 	case OP_OFFERFILES:
 		return "OP_OFFERFILES"
+	case OP_LOGINREQUEST:
+		return "OP_LOGINREQUEST"
+	case OP_GETSERVERLIST:
+		return "OP_GETSERVERLIST"
+	case OP_IDCHANGE:
+		return "OP_IDCHANGE"
+	case OP_SERVERLIST:
+		return "OP_SERVERLIST"
 	default:
 		return fmt.Sprintf("0x%02X", op)
 	}
