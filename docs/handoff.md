@@ -437,3 +437,19 @@ Open questions / blockers for a host that has the binary:
 - gtk-gnutella's HTTP serving path and `X-Gnutella-Content-Length` handling are
   assumed to match the servent convention the scripted tests use; a mismatch
   would surface as a Fetch failure rather than a skip.
+
+### P4 AICH verification: first slice landed
+
+`internal/engine/ed2k/aich.go` adds `AICHBlockSize` (180 KiB), `AICHRoot`,
+`AICHVerify`, plus leaf-count/depth helpers and aliases. MD4 via
+`golang.org/x/crypto/md4` (promoted to a direct dependency; pure Go, no cgo).
+
+Semantics chosen for this slice, to be reconciled with `amuled` in the
+differential test later:
+- Blocks are zero-padded to `blockSize` before hashing (final short block
+  included).
+- Odd trailing node in a level is promoted unchanged (not duplicated).
+- Empty input yields the zero hash.
+- On root mismatch, every block index is reported as suspect, because the
+  root alone cannot localize corruption; callers with per-block hashes can
+  narrow the set. This is the one most likely to need revisiting.
