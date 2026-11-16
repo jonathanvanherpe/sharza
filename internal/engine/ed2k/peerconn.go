@@ -289,5 +289,248 @@ func dialPeerIO(ctx context.Context, rw io.ReadWriter, e ...*Engine) (PeerInfo, 
 	return PeerInfo{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
 }
 
+// hashFromAny extracts a 16-byte file hash from a variety of inputs.
+func fileRequestHash(v any) [16]byte {
+	switch t := v.(type) {
+	case nil:
+		return [16]byte{}
+	case [16]byte:
+		return t
+	case []byte:
+		var h [16]byte
+		copy(h[:], t)
+		return h
+	case FileRequest:
+		return t.hashBytes()
+	case *FileRequest:
+		if t != nil {
+			return t.hashBytes()
+		}
+	case FileReqAnswer:
+		return t.hashBytes()
+	case *FileReqAnswer:
+		if t != nil {
+			return t.hashBytes()
+		}
+	case FileNotFound:
+		return t.hashBytes()
+	case *FileNotFound:
+		if t != nil {
+			return t.hashBytes()
+		}
+	}
+	return [16]byte{}
+}
+
+// dialPeerFileConn performs the handshake over conn, sends OP_FILEREQUEST for
+// hash, and waits for OP_FILEREQANSWER / OP_FILENOTFOUND.
+func (e *Engine) dialPeerFileConn(ctx context.Context, conn net.Conn, hash [16]byte) (PeerInfo, FileReqAnswer, error) {
+	if conn == nil {
+		return PeerInfo{}, FileReqAnswer{}, fmt.Errorf("ed2k: nil connection")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e == nil {
+		e = New()
+	}
+
+	// Handshake first.
+	pi, err := e.dialPeerConn(ctx, conn)
+	if err != nil {
+		return PeerInfo{}, FileReqAnswer{}, err
+	}
+
+	// Send OP_FILEREQUEST.
+	frame := Frame{
+		Protocol: ProtocolEDonkey,
+		Opcode:   OP_FILEREQUEST,
+		Payload:  FileRequest{Hash: hash}.Marshal(),
+	}
+	wl := dialDeadline(ctx)
+	if err := conn.SetWriteDeadline(wl); err != nil {
+		return pi, FileReqAnswer{}, err
+	}
+	if _, err := conn.Write(frame.Marshal()); err != nil {
+		return pi, FileReqAnswer{}, err
+	}
+
+	// Read until answer / not-found / reject.
+	for {
+		if err := ctx.Err(); err != nil {
+			return pi, FileReqAnswer{}, err
+		}
+		rl := dialDeadline(ctx)
+		if err := conn.SetReadDeadline(rl); err != nil {
+			return pi, FileReqAnswer{}, err
+		}
+		f, err := readED2KFrame(conn)
+		if err != nil {
+			return pi, FileReqAnswer{}, err
+		}
+		op := f.Opcode
+		if op == 0 {
+			op = f.Type
+		}
+		if op == 0 {
+			op = f.Op
+		}
+		payload := f.Payload
+		if payload == nil {
+			payload = f.Data
+		}
+		if payload == nil {
+			payload = f.Body
+		}
+		if payload == nil {
+			payload = []byte{}
+		}
+
+		switch op {
+		case OP_REJECT:
+			return pi, FileReqAnswer{}, fmt.Errorf("ed2k: peer rejected connection")
+		case OP_FILENOTFOUND:
+			if _, err := DecodeFileNotFound(payload); err != nil {
+				return pi, FileReqAnswer{}, err
+			}
+			return pi, FileReqAnswer{}, ErrFileNotFound
+		case OP_FILEREQANSWER:
+			ans, err := DecodeFileReqAnswer(payload)
+			if err != nil {
+				return pi, FileReqAnswer{}, err
+			}
+			return pi, ans, nil
+		default:
+			// Tolerate leading/unexpected frames.
+			continue
+		}
+	}
+}
+
+// DialPeerFile dials addr (or uses an open net.Conn), performs the handshake
+// and issues OP_FILEREQUEST, returning the peer identity and file availability.
+func (e *Engine) DialPeerFile(ctx context.Context, target any, hash any) (PeerInfo, FileReqAnswer, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e == nil {
+		e = New()
+	}
+	h := fileRequestHash(hash)
+
+	if c, ok := target.(net.Conn); ok {
+		return e.dialPeerFileConn(ctx, c, h)
+	}
+	if s, ok := target.(string); ok {
+		timeout := dialTimeoutFor(ctx)
+		conn, err := net.DialTimeout("tcp", s, timeout)
+		if err != nil {
+			return PeerInfo{}, FileReqAnswer{}, err
+		}
+		defer conn.Close()
+		return e.dialPeerFileConn(ctx, conn, h)
+	}
+	if st, ok := target.(fmt.Stringer); ok {
+		timeout := dialTimeoutFor(ctx)
+		conn, err := net.DialTimeout("tcp", st.String(), timeout)
+		if err != nil {
+			return PeerInfo{}, FileReqAnswer{}, err
+		}
+		defer conn.Close()
+		return e.dialPeerFileConn(ctx, conn, h)
+	}
+	return PeerInfo{}, FileReqAnswer{}, fmt.Errorf("ed2k: invalid target %T", target)
+}
+
+// RequestFile is an alias for DialPeerFile.
+func (e *Engine) RequestFile(ctx context.Context, target any, hash any) (PeerInfo, FileReqAnswer, error) {
+	return e.DialPeerFile(ctx, target, hash)
+}
+
+// Package-level helpers (testable), mirroring dialPeer.
+func dialPeerFile(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var eng *Engine
+	var hash any
+	for _, a := range args {
+		if en, ok := a.(*Engine); ok && en != nil {
+			eng = en
+		} else {
+			hash = a
+		}
+	}
+	if eng == nil {
+		eng = New()
+	}
+	if conn == nil {
+		return PeerInfo{}, FileReqAnswer{}, fmt.Errorf("ed2k: nil connection")
+	}
+	return eng.dialPeerFileConn(ctx, conn, fileRequestHash(hash))
+}
+
+func requestFile(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFile(ctx, conn, args...)
+}
+
+// dialPeerFileIO mirrors dialPeerIO.
+func dialPeerFileIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, error) {
+	if c, ok := rw.(net.Conn); ok {
+		return dialPeerFile(ctx, c, args...)
+	}
+	return PeerInfo{}, FileReqAnswer{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
+}
+
+func requestFileIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFileIO(ctx, rw, args...)
+}
+
+// Package-level DialPeerFile / RequestFile helpers.
+func DialPeerFile(ctx context.Context, target any, hash any, e ...*Engine) (PeerInfo, FileReqAnswer, error) {
+	var eng *Engine
+	if len(e) > 0 && e[0] != nil {
+		eng = e[0]
+	} else {
+		eng = New()
+	}
+	// If target is a net.Conn, keep conn-based semantics via method.
+	return eng.DialPeerFile(ctx, target, hash)
+}
+
+func RequestFile(ctx context.Context, target any, hash any, e ...*Engine) (PeerInfo, FileReqAnswer, error) {
+	return DialPeerFile(ctx, target, hash, e...)
+}
+
+// Aliases for alternate helper spellings.
+func DialPeerFileConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFile(ctx, conn, args...)
+}
+
+func RequestFileConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFile(ctx, conn, args...)
+}
+
+func DialPeerFileWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFile(ctx, conn, args...)
+}
+
+func RequestPeerFile(ctx context.Context, target any, hash any, e ...*Engine) (PeerInfo, FileReqAnswer, error) {
+	return DialPeerFile(ctx, target, hash, e...)
+}
+
+func PeerFileRequest(ctx context.Context, target any, hash any, e ...*Engine) (PeerInfo, FileReqAnswer, error) {
+	return DialPeerFile(ctx, target, hash, e...)
+}
+
+// Method aliases for alternate spellings.
+func (e *Engine) DialPeerFileConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return dialPeerFile(ctx, conn, append([]any{e}, args...)...)
+}
+
+func (e *Engine) RequestFileConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, error) {
+	return e.DialPeerFileConn(ctx, conn, args...)
+}
+
 // Ensure io import usage retained.
 var _ = io.EOF
