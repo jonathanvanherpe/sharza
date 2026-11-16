@@ -273,6 +273,10 @@ func OpcodeName(op byte) string {
 		return "OP_FILESTATUSREQUEST"
 	case OP_FILESTATUS:
 		return "OP_FILESTATUS"
+	case OP_HASHSETREQUEST:
+		return "OP_HASHSETREQUEST"
+	case OP_HASHSETANSWER:
+		return "OP_HASHSETANSWER"
 	default:
 		return fmt.Sprintf("0x%02X", op)
 	}
