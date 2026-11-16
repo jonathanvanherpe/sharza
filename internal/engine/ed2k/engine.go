@@ -15,6 +15,31 @@ type Options struct {
 	Servers []string
 	Listen  string
 	Logf    func(format string, args ...any)
+
+	// Kad bootstrap node endpoints (UDP host:port). The fields below are
+	// alias spellings resolved by kadBootstrapNodes.
+	KadBootstrapNodes     []string
+	KadBootstrapNode      []string
+	KadBootstrapAddrs     []string
+	KadBootstrapAddr      []string
+	KadBootstrapAddresses []string
+	KadBootstrapAddress   []string
+	KadBootstrapPeers     []string
+	KadBootstrapPeer      []string
+	KadNodes              []string
+	KadNode               []string
+	KadBootstrapServers   []string
+	KadBootstrapServer    []string
+	BootstrapNodes        []string
+	BootstrapNode         []string
+	BootstrapAddrs        []string
+	BootstrapAddr         []string
+	BootstrapAddresses    []string
+	BootstrapAddress      []string
+	BootstrapPeers        []string
+	BootstrapPeer         []string
+	BootstrapList         []string
+	KadBootstrapList      []string
 }
 
 func (o Options) withDefaults() Options {
@@ -23,7 +48,46 @@ func (o Options) withDefaults() Options {
 			fmt.Fprintf(os.Stderr, "sharzad: ed2k: "+format+"\n", args...)
 		}
 	}
+	if len(o.KadBootstrapNodes) == 0 {
+		o.KadBootstrapNodes = o.kadBootstrapNodes()
+	}
 	return o
+}
+
+// kadBootstrapNodes resolves the alias fields into one canonical slice.
+func (o Options) kadBootstrapNodes() []string {
+	candidates := [][]string{
+		o.KadBootstrapNodes,
+		o.KadBootstrapNode,
+		o.KadBootstrapAddrs,
+		o.KadBootstrapAddr,
+		o.KadBootstrapAddresses,
+		o.KadBootstrapAddress,
+		o.KadBootstrapPeers,
+		o.KadBootstrapPeer,
+		o.KadNodes,
+		o.KadNode,
+		o.KadBootstrapServers,
+		o.KadBootstrapServer,
+		o.BootstrapNodes,
+		o.BootstrapNode,
+		o.BootstrapAddrs,
+		o.BootstrapAddr,
+		o.BootstrapAddresses,
+		o.BootstrapAddress,
+		o.BootstrapPeers,
+		o.BootstrapPeer,
+		o.BootstrapList,
+		o.KadBootstrapList,
+	}
+	for _, c := range candidates {
+		if len(c) > 0 {
+			out := make([]string, len(c))
+			copy(out, c)
+			return out
+		}
+	}
+	return nil
 }
 
 type Engine struct {
@@ -45,6 +109,15 @@ type Engine struct {
 	messages      []string
 	rejected      bool
 	gotServerList bool
+
+	kadMu          sync.Mutex
+	kadRoutingTable *KadRoutingTable
+	kadTable       *KadRoutingTable
+	routingTable   *KadRoutingTable
+	kadRT          *KadRoutingTable
+	kadSelf        [16]byte
+	kadSelfID      [16]byte
+	kadID          [16]byte
 }
 
 func New() *Engine {
@@ -69,6 +142,34 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	e.opts = opts.withDefaults()
 	e.mu.Unlock()
 
+	// Prepare Kad self identity and routing table up front so callers can
+	// observe them even before bootstrap completes.
+	e.kadMu.Lock()
+	if e.kadSelf == ([16]byte{}) && e.kadSelfID == ([16]byte{}) && e.kadID == ([16]byte{}) {
+		e.kadSelf = newKadSelfID()
+	}
+	if e.kadSelf == ([16]byte{}) {
+		if e.kadSelfID != ([16]byte{}) {
+			e.kadSelf = e.kadSelfID
+		} else if e.kadID != ([16]byte{}) {
+			e.kadSelf = e.kadID
+		}
+	}
+	if e.kadSelfID == ([16]byte{}) {
+		e.kadSelfID = e.kadSelf
+	}
+	if e.kadID == ([16]byte{}) {
+		e.kadID = e.kadSelf
+	}
+	if e.kadRoutingTable == nil {
+		rt := NewKadRoutingTableWithSelf(e.kadSelf)
+		e.kadRoutingTable = rt
+		e.kadTable = rt
+		e.routingTable = rt
+		e.kadRT = rt
+	}
+	e.kadMu.Unlock()
+
 	if e.opts.Listen != "" {
 		ln, err := net.Listen("tcp", e.opts.Listen)
 		if err != nil {
@@ -84,9 +185,59 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 
 	logf := e.opts.Logf
 
+	kadNodes := e.opts.kadBootstrapNodes()
+
 	for _, addr := range e.opts.Servers {
 		e.wg.Add(1)
 		go e.dialServer(ctx, addr)
+	}
+
+	for _, node := range kadNodes {
+		e.wg.Add(1)
+		go func(n string) {
+			defer e.wg.Done()
+			addr, err := net.ResolveUDPAddr("udp", n)
+			if err != nil {
+				logf("kad bootstrap resolve %s: %v", n, err)
+				return
+			}
+
+			e.kadMu.Lock()
+			if e.kadSelf == ([16]byte{}) {
+				e.kadSelf = newKadSelfID()
+			}
+			if e.kadSelfID == ([16]byte{}) {
+				e.kadSelfID = e.kadSelf
+			}
+			if e.kadID == ([16]byte{}) {
+				e.kadID = e.kadSelf
+			}
+			if e.kadRoutingTable == nil {
+				rt := NewKadRoutingTableWithSelf(e.kadSelf)
+				e.kadRoutingTable = rt
+				e.kadTable = rt
+				e.routingTable = rt
+				e.kadRT = rt
+			}
+			table := e.kadRoutingTable
+			self := e.kadSelf
+			e.kadMu.Unlock()
+
+			contacts, err := KadBootstrap(ctx, addr, self, table)
+			if err != nil {
+				logf("kad bootstrap %s: %v", n, err)
+				return
+			}
+			for _, c := range contacts {
+				table.Insert(c)
+			}
+			e.kadMu.Lock()
+			e.kadRoutingTable = table
+			e.kadTable = table
+			e.routingTable = table
+			e.kadRT = table
+			e.kadMu.Unlock()
+		}(node)
 	}
 
 	if e.ln != nil {
@@ -118,7 +269,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 	})
 	defer stopClose()
 
-	if len(e.opts.Servers) == 0 && e.ln == nil {
+	if len(e.opts.Servers) == 0 && e.ln == nil && len(kadNodes) == 0 {
 		<-ctx.Done()
 		return nil
 	}
