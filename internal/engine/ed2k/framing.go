@@ -252,6 +252,10 @@ func OpcodeName(op byte) string {
 		return "OP_SERVERMESSAGE"
 	case OP_OFFERFILES:
 		return "OP_OFFERFILES"
+	case OP_REQUESTPARTS:
+		return "OP_REQUESTPARTS"
+	case OP_SENDINGPART:
+		return "OP_SENDINGPART"
 	case OP_LOGINREQUEST:
 		return "OP_LOGINREQUEST"
 	case OP_GETSERVERLIST:
