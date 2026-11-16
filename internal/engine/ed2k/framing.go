@@ -245,6 +245,9 @@ func MarshalFrame(f Frame) []byte { return f.Marshal() }
 
 // OpcodeName returns a human-readable name for an opcode.
 func OpcodeName(op byte) string {
+	if op == OP_HELLO {
+		return "OP_HELLO"
+	}
 	switch op {
 	case OP_REJECT:
 		return "OP_REJECT"
@@ -264,6 +267,8 @@ func OpcodeName(op byte) string {
 		return "OP_IDCHANGE"
 	case OP_SERVERLIST:
 		return "OP_SERVERLIST"
+	case OP_HELLOANSWER:
+		return "OP_HELLOANSWER"
 	default:
 		return fmt.Sprintf("0x%02X", op)
 	}

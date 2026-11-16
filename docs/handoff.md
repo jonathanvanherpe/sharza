@@ -453,3 +453,7 @@ differential test later:
 - On root mismatch, every block index is reported as suspect, because the
   root alone cannot localize corruption; callers with per-block hashes can
   narrow the set. This is the one most likely to need revisiting.
+
+## Open questions (this cycle)
+
+- eDonkey C2C Hello handshake: `OP_HELLO` (0x01) collides with `OP_LOGINREQUEST` (0x01); `OpcodeName` now reports `OP_HELLO` for 0x01. `HelloAnswer` follows Shareaza's published layout and has no leading 0x10 byte (only `Hello` does), per the wire format rather than a literal reading of the brief's "same fields".
