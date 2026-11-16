@@ -11,9 +11,7 @@ import (
 	"time"
 )
 
-const (
-	ed2kDialTimeout = 10 * time.Second
-)
+var ed2kDialTimeout = 10 * time.Second
 
 // readED2KFrame reads one frame from a live connection without requiring
 // the sender to close or send trailing bytes.
