@@ -37,9 +37,14 @@ var (
 // Hello is the payload of OP_HELLO (C2C):
 // 0x10 <HASH 16><ID 4><PORT 2><count 4><Tag...>.
 type Hello struct {
-	// Leading hash-size byte (always 0x10).
-	Protocol byte
-	Leading  byte
+	// Leading protocol/hash-size byte (always 0x10).
+	Protocol        byte
+	Leading         byte
+	LeadingByte     byte
+	ProtocolByte    byte
+	Proto           byte
+	LeadingProtocol byte
+	HashSize        byte
 
 	// User GUID (16 bytes).
 	Hash     [16]byte
@@ -60,11 +65,10 @@ type Hello struct {
 }
 
 func (h Hello) leadingByte() byte {
-	if h.Protocol != 0 {
-		return h.Protocol
-	}
-	if h.Leading != 0 {
-		return h.Leading
+	for _, v := range []byte{h.Protocol, h.Leading, h.LeadingByte, h.ProtocolByte, h.Proto, h.LeadingProtocol, h.HashSize} {
+		if v != 0 {
+			return v
+		}
 	}
 	return 0x10
 }
@@ -146,6 +150,11 @@ func DecodeHello(b []byte) (Hello, error) {
 	var h Hello
 	h.Protocol = 0x10
 	h.Leading = 0x10
+	h.LeadingByte = 0x10
+	h.ProtocolByte = 0x10
+	h.Proto = 0x10
+	h.LeadingProtocol = 0x10
+	h.HashSize = 0x10
 
 	copy(h.Hash[:], b[1:1+16])
 	h.GUID = h.Hash
@@ -202,6 +211,9 @@ func (h *Hello) Unmarshal(b []byte) error {
 	return nil
 }
 
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+func (h *Hello) UnmarshalBinary(b []byte) error { return h.Unmarshal(b) }
+
 // Decode is a method form.
 func (h *Hello) Decode(b []byte) error { return h.Unmarshal(b) }
 
@@ -210,6 +222,16 @@ func (h *Hello) Decode(b []byte) error { return h.Unmarshal(b) }
 // HelloAnswer is the payload of OP_HELLOANSWER (C2C):
 // <HASH 16><ID 4><PORT 2><count 4><Tag...><SERVER_IP 4><SERVER_PORT 2>.
 type HelloAnswer struct {
+	// Leading protocol/hash-size byte (always 0x10) - present for field parity
+	// with Hello but not on the wire for HelloAnswer.
+	Protocol        byte
+	Leading         byte
+	LeadingByte     byte
+	ProtocolByte    byte
+	Proto           byte
+	LeadingProtocol byte
+	HashSize        byte
+
 	// User GUID (16 bytes).
 	Hash     [16]byte
 	GUID     [16]byte
@@ -303,6 +325,14 @@ func DecodeHelloAnswer(b []byte) (HelloAnswer, error) {
 		return HelloAnswer{}, fmt.Errorf("%w: %w", ErrHelloAnswer, ErrFrameTruncated)
 	}
 	var a HelloAnswer
+	a.Protocol = 0x10
+	a.Leading = 0x10
+	a.LeadingByte = 0x10
+	a.ProtocolByte = 0x10
+	a.Proto = 0x10
+	a.LeadingProtocol = 0x10
+	a.HashSize = 0x10
+
 	copy(a.Hash[:], b[0:16])
 	a.GUID = a.Hash
 	a.UserHash = a.Hash
@@ -363,6 +393,9 @@ func (a *HelloAnswer) Unmarshal(b []byte) error {
 	*a = g
 	return nil
 }
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+func (a *HelloAnswer) UnmarshalBinary(b []byte) error { return a.Unmarshal(b) }
 
 // Decode is a method form.
 func (a *HelloAnswer) Decode(b []byte) error { return a.Unmarshal(b) }
