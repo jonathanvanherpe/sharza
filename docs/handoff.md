@@ -456,6 +456,8 @@ differential test later:
 
 ## Open questions (this cycle)
 
+- P4 ed2k server-side (incoming) transfer: `internal/engine/ed2k/servertransfer.go` adds `serveTransferConn` mirroring `serverfilerequest.go` + `transferconn.go`: OP_HELLO/OP_HELLOANSWER, OP_FILEREQUEST → OP_FILEREQANSWER/OP_FILENOTFOUND, OP_REQUESTPARTS → OP_SENDINGPART with caller-supplied source bytes sliced by von/bis. Out of scope: queue handling, file I/O, `.part.met`, AICH, obfuscation, daemon/RPC/store/config wiring, range mapping to canonical blocks.
+
 - eDonkey C2C Hello handshake: `OP_HELLO` (0x01) collides with `OP_LOGINREQUEST` (0x01); `OpcodeName` now reports `OP_HELLO` for 0x01. `HelloAnswer` follows Shareaza's published layout and has no leading 0x10 byte (only `Hello` does), per the wire format rather than a literal reading of the brief's "same fields".
 
 - P4 hash-set codecs: `internal/engine/ed2k/hashset.go` adds `OP_HASHSETREQUEST` (0x51) and `OP_HASHSETANSWER` (0x52) plus request/answer structs. Wire format follows Shareaza's EDPacket.h comment (`<HASH 16>` request; `<count u16 LE><HASH[count]>` answer) rather than Shareaza's runtime code, which additionally writes a leading file hash in the answer; the brief's struct spec omits that field, so the codec is count + hashes only. Out of scope: C2C networking, queue scheduling, AICH verification wiring, `.part.met` I/O, obfuscation, I64/compressed-part variants, config/cmd/daemon/RPC/store changes.
