@@ -330,6 +330,12 @@ func fileRequestHash(v any) [16]byte {
 		if t != nil {
 			return t.hashBytes()
 		}
+	case QueueRequest:
+		return t.hashBytes()
+	case *QueueRequest:
+		if t != nil {
+			return t.hashBytes()
+		}
 	}
 	return [16]byte{}
 }
