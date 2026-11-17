@@ -183,7 +183,7 @@ type (
 // verified only when all parts are present and matching and the whole-file
 // MD4 matches PartMet.FileHash, and optionally checks the AICH root when a
 // trusted root is supplied via the trailing variadic arguments.
-func VerifyPartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
+func PartVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
 	if data == nil {
 		data = []byte{}
 	}
@@ -457,118 +457,98 @@ func VerifyPartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, erro
 	return res, nil
 }
 
-// verifyPartMet is an unexported alias, mirroring aich.go.
-func verifyPartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
-}
 
 // --- Method forms ---
 
 func (pm PartMet) Verify(data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func (pm PartMet) VerifyPartMet(data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func (pm PartMet) VerifyPart(data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func (pm PartMet) Check(data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func (pm PartMet) Validate(data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 // --- Package-level aliases / alternate spellings ---
 
 func VerifyPart(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyParts(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyPartHashes(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyPartMetRecord(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyPartMetData(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyPartData(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyPartsData(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func VerifyMetPart(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
-}
-
-func CheckPartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func ValidatePartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func ValidatePart(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
-}
-
-func PartVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
-}
-
-func PartMetVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func PartVerifyMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
-func PartVerifyPartMet(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+func PartPartVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
+	return PartVerify(pm, data, args...)
 }
 
 func Verify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 // lowercase aliases
 func verifyPart(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func verifyParts(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func verifyPartHashes(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 func partVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
-}
-
-func partMetVerify(pm PartMet, data []byte, args ...any) (PartVerifyResult, error) {
-	return VerifyPartMet(pm, data, args...)
+	return PartVerify(pm, data, args...)
 }
 
 // AICH-specific convenience wrappers.
@@ -578,9 +558,9 @@ func VerifyPartMetAICH(pm PartMet, data []byte, root [16]byte, blockSize ...uint
 		bs = blockSize[0]
 	}
 	if bs == 0 {
-		return VerifyPartMet(pm, data, root)
+		return PartVerify(pm, data, root)
 	}
-	return VerifyPartMet(pm, data, root, bs)
+	return PartVerify(pm, data, root, bs)
 }
 
 func VerifyPartAICH(pm PartMet, data []byte, root [16]byte, blockSize ...uint64) (PartVerifyResult, error) {

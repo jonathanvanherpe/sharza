@@ -467,3 +467,9 @@ differential test later:
 ### P4 ed2k download client (first slice)
 
 Added `internal/engine/ed2k/download.go` with `Downloader`, `Engine.DialDownload`/`Download` and `dialDownload`/`dialDownloadConn` helpers mirroring the transfer/queue helpers. Loops OP_REQUESTPARTS/OP_SENDINGPART into a caller-supplied destination (io.Writer/[]byte/*[]byte), stopping on empty part/EOF. No queue scheduling, file I/O, .part.met, AICH, obfuscation, pooling/retry, or daemon/RPC/store wiring.
+
+### P4 ed2k `.part.met` verification (first slice)
+
+Added `internal/engine/ed2k/partmetverify.go` with `PartMetVerify(data []byte, pm PartMet) (bool, []int)` plus aliases (`VerifyPartMet`, `PartMetCheck`, `CheckPartMet`) and `PartMetPartHash`. Resolves `PartMet` alias fields via `normalized()`; checks non-zero file size against `len(data)`; MD4 (golang.org/x/crypto/md4) per part (final short part, no padding); collects corrupt/missing part indices; non-zero root/file MD4 mismatch marks every part corrupt. Returns `true, nil` on full match. No file I/O, networking, AICH wiring, obfuscation, or daemon/RPC/store/config changes.
+
+To avoid Go redeclaration (same package) with the prior `partverify.go` helpers, the colliding top-level names `VerifyPartMet(pm,...)`, `CheckPartMet(pm,...)`, `PartMetVerify(pm,...)` (and lowercase `verifyPartMet`/`partMetVerify`) were removed from `partverify.go`; their behaviour remains reachable via the non-colliding `PartVerify`/`ValidatePartMet`/etc. aliases, and `partverify_test.go` was updated to call `PartVerify`. The new API keeps the existing `PartVerifyResult`-based helper intact for callers that want the richer result.
