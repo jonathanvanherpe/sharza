@@ -44,7 +44,7 @@ func TestServeTransferConnSuccess(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		pi, fr, rp, sp, err := e.ServeTransferConn(ctx, conn, wantHash, availName, wantData)
+		pi, fr, rp, err := e.ServeTransferConn(ctx, conn, wantHash, availName, wantData)
 		if err != nil {
 			t.Errorf("ServeTransferConn: %v", err)
 			return
@@ -63,9 +63,6 @@ func TestServeTransferConnSuccess(t *testing.T) {
 		}
 		if rp.hashBytes() != wantHash {
 			t.Errorf("returned rp hash = %v, want %v", rp.hashBytes(), wantHash)
-		}
-		if string(sp.Data) != string(wantData) {
-			t.Errorf("returned data = %q, want %q", sp.Data, wantData)
 		}
 		_ = serverClientID
 		_ = serverPort
@@ -164,7 +161,7 @@ func TestServeTransferConnNotFound(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		// No available file supplied -> not found.
-		pi, fr, _, _, err := e.ServeTransferConn(ctx, conn)
+		pi, fr, _, err := e.ServeTransferConn(ctx, conn)
 		if err != nil {
 			t.Errorf("ServeTransferConn: %v", err)
 			return
@@ -237,7 +234,7 @@ func TestServeTransferConnNotFoundMismatched(t *testing.T) {
 		e := New()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _, _, _, err = e.ServeTransferConn(ctx, conn, otherHash, "other.txt")
+		_, _, _, err = e.ServeTransferConn(ctx, conn, otherHash, "other.txt")
 		if err != nil {
 			t.Errorf("ServeTransferConn: %v", err)
 		}
@@ -300,7 +297,7 @@ func TestServeTransferConnMalformed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_, _, _, _, err = e.ServeTransferConn(ctx, conn)
+	_, _, _, err = e.ServeTransferConn(ctx, conn)
 	if err == nil {
 		t.Fatal("expected error on unexpected opcode")
 	}
@@ -365,7 +362,7 @@ func TestServeTransferConnMalformedRequest(t *testing.T) {
 	// Send truncated OP_FILEREQUEST.
 	conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_FILEREQUEST, Payload: []byte{1, 2, 3}}.Marshal())
 
-	_, _, _, _, err = e.ServeTransferConn(ctx, conn, wantHash, "avail.txt")
+	_, _, _, err = e.ServeTransferConn(ctx, conn, wantHash, "avail.txt")
 	if err == nil {
 		t.Fatal("expected decode error")
 	}
@@ -391,16 +388,13 @@ func TestServeTransferConnRoundTrip(t *testing.T) {
 		e := New()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _, rp, sp, err := e.ServeTransferConn(ctx, conn, wantHash, "avail.txt", wantData)
+		_, _, rp, err := e.ServeTransferConn(ctx, conn, wantHash, "avail.txt", wantData)
 		if err != nil {
 			t.Errorf("ServeTransferConn: %v", err)
 			return
 		}
 		if rp.Von[0] != 0 || rp.Bis[0] != uint32(len(wantData)) {
 			t.Errorf("rp range = %d/%d", rp.Von[0], rp.Bis[0])
-		}
-		if string(sp.Data) != string(wantData) {
-			t.Errorf("data = %q, want %q", sp.Data, wantData)
 		}
 	}()
 
@@ -470,7 +464,7 @@ func TestServeTransferConnSizeMismatch(t *testing.T) {
 		e := New()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _, _, _, err = e.ServeTransferConn(ctx, conn, wantHash, "avail.txt", wantData)
+		_, _, _, err = e.ServeTransferConn(ctx, conn, wantHash, "avail.txt", wantData)
 		// refusal: either error or notfound; we accept nil with notfound write
 		_ = err
 	}()

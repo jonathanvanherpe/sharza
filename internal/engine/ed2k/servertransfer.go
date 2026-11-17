@@ -20,9 +20,9 @@ import (
 // source buffer by the request's von/bis range.
 // It returns the peer identity, the decoded FileRequest, the decoded
 // RequestParts, and the SendingPart that was sent.
-func (e *Engine) serveTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) serveTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	if conn == nil {
-		return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: nil connection")
+		return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: nil connection")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -41,15 +41,15 @@ func (e *Engine) serveTransferConn(ctx context.Context, conn net.Conn, args ...a
 handshake:
 	for {
 		if err := ctx.Err(); err != nil {
-			return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+			return PeerInfo{}, FileRequest{}, RequestParts{}, err
 		}
 		rl := dialDeadline(ctx)
 		if err := conn.SetReadDeadline(rl); err != nil {
-			return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+			return PeerInfo{}, FileRequest{}, RequestParts{}, err
 		}
 		f, err := readED2KFrame(conn)
 		if err != nil {
-			return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+			return PeerInfo{}, FileRequest{}, RequestParts{}, err
 		}
 		op := f.Opcode
 		if op == 0 {
@@ -71,11 +71,11 @@ handshake:
 
 		switch op {
 		case OP_REJECT:
-			return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: peer rejected connection")
+			return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: peer rejected connection")
 		case OP_HELLO:
 			h, err := DecodeHello(payload)
 			if err != nil {
-				return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+				return PeerInfo{}, FileRequest{}, RequestParts{}, err
 			}
 			cid := h.ClientID
 			if cid == 0 {
@@ -122,14 +122,14 @@ handshake:
 			}
 			wl := dialDeadline(ctx)
 			if err := conn.SetWriteDeadline(wl); err != nil {
-				return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+				return PeerInfo{}, FileRequest{}, RequestParts{}, err
 			}
 			if _, err := conn.Write(frame.Marshal()); err != nil {
-				return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, err
+				return PeerInfo{}, FileRequest{}, RequestParts{}, err
 			}
 			break handshake
 		default:
-			return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: unexpected opcode 0x%02X", op)
+			return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: unexpected opcode 0x%02X", op)
 		}
 	}
 
@@ -137,15 +137,15 @@ handshake:
 readRequest:
 	for {
 		if err := ctx.Err(); err != nil {
-			return peer, fr, RequestParts{}, SendingPart{}, err
+			return peer, fr, RequestParts{}, err
 		}
 		rl := dialDeadline(ctx)
 		if err := conn.SetReadDeadline(rl); err != nil {
-			return peer, fr, RequestParts{}, SendingPart{}, err
+			return peer, fr, RequestParts{}, err
 		}
 		f, err := readED2KFrame(conn)
 		if err != nil {
-			return peer, fr, RequestParts{}, SendingPart{}, err
+			return peer, fr, RequestParts{}, err
 		}
 		op := f.Opcode
 		if op == 0 {
@@ -167,11 +167,11 @@ readRequest:
 
 		switch op {
 		case OP_REJECT:
-			return peer, fr, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: peer rejected connection")
+			return peer, fr, RequestParts{}, fmt.Errorf("ed2k: peer rejected connection")
 		case OP_FILEREQUEST:
 			decoded, err := DecodeFileRequest(payload)
 			if err != nil {
-				return peer, fr, RequestParts{}, SendingPart{}, err
+				return peer, fr, RequestParts{}, err
 			}
 			fr = decoded
 			reqHash := fr.hashBytes()
@@ -179,7 +179,7 @@ readRequest:
 			found := hasAvailable && reqHash == availHash
 			wl := dialDeadline(ctx)
 			if err := conn.SetWriteDeadline(wl); err != nil {
-				return peer, fr, RequestParts{}, SendingPart{}, err
+				return peer, fr, RequestParts{}, err
 			}
 			if found {
 				ans := FileReqAnswer{Hash: availHash, Name: availName}
@@ -192,7 +192,7 @@ readRequest:
 					Payload:  ans.Marshal(),
 				}
 				if _, err := conn.Write(frame.Marshal()); err != nil {
-					return peer, fr, RequestParts{}, SendingPart{}, err
+					return peer, fr, RequestParts{}, err
 				}
 			} else {
 				frame := Frame{
@@ -201,9 +201,9 @@ readRequest:
 					Payload:  FileNotFound{Hash: reqHash}.Marshal(),
 				}
 				if _, err := conn.Write(frame.Marshal()); err != nil {
-					return peer, fr, RequestParts{}, SendingPart{}, err
+					return peer, fr, RequestParts{}, err
 				}
-				return peer, fr, RequestParts{}, SendingPart{}, nil
+				return peer, fr, RequestParts{}, nil
 			}
 			break readRequest
 		default:
@@ -215,15 +215,15 @@ readRequest:
 	// --- Request parts: read OP_REQUESTPARTS. ---
 	for {
 		if err := ctx.Err(); err != nil {
-			return peer, fr, rp, SendingPart{}, err
+			return peer, fr, rp, err
 		}
 		rl := dialDeadline(ctx)
 		if err := conn.SetReadDeadline(rl); err != nil {
-			return peer, fr, rp, SendingPart{}, err
+			return peer, fr, rp, err
 		}
 		f, err := readED2KFrame(conn)
 		if err != nil {
-			return peer, fr, rp, SendingPart{}, err
+			return peer, fr, rp, err
 		}
 		op := f.Opcode
 		if op == 0 {
@@ -245,11 +245,11 @@ readRequest:
 
 		switch op {
 		case OP_REJECT:
-			return peer, fr, rp, SendingPart{}, fmt.Errorf("ed2k: peer rejected connection")
+			return peer, fr, rp, fmt.Errorf("ed2k: peer rejected connection")
 		case OP_REQUESTPARTS:
 			decoded, err := DecodeRequestParts(payload)
 			if err != nil {
-				return peer, fr, rp, SendingPart{}, err
+				return peer, fr, rp, err
 			}
 			rp = decoded
 			reqHash := rp.hashBytes()
@@ -263,12 +263,12 @@ readRequest:
 				}
 				wl := dialDeadline(ctx)
 				if err := conn.SetWriteDeadline(wl); err != nil {
-					return peer, fr, rp, SendingPart{}, err
+					return peer, fr, rp, err
 				}
 				if _, err := conn.Write(frame.Marshal()); err != nil {
-					return peer, fr, rp, SendingPart{}, err
+					return peer, fr, rp, err
 				}
-				return peer, fr, rp, SendingPart{}, nil
+				return peer, fr, rp, nil
 			}
 
 			von := rp.vonArray()
@@ -295,12 +295,12 @@ readRequest:
 					}
 					wl := dialDeadline(ctx)
 					if err := conn.SetWriteDeadline(wl); err != nil {
-						return peer, fr, rp, SendingPart{}, err
+						return peer, fr, rp, err
 					}
 					if _, err := conn.Write(frame.Marshal()); err != nil {
-						return peer, fr, rp, SendingPart{}, err
+						return peer, fr, rp, err
 					}
-					return peer, fr, rp, SendingPart{}, nil
+					return peer, fr, rp, nil
 				}
 			}
 
@@ -325,12 +325,12 @@ readRequest:
 			}
 			wl := dialDeadline(ctx)
 			if err := conn.SetWriteDeadline(wl); err != nil {
-				return peer, fr, rp, SendingPart{}, err
+				return peer, fr, rp, err
 			}
 			if _, err := conn.Write(frame.Marshal()); err != nil {
-				return peer, fr, rp, SendingPart{}, err
+				return peer, fr, rp, err
 			}
-			return peer, fr, rp, sp, nil
+			return peer, fr, rp, nil
 		default:
 			// Tolerate leading/unexpected frames.
 			continue
@@ -511,77 +511,77 @@ func parseTransferAvailable(args []any) ([16]byte, string, []byte, bool) {
 
 // ---- Engine method aliases ----
 
-func (e *Engine) ServeTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) ServeTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) HandleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) HandleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) AcceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) AcceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) ServeTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) ServeTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) HandleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) HandleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) AcceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) AcceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
 // lowercase method aliases
-func (e *Engine) serveTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) serveTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) handleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) handleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) acceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) acceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConn(ctx, conn, args...)
 }
 
-func (e *Engine) serveTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) serveTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	if c, ok := rw.(net.Conn); ok {
 		return e.serveTransferConn(ctx, c, args...)
 	}
-	return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
+	return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
 }
 
-func (e *Engine) ServeTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) ServeTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.serveTransferConnIO(ctx, rw, args...)
 }
 
-func (e *Engine) HandleTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) HandleTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.ServeTransferConnIO(ctx, rw, args...)
 }
 
-func (e *Engine) AcceptTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) AcceptTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.ServeTransferConnIO(ctx, rw, args...)
 }
 
-func (e *Engine) ServeTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) ServeTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.ServeTransferConnIO(ctx, rw, args...)
 }
 
-func (e *Engine) HandleTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) HandleTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.ServeTransferConnIO(ctx, rw, args...)
 }
 
-func (e *Engine) AcceptTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func (e *Engine) AcceptTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return e.ServeTransferConnIO(ctx, rw, args...)
 }
 
 // ---- Package-level helpers ----
 
-func serveTransferConnPkg(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func serveTransferConnPkg(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -598,120 +598,120 @@ func serveTransferConnPkg(ctx context.Context, conn net.Conn, args ...any) (Peer
 		eng = New()
 	}
 	if conn == nil {
-		return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: nil connection")
+		return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: nil connection")
 	}
 	return eng.serveTransferConn(ctx, conn, rest...)
 }
 
 // lowercase package-level base
-func serveTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func serveTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func handleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func handleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func acceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func acceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func serveTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func serveTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func handleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func handleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func acceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func acceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
 // Uppercase package-level helpers
-func ServeTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func HandleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func AcceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransferConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func ServeTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func HandleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
-func AcceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransfer(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnPkg(ctx, conn, args...)
 }
 
 // IO variants (package-level)
-func serveTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func serveTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	if c, ok := rw.(net.Conn); ok {
 		return serveTransferConnPkg(ctx, c, args...)
 	}
-	return PeerInfo{}, FileRequest{}, RequestParts{}, SendingPart{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
+	return PeerInfo{}, FileRequest{}, RequestParts{}, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
 }
 
-func ServeTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
-func HandleTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
-func AcceptTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransferConnIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
-func ServeTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
-func HandleTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
-func AcceptTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
 // lowercase IO aliases
-func serveTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func serveTransferIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return serveTransferConnIO(ctx, rw, args...)
 }
 
 // Additional alternate spellings / aliases
-func ServeTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return ServeTransferConn(ctx, conn, args...)
 }
 
-func HandleTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return HandleTransferConn(ctx, conn, args...)
 }
 
-func AcceptTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransferWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return AcceptTransferConn(ctx, conn, args...)
 }
 
-func ServeTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func ServeTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return ServeTransferConn(ctx, conn, args...)
 }
 
-func HandleTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func HandleTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return HandleTransferConn(ctx, conn, args...)
 }
 
-func AcceptTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, SendingPart, error) {
+func AcceptTransferConnWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileRequest, RequestParts, error) {
 	return AcceptTransferConn(ctx, conn, args...)
 }
 
