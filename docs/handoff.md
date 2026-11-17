@@ -475,3 +475,16 @@ Added `internal/engine/ed2k/download.go` with `Downloader`, `Engine.DialDownload
 Added `internal/engine/ed2k/partmetverify.go` with `PartMetVerify(data []byte, pm PartMet) (bool, []int)` plus aliases (`VerifyPartMet`, `PartMetCheck`, `CheckPartMet`) and `PartMetPartHash`. Resolves `PartMet` alias fields via `normalized()`; checks non-zero file size against `len(data)`; MD4 (golang.org/x/crypto/md4) per part (final short part, no padding); collects corrupt/missing part indices; non-zero root/file MD4 mismatch marks every part corrupt. Returns `true, nil` on full match. No file I/O, networking, AICH wiring, obfuscation, or daemon/RPC/store/config changes.
 
 To avoid Go redeclaration (same package) with the prior `partverify.go` helpers, the colliding top-level names `VerifyPartMet(pm,...)`, `CheckPartMet(pm,...)`, `PartMetVerify(pm,...)` (and lowercase `verifyPartMet`/`partMetVerify`) were removed from `partverify.go`; their behaviour remains reachable via the non-colliding `PartVerify`/`ValidatePartMet`/etc. aliases, and `partverify_test.go` was updated to call `PartVerify`. The new API keeps the existing `PartVerifyResult`-based helper intact for callers that want the richer result.
+
+### P4 ed2k in-process exchange slice (exchange_test.go)
+
+Added `internal/engine/ed2k/exchange_test.go` with `TestExchangeDataVerifies` and
+`TestExchangeDataNotFound`, pairing `ServeTransferConn` (listener) with
+`DialDownload` (dialer) over real TCP. To make the two composable,
+`serveTransferConn` gained minimal, additive handling: it now answers
+`OP_QUEUEREQUEST` with `OP_STARTUPLOAD`, clamps a request's `bis` to the
+available source length, returns an empty terminal `OP_SENDINGPART` when the
+requested offset is at/past end-of-data, and only returns after the final
+chunk (continuing to serve subsequent requests otherwise). No opcode/layout,
+block-map, or PartMet semantics changed. Serving-side queue *scheduling*
+remains out of scope; only the grant needed for the exchange is emitted.
