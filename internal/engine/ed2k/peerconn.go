@@ -318,6 +318,18 @@ func fileRequestHash(v any) [16]byte {
 		if t != nil {
 			return t.hashBytes()
 		}
+	case RequestParts:
+		return t.hashBytes()
+	case *RequestParts:
+		if t != nil {
+			return t.hashBytes()
+		}
+	case SendingPart:
+		return t.hashBytes()
+	case *SendingPart:
+		if t != nil {
+			return t.hashBytes()
+		}
 	}
 	return [16]byte{}
 }
