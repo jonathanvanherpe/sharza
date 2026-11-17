@@ -576,7 +576,8 @@ func isHashLike(v any) bool {
 		FileReqAnswer, *FileReqAnswer,
 		FileNotFound, *FileNotFound,
 		RequestParts, *RequestParts,
-		SendingPart, *SendingPart:
+		SendingPart, *SendingPart,
+		QueueRequest, *QueueRequest:
 		return true
 	}
 	return false
