@@ -35,7 +35,7 @@ func makePartMetAndData(t *testing.T) (PartMet, []byte) {
 
 func TestPartVerifyBasic(t *testing.T) {
 	pm, data := makePartMetAndData(t)
-	res, err := VerifyPartMet(pm, data)
+	res, err := PartVerify(pm, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestPartVerifyMutationPart(t *testing.T) {
 	pm, data := makePartMetAndData(t)
 	corrupt := append([]byte(nil), data...)
 	corrupt[5] ^= 0xFF
-	res, err := VerifyPartMet(pm, corrupt)
+	res, err := PartVerify(pm, corrupt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestPartVerifyMutationHash(t *testing.T) {
 	pm.PartHashes[0][0] ^= 0xFF
 	pm.PartHashes = append([][16]byte(nil), pm.PartHashes...)
 	// update aliases? normalized uses PartHashes
-	res, err := VerifyPartMet(pm, data)
+	res, err := PartVerify(pm, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestPartVerifyMutationHash(t *testing.T) {
 
 func TestPartVerifySizeMismatch(t *testing.T) {
 	pm, data := makePartMetAndData(t)
-	res, err := VerifyPartMet(pm, data[:len(data)-1])
+	res, err := PartVerify(pm, data[:len(data)-1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestPartVerifySizeMismatch(t *testing.T) {
 func TestPartVerifyAICH(t *testing.T) {
 	pm, data := makePartMetAndData(t)
 	root := AICHRoot(data, AICHBlockSize)
-	res, err := VerifyPartMet(pm, data, root)
+	res, err := PartVerify(pm, data, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestPartVerifyAICH(t *testing.T) {
 	// wrong root
 	wrong := root
 	wrong[0] ^= 0xFF
-	res2, err := VerifyPartMet(pm, data, wrong)
+	res2, err := PartVerify(pm, data, wrong)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestPartVerifyEmpty(t *testing.T) {
 	data := []byte{}
 	fileHash := md4Sum(data)
 	pm := PartMet{FileSize: 0, FileHash: fileHash, PartSize: 64, PartHashes: nil}
-	res, err := VerifyPartMet(pm, data)
+	res, err := PartVerify(pm, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestPartVerifyAliasFieldsPartMet(t *testing.T) {
 	}
 	fileHash := md4Sum(data)
 	pm := PartMet{Size: fileSize, Hash: fileHash, PartLen: partSize, Parts: parts}
-	res, err := VerifyPartMet(pm, data)
+	res, err := PartVerify(pm, data)
 	if err != nil {
 		t.Fatal(err)
 	}
