@@ -38,6 +38,12 @@ func TestDownloadSmokeFull(t *testing.T) {
 			return
 		}
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_FILEREQANSWER, Payload: FileReqAnswer{Hash: wantHash, Name: wantName}.Marshal()}.Marshal())
+		// queue request
+		qf, _ := readED2KFrame(conn)
+		if qf.Opcode != OP_QUEUEREQUEST {
+			return
+		}
+		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_STARTUPLOAD, Payload: StartUpload{}.Marshal()}.Marshal())
 		// first request
 		f3, _ := readED2KFrame(conn)
 		if f3.Opcode != OP_REQUESTPARTS {
@@ -61,7 +67,7 @@ func TestDownloadSmokeFull(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	pi, ans, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	pi, ans, _, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err != nil {
 		t.Fatalf("DialDownload: %v", err)
 	}
@@ -100,6 +106,8 @@ func TestDownloadSmokeEmpty(t *testing.T) {
 		_, _ = readED2KFrame(conn)
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_FILEREQANSWER, Payload: FileReqAnswer{Hash: wantHash, Name: "empty.txt"}.Marshal()}.Marshal())
 		_, _ = readED2KFrame(conn)
+		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_STARTUPLOAD, Payload: StartUpload{}.Marshal()}.Marshal())
+		_, _ = readED2KFrame(conn)
 		sp := SendingPart{Hash: wantHash, Von: 0, Bis: 0, Data: nil}
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_SENDINGPART, Payload: sp.Marshal()}.Marshal())
 	}()
@@ -114,7 +122,7 @@ func TestDownloadSmokeEmpty(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	_, _, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	_, _, _, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err != nil {
 		t.Fatalf("DialDownload: %v", err)
 	}
@@ -155,7 +163,7 @@ func TestDownloadSmokeNotFound(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	_, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	_, _, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err == nil {
 		t.Fatal("expected not-found error")
 	}
@@ -190,7 +198,7 @@ func TestDownloadSmokeReject(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	_, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	_, _, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err == nil {
 		t.Fatal("expected reject error")
 	}
@@ -218,6 +226,8 @@ func TestDownloadSmokeConnHelper(t *testing.T) {
 		_, _ = readED2KFrame(conn)
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_FILEREQANSWER, Payload: FileReqAnswer{Hash: wantHash, Name: "conn.txt"}.Marshal()}.Marshal())
 		_, _ = readED2KFrame(conn)
+		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_STARTUPLOAD, Payload: StartUpload{}.Marshal()}.Marshal())
+		_, _ = readED2KFrame(conn)
 		sp := SendingPart{Hash: wantHash, Von: 0, Bis: uint32(len(wantData)), Data: wantData}
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_SENDINGPART, Payload: sp.Marshal()}.Marshal())
 		_, _ = readED2KFrame(conn)
@@ -240,7 +250,7 @@ func TestDownloadSmokeConnHelper(t *testing.T) {
 	}
 	defer conn.Close()
 	buf := &bytes.Buffer{}
-	pi, ans, n, err := dialDownload(ctx, conn, wantHash, buf, e)
+	pi, ans, _, n, err := dialDownload(ctx, conn, wantHash, buf, e)
 	if err != nil {
 		t.Fatalf("dialDownload: %v", err)
 	}
@@ -289,7 +299,7 @@ func TestDownloadTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	_, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	_, _, _, _, err = e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -316,6 +326,8 @@ func TestDownloadPartialChunks(t *testing.T) {
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_HELLOANSWER, Payload: ans.Marshal()}.Marshal())
 		_, _ = readED2KFrame(conn)
 		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_FILEREQANSWER, Payload: FileReqAnswer{Hash: wantHash, Name: "chunked.txt"}.Marshal()}.Marshal())
+		_, _ = readED2KFrame(conn)
+		conn.Write(Frame{Protocol: ProtocolEDonkey, Opcode: OP_STARTUPLOAD, Payload: StartUpload{}.Marshal()}.Marshal())
 		// send in two chunks
 		half := len(wantData) / 2
 		f, _ := readED2KFrame(conn)
@@ -340,7 +352,7 @@ func TestDownloadPartialChunks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := &bytes.Buffer{}
-	_, _, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
+	_, _, _, n, err := e.DialDownload(ctx, ln.Addr().String(), wantHash, buf)
 	if err != nil {
 		t.Fatalf("DialDownload: %v", err)
 	}

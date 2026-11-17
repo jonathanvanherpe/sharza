@@ -40,7 +40,7 @@ func NewDownloader(target any, hash any, e ...*Engine) *Downloader {
 
 // Download fetches the file into Dst and returns peer identity, file
 // availability and the number of bytes written.
-func (d *Downloader) Download(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (d *Downloader) Download(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if len(dst) > 0 && dst[0] != nil {
 		d.Dst = dst[0]
 	}
@@ -48,7 +48,7 @@ func (d *Downloader) Download(ctx context.Context, dst ...any) (PeerInfo, FileRe
 }
 
 // Fetch is an alias for Download.
-func (d *Downloader) Fetch(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (d *Downloader) Fetch(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if len(dst) > 0 && dst[0] != nil {
 		d.Dst = dst[0]
 	}
@@ -60,12 +60,12 @@ func (d *Downloader) Fetch(ctx context.Context, dst ...any) (PeerInfo, FileReqAn
 }
 
 // Run is an alias for Download.
-func (d *Downloader) Run(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (d *Downloader) Run(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return d.Download(ctx, dst...)
 }
 
 // Do is an alias for Download.
-func (d *Downloader) Do(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (d *Downloader) Do(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return d.Download(ctx, dst...)
 }
 
@@ -74,9 +74,9 @@ func (d *Downloader) Do(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswe
 // OP_FILENOTFOUND, then repeatedly builds OP_REQUESTPARTS for the next
 // missing byte range, sends it, reads OP_SENDINGPART, and copies Data into
 // dst, stopping when the peer reports no more data.
-func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]byte, dst any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]byte, dst any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if conn == nil {
-		return PeerInfo{}, FileReqAnswer{}, 0, fmt.Errorf("ed2k: nil connection")
+		return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, fmt.Errorf("ed2k: nil connection")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -88,7 +88,7 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 	// Handshake first.
 	pi, err := e.dialPeerConn(ctx, conn)
 	if err != nil {
-		return PeerInfo{}, FileReqAnswer{}, 0, err
+		return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, err
 	}
 
 	// Send OP_FILEREQUEST.
@@ -99,10 +99,10 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 	}
 	wl := dialDeadline(ctx)
 	if err := conn.SetWriteDeadline(wl); err != nil {
-		return pi, FileReqAnswer{}, 0, err
+		return pi, FileReqAnswer{}, QueueResult{}, 0, err
 	}
 	if _, err := conn.Write(frFrame.Marshal()); err != nil {
-		return pi, FileReqAnswer{}, 0, err
+		return pi, FileReqAnswer{}, QueueResult{}, 0, err
 	}
 
 	// Read until answer / not-found / reject.
@@ -110,15 +110,15 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 	answerFound := false
 	for !answerFound {
 		if err := ctx.Err(); err != nil {
-			return pi, FileReqAnswer{}, 0, err
+			return pi, FileReqAnswer{}, QueueResult{}, 0, err
 		}
 		rl := dialDeadline(ctx)
 		if err := conn.SetReadDeadline(rl); err != nil {
-			return pi, FileReqAnswer{}, 0, err
+			return pi, FileReqAnswer{}, QueueResult{}, 0, err
 		}
 		f, err := readED2KFrame(conn)
 		if err != nil {
-			return pi, FileReqAnswer{}, 0, err
+			return pi, FileReqAnswer{}, QueueResult{}, 0, err
 		}
 		op := f.Opcode
 		if op == 0 {
@@ -140,16 +140,16 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 
 		switch op {
 		case OP_REJECT:
-			return pi, FileReqAnswer{}, 0, fmt.Errorf("ed2k: peer rejected connection")
+			return pi, FileReqAnswer{}, QueueResult{}, 0, fmt.Errorf("ed2k: peer rejected connection")
 		case OP_FILENOTFOUND:
 			if _, err := DecodeFileNotFound(payload); err != nil {
-				return pi, FileReqAnswer{}, 0, err
+				return pi, FileReqAnswer{}, QueueResult{}, 0, err
 			}
-			return pi, FileReqAnswer{}, 0, ErrFileNotFound
+			return pi, FileReqAnswer{}, QueueResult{}, 0, ErrFileNotFound
 		case OP_FILEREQANSWER:
 			a, err := DecodeFileReqAnswer(payload)
 			if err != nil {
-				return pi, FileReqAnswer{}, 0, err
+				return pi, FileReqAnswer{}, QueueResult{}, 0, err
 			}
 			ans = a
 			answerFound = true
@@ -158,12 +158,85 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 		}
 	}
 
+	// Queue round-trip: after OP_FILEREQANSWER, request an upload slot.
+	qrFrame := Frame{
+		Protocol: ProtocolEDonkey,
+		Opcode:   OP_QUEUEREQUEST,
+		Payload:  QueueRequest{Hash: hash}.Marshal(),
+	}
+	wl = dialDeadline(ctx)
+	if err := conn.SetWriteDeadline(wl); err != nil {
+		return pi, ans, QueueResult{}, 0, err
+	}
+	if _, err := conn.Write(qrFrame.Marshal()); err != nil {
+		return pi, ans, QueueResult{}, 0, err
+	}
+
+	var qres QueueResult
+	queueDone := false
+	for !queueDone {
+		if err := ctx.Err(); err != nil {
+			return pi, ans, QueueResult{}, 0, err
+		}
+		rl := dialDeadline(ctx)
+		if err := conn.SetReadDeadline(rl); err != nil {
+			return pi, ans, QueueResult{}, 0, err
+		}
+		f, err := readED2KFrame(conn)
+		if err != nil {
+			return pi, ans, QueueResult{}, 0, err
+		}
+		op := f.Opcode
+		if op == 0 {
+			op = f.Type
+		}
+		if op == 0 {
+			op = f.Op
+		}
+		payload := f.Payload
+		if payload == nil {
+			payload = f.Data
+		}
+		if payload == nil {
+			payload = f.Body
+		}
+		if payload == nil {
+			payload = []byte{}
+		}
+
+		switch op {
+		case OP_REJECT:
+			return pi, ans, QueueResult{}, 0, fmt.Errorf("ed2k: peer rejected connection")
+		case OP_FILENOTFOUND:
+			if _, err := DecodeFileNotFound(payload); err != nil {
+				return pi, ans, QueueResult{}, 0, err
+			}
+			return pi, ans, QueueResult{}, 0, ErrFileNotFound
+		case OP_STARTUPLOAD:
+			if _, err := DecodeStartUpload(payload); err != nil {
+				return pi, ans, QueueResult{}, 0, err
+			}
+			qres = newQueueGranted()
+			queueDone = true
+		case OP_QUEUERANK:
+			qr, err := DecodeQueueRank(payload)
+			if err != nil {
+				return pi, ans, QueueResult{}, 0, err
+			}
+			qres = newQueueRanked(qr.rankValue())
+			// Queued: report rank, no transfer.
+			return pi, ans, qres, 0, nil
+		default:
+			// tolerate
+		}
+	}
+
 	total := 0
 	offset := uint32(0)
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return pi, ans, total, err
+			return pi, ans, qres, total, err
 		}
 
 		end := offset + downloadChunkSize
@@ -187,28 +260,28 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 		}
 		wl = dialDeadline(ctx)
 		if err := conn.SetWriteDeadline(wl); err != nil {
-			return pi, ans, total, err
+			return pi, ans, qres, total, err
 		}
 		if _, err := conn.Write(rpFrame.Marshal()); err != nil {
-			return pi, ans, total, err
+			return pi, ans, qres, total, err
 		}
 
 		// Read until OP_SENDINGPART / reject / not-found.
 		gotPart := false
 		for !gotPart {
 			if err := ctx.Err(); err != nil {
-				return pi, ans, total, err
+				return pi, ans, qres, total, err
 			}
 			rl := dialDeadline(ctx)
 			if err := conn.SetReadDeadline(rl); err != nil {
-				return pi, ans, total, err
+				return pi, ans, qres, total, err
 			}
 			f, err := readED2KFrame(conn)
 			if err != nil {
 				if err == io.EOF && total > 0 {
-					return pi, ans, total, nil
+					return pi, ans, qres, total, nil
 				}
-				return pi, ans, total, err
+				return pi, ans, qres, total, err
 			}
 			op := f.Opcode
 			if op == 0 {
@@ -230,16 +303,16 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 
 			switch op {
 			case OP_REJECT:
-				return pi, ans, total, fmt.Errorf("ed2k: peer rejected connection")
+				return pi, ans, qres, total, fmt.Errorf("ed2k: peer rejected connection")
 			case OP_FILENOTFOUND:
 				if _, err := DecodeFileNotFound(payload); err != nil {
-					return pi, ans, total, err
+					return pi, ans, qres, total, err
 				}
-				return pi, ans, total, ErrFileNotFound
+				return pi, ans, qres, total, ErrFileNotFound
 			case OP_SENDINGPART:
 				sp, err := DecodeSendingPart(payload)
 				if err != nil {
-					return pi, ans, total, err
+					return pi, ans, qres, total, err
 				}
 				if sp.hashBytes() == ([16]byte{}) {
 					sp.Hash = hash
@@ -250,7 +323,7 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 				if len(data) > 0 {
 					n, werr := writeToDst(dst, data)
 					if werr != nil {
-						return pi, ans, total, werr
+						return pi, ans, qres, total, werr
 					}
 					total += n
 				}
@@ -266,7 +339,7 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 
 				// Stop when peer reports no more data.
 				if len(data) == 0 || sp.bisValue() == sp.vonValue() {
-					return pi, ans, total, nil
+					return pi, ans, qres, total, nil
 				}
 				gotPart = true
 			default:
@@ -279,7 +352,7 @@ func (e *Engine) dialDownloadConn(ctx context.Context, conn net.Conn, hash [16]b
 // DialDownload dials a peer (or uses an open connection), performs the
 // handshake, file request, and download loop, returning peer identity, file
 // availability and the number of bytes written to dst.
-func (e *Engine) DialDownload(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) DialDownload(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -299,7 +372,7 @@ func (e *Engine) DialDownload(ctx context.Context, target any, hash any, dst any
 		timeout := dialTimeoutFor(ctx)
 		conn, err := net.DialTimeout("tcp", s, timeout)
 		if err != nil {
-			return PeerInfo{}, FileReqAnswer{}, 0, err
+			return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, err
 		}
 		defer conn.Close()
 		return e.dialDownloadConn(ctx, conn, h, dst)
@@ -308,29 +381,29 @@ func (e *Engine) DialDownload(ctx context.Context, target any, hash any, dst any
 		timeout := dialTimeoutFor(ctx)
 		conn, err := net.DialTimeout("tcp", st.String(), timeout)
 		if err != nil {
-			return PeerInfo{}, FileReqAnswer{}, 0, err
+			return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, err
 		}
 		defer conn.Close()
 		return e.dialDownloadConn(ctx, conn, h, dst)
 	}
-	return PeerInfo{}, FileReqAnswer{}, 0, fmt.Errorf("ed2k: invalid target %T", target)
+	return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, fmt.Errorf("ed2k: invalid target %T", target)
 }
 
 // Aliases.
-func (e *Engine) Download(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) Download(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return e.DialDownload(ctx, target, hash, dst)
 }
 
-func (e *Engine) DialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) DialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, append([]any{e}, args...)...)
 }
 
-func (e *Engine) DownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) DownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return e.DialDownloadConn(ctx, conn, args...)
 }
 
 // Package-level helper (testable), mirroring dialPeer/dialTransfer/dialQueue.
-func dialDownload(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func dialDownload(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -381,19 +454,19 @@ func dialDownload(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, Fi
 		eng = New()
 	}
 	if conn == nil {
-		return PeerInfo{}, FileReqAnswer{}, 0, fmt.Errorf("ed2k: nil connection")
+		return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, fmt.Errorf("ed2k: nil connection")
 	}
 	h := fileRequestHash(hash)
 	return eng.dialDownloadConn(ctx, conn, h, dst)
 }
 
 // Package-level dialDownloadConn alias (lowercase).
-func dialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func dialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
 // Package-level target helpers.
-func DialDownload(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, int, error) {
+func DialDownload(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	var eng *Engine
 	if len(e) > 0 && e[0] != nil {
 		eng = e[0]
@@ -403,57 +476,57 @@ func DialDownload(ctx context.Context, target any, hash any, dst any, e ...*Engi
 	return eng.DialDownload(ctx, target, hash, dst)
 }
 
-func Download(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, int, error) {
+func Download(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return DialDownload(ctx, target, hash, dst, e...)
 }
 
 // Conn helpers.
-func DialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func DialDownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
-func DownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func DownloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
 // IO variants.
-func dialDownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func dialDownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	if c, ok := rw.(net.Conn); ok {
 		return dialDownload(ctx, c, args...)
 	}
-	return PeerInfo{}, FileReqAnswer{}, 0, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
+	return PeerInfo{}, FileReqAnswer{}, QueueResult{}, 0, fmt.Errorf("ed2k: ReadWriter is not a net.Conn")
 }
 
-func DialDownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func DialDownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownloadIO(ctx, rw, args...)
 }
 
-func DownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func DownloadIO(ctx context.Context, rw io.ReadWriter, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownloadIO(ctx, rw, args...)
 }
 
 // Alias spellings (extra coverage).
-func dialDownloadWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func dialDownloadWithConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
-func dialDownloadDirect(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func dialDownloadDirect(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
-func (e *Engine) dialDownload(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) dialDownload(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return e.DialDownload(ctx, target, hash, dst)
 }
 
-func (e *Engine) dialDownloadConnMethod(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) dialDownloadConnMethod(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return e.DialDownloadConn(ctx, conn, args...)
 }
 
-func (e *Engine) download(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, int, error) {
+func (e *Engine) download(ctx context.Context, target any, hash any, dst any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return e.DialDownload(ctx, target, hash, dst)
 }
 
-func download(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, int, error) {
+func download(ctx context.Context, target any, hash any, dst any, e ...*Engine) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	eng := New()
 	if len(e) > 0 && e[0] != nil {
 		eng = e[0]
@@ -461,7 +534,7 @@ func download(ctx context.Context, target any, hash any, dst any, e ...*Engine) 
 	return eng.DialDownload(ctx, target, hash, dst)
 }
 
-func downloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, int, error) {
+func downloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return dialDownload(ctx, conn, args...)
 }
 
