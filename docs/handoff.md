@@ -456,6 +456,8 @@ differential test later:
 
 ## Open questions (this cycle)
 
+- P5 canonical block map: `internal/blockmap` added (`DefaultBlockSize = 1<<20`, `BlockMap`, `New`, `BlockCount`, `BlockByteRange`, `SetVerified`, `IsVerified`, `VerifiedCount`, `AllVerified`, `Unverified`, plus aliases). No engine/daemon/RPC/store/config wiring. Empty file is vacuously AllVerified. Out of scope per brief: scheduler/leases, verified store, BT range mapping, source matching, persistence, `.part.met`/AICH integration.
+
 - P4 ed2k server-side (incoming) transfer: `internal/engine/ed2k/servertransfer.go` adds `serveTransferConn` mirroring `serverfilerequest.go` + `transferconn.go`: OP_HELLO/OP_HELLOANSWER, OP_FILEREQUEST → OP_FILEREQANSWER/OP_FILENOTFOUND, OP_REQUESTPARTS → OP_SENDINGPART with caller-supplied source bytes sliced by von/bis. Out of scope: queue handling, file I/O, `.part.met`, AICH, obfuscation, daemon/RPC/store/config wiring, range mapping to canonical blocks.
 
 - eDonkey C2C Hello handshake: `OP_HELLO` (0x01) collides with `OP_LOGINREQUEST` (0x01); `OpcodeName` now reports `OP_HELLO` for 0x01. `HelloAnswer` follows Shareaza's published layout and has no leading 0x10 byte (only `Hello` does), per the wire format rather than a literal reading of the brief's "same fields".
