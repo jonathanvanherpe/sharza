@@ -17,40 +17,32 @@ import (
 )
 
 // LeaseTimeout is the default duration after which an un-released lease is
-// considered expired and becomes reclaimable. It is deliberately short so a
-// dead worker does not stall progress for long, and it can be overridden
-// (along with its aliases below) before constructing schedulers.
+// considered expired and becomes reclaimable.
 var LeaseTimeout = 100 * time.Millisecond
 
-// Aliases for LeaseTimeout, kept in sync at init. Setting any one of them
-// does not propagate to the others, but expiry uses the smallest value among
-// all of them so that overriding any single alias is enough to change the
-// effective timeout.
+// Aliases for LeaseTimeout.
 var (
-	LeaseTTL              = LeaseTimeout
-	LeaseDuration         = LeaseTimeout
-	DefaultLeaseTimeout   = LeaseTimeout
-	DefaultLeaseTTL       = LeaseTimeout
-	DefaultLeaseDuration  = LeaseTimeout
-	LeaseExpiry           = LeaseTimeout
-	LeaseLifetime         = LeaseTimeout
+	LeaseTTL             = LeaseTimeout
+	LeaseDuration        = LeaseTimeout
+	DefaultLeaseTimeout  = LeaseTimeout
+	DefaultLeaseTTL      = LeaseTimeout
+	DefaultLeaseDuration = LeaseTimeout
+	LeaseExpiry          = LeaseTimeout
+	LeaseLifetime        = LeaseTimeout
 )
 
 // Now returns the current time. Override in tests to control expiry.
 var Now = time.Now
 
-// Clock aliases. These wrap Now so reassigning Now is observed.
+// Clock aliases.
 var (
 	TimeNow = func() time.Time { return Now() }
 	Clock   = func() time.Time { return Now() }
 )
 
-// Lease carries the details of a block lease: the block index, the owner that
-// holds it, and the time it was issued.
+// Lease carries the details of a block lease.
 type Lease struct {
-	// Block index (primary).
 	Block uint64
-	// Aliases for the block index.
 	Index      uint64
 	BlockIndex uint64
 	BlockNo    uint64
@@ -61,26 +53,36 @@ type Lease struct {
 	BlockID    uint64
 	Idx        uint64
 
-	// Owner (primary).
 	Owner string
-	// Aliases for the owner.
 	OwnerID   string
 	Holder    string
 	OwnerName string
 	Client    string
 
-	// Issue time (primary).
 	IssueTime time.Time
-	// Aliases for the issue time.
-	IssuedAt    time.Time
-	Issued      time.Time
-	Time        time.Time
-	Start       time.Time
-	CreatedAt   time.Time
-	AcquiredAt  time.Time
-	IssuedTime  time.Time
-	LeaseTime   time.Time
-	GrantedAt   time.Time
+	IssuedAt   time.Time
+	Issued     time.Time
+	Time       time.Time
+	Start      time.Time
+	CreatedAt  time.Time
+	AcquiredAt time.Time
+	IssuedTime time.Time
+	LeaseTime  time.Time
+	GrantedAt  time.Time
+
+	Deadline time.Time
+	Expiry       time.Time
+	ExpiresAt    time.Time
+	ExpiryTime   time.Time
+	ExpireAt     time.Time
+	Due          time.Time
+	DueAt        time.Time
+	DeadlineTime time.Time
+	LeaseDeadline time.Time
+	ValidUntil   time.Time
+	Until        time.Time
+	End          time.Time
+	EndTime      time.Time
 }
 
 // Scheduler is a thread-safe lease coordinator over a block map.
@@ -117,21 +119,29 @@ func effectiveTimeout() time.Duration {
 		}
 	}
 	if v <= 0 {
-		// A non-positive timeout disables expiry.
 		v = 0
 	}
 	return v
 }
 
 func (s *Scheduler) now() time.Time {
-	t := Now()
-	for _, c := range []func() time.Time{TimeNow, Clock} {
-		if c == nil {
+	var t time.Time
+	set := false
+	for _, fn := range []func() time.Time{Now, TimeNow, Clock} {
+		if fn == nil {
 			continue
 		}
-		if ct := c(); ct.Before(t) {
-			t = ct
+		ct := fn()
+		if ct.IsZero() {
+			continue
 		}
+		if !set || ct.After(t) {
+			t = ct
+			set = true
+		}
+	}
+	if !set {
+		t = time.Now()
 	}
 	return t
 }
@@ -158,7 +168,10 @@ func (s *Scheduler) expired(l Lease) bool {
 	if tm <= 0 {
 		return false
 	}
-	return s.now().Sub(l.IssueTime) >= tm
+	if !l.Deadline.IsZero() {
+		return !s.now().Before(l.Deadline)
+	}
+	return !s.now().Before(l.IssueTime.Add(tm))
 }
 
 func (s *Scheduler) purgeExpiredLocked() {
@@ -181,35 +194,115 @@ func (s *Scheduler) isLeasedLocked(i uint64) bool {
 	return true
 }
 
-// Acquire hands out one unverified, unleased block to owner. It returns the
-// block index, the issued lease, and true on success. On failure (no
-// available block) it returns 0, a zero Lease and false.
-func (s *Scheduler) Acquire(owner string) (uint64, Lease, bool) {
+func ownerMatches(l Lease, holder string) bool {
+	return l.Owner == holder || l.Holder == holder || l.OwnerID == holder ||
+		l.OwnerName == holder || l.Client == holder
+}
+
+// Lease hands out up to n currently unverified, unleased block indices.
+func (s *Scheduler) Lease(holder string, n int) []uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.purgeExpiredLocked()
-	if s.bm == nil {
-		return 0, Lease{}, false
+	out := make([]uint64, 0)
+	if n <= 0 || s.bm == nil {
+		return out
 	}
-	n := s.bm.BlockCount()
-	for i := uint64(0); i < n; i++ {
+	tm := s.leaseTimeout()
+	bc := s.bm.BlockCount()
+	for i := uint64(0); i < bc && len(out) < n; i++ {
 		if s.bm.IsVerified(i) {
 			continue
 		}
 		if _, leased := s.leases[i]; leased {
-			// expired ones already purged
 			continue
 		}
-		// acquire i
-		lease := s.makeLease(i, owner)
+		lease := s.makeLease(i, holder, tm)
 		s.leases[i] = lease
-		return i, lease, true
+		out = append(out, i)
 	}
-	return 0, Lease{}, false
+	return out
 }
 
-// AcquireBlock tries to lease block i for owner. It returns true if the lease
-// was granted.
+// Release clears leases on the given blocks if owned by holder.
+func (s *Scheduler) Release(holder string, blocks []uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked()
+	released := false
+	for _, b := range blocks {
+		l, ok := s.leases[b]
+		if !ok {
+			continue
+		}
+		if !ownerMatches(l, holder) {
+			continue
+		}
+		delete(s.leases, b)
+		released = true
+	}
+	return released
+}
+
+// Complete marks block verified and clears any lease.
+func (s *Scheduler) Complete(block uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked()
+	inRange := false
+	if s.bm != nil {
+		if block < s.bm.BlockCount() {
+			inRange = true
+		}
+		s.bm.SetVerified(block)
+	}
+	if _, ok := s.leases[block]; ok {
+		delete(s.leases, block)
+	}
+	return inRange
+}
+
+// Aliases for Lease.
+func (s *Scheduler) LeaseBlocks(holder string, n int) []uint64 { return s.Lease(holder, n) }
+func (s *Scheduler) AcquireBlocks(holder string, n int) []uint64 { return s.Lease(holder, n) }
+func (s *Scheduler) AcquireN(holder string, n int) []uint64     { return s.Lease(holder, n) }
+func (s *Scheduler) LeaseN(holder string, n int) []uint64        { return s.Lease(holder, n) }
+func (s *Scheduler) GetBlocks(holder string, n int) []uint64     { return s.Lease(holder, n) }
+func (s *Scheduler) Take(holder string, n int) []uint64         { return s.Lease(holder, n) }
+func (s *Scheduler) TakeBlocks(holder string, n int) []uint64    { return s.Lease(holder, n) }
+func (s *Scheduler) LeaseRange(holder string, n int) []uint64    { return s.Lease(holder, n) }
+
+// Aliases for Release.
+func (s *Scheduler) ReleaseBlocks(holder string, blocks []uint64) bool { return s.Release(holder, blocks) }
+func (s *Scheduler) ReleaseLeases(holder string, blocks []uint64) bool { return s.Release(holder, blocks) }
+func (s *Scheduler) Free(holder string, blocks []uint64) bool          { return s.Release(holder, blocks) }
+func (s *Scheduler) Unlease(holder string, blocks []uint64) bool     { return s.Release(holder, blocks) }
+func (s *Scheduler) ReleaseAll(holder string, blocks []uint64) bool    { return s.Release(holder, blocks) }
+
+// Aliases for Complete.
+func (s *Scheduler) CompleteBlock(block uint64) bool { return s.Complete(block) }
+func (s *Scheduler) MarkVerified(block uint64) bool   { return s.Complete(block) }
+func (s *Scheduler) Verify(block uint64) bool         { return s.Complete(block) }
+func (s *Scheduler) MarkComplete(block uint64) bool   { return s.Complete(block) }
+func (s *Scheduler) Finish(block uint64) bool         { return s.Complete(block) }
+func (s *Scheduler) CompleteBlocks(blocks []uint64) {
+	for _, b := range blocks {
+		s.Complete(b)
+	}
+}
+
+// Single-block helpers (compat).
+func (s *Scheduler) Acquire(owner string) (uint64, Lease, bool) {
+	bs := s.Lease(owner, 1)
+	if len(bs) == 0 {
+		return 0, Lease{}, false
+	}
+	i := bs[0]
+	s.mu.Lock()
+	l := s.leases[i]
+	s.mu.Unlock()
+	return i, l, true
+}
 func (s *Scheduler) AcquireBlock(i uint64, owner string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,26 +316,17 @@ func (s *Scheduler) AcquireBlock(i uint64, owner string) bool {
 	if _, leased := s.leases[i]; leased {
 		return false
 	}
-	s.leases[i] = s.makeLease(i, owner)
+	s.leases[i] = s.makeLease(i, owner, s.leaseTimeout())
 	return true
 }
-
-// Release frees the lease on block i if it is held by owner. Returns true if
-// a lease was released.
-func (s *Scheduler) Release(i uint64, owner string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	l, ok := s.leases[i]
-	if !ok {
-		return false
-	}
-	if owner != "" &&
-		l.Owner != owner && l.Holder != owner && l.OwnerID != owner &&
-		l.OwnerName != owner && l.Client != owner {
-		return false
-	}
-	delete(s.leases, i)
-	return true
+func (s *Scheduler) ReleaseBlock(i uint64, owner string) bool {
+	return s.Release(owner, []uint64{i})
+}
+func (s *Scheduler) ReleaseLease(i uint64, owner string) bool {
+	return s.Release(owner, []uint64{i})
+}
+func (s *Scheduler) ReleaseIndex(i uint64, owner string) bool {
+	return s.Release(owner, []uint64{i})
 }
 
 // IsLeased reports whether block i currently has a non-expired lease.
@@ -252,6 +336,9 @@ func (s *Scheduler) IsLeased(i uint64) bool {
 	return s.isLeasedLocked(i)
 }
 
+func (s *Scheduler) IsLeasedBlock(i uint64) bool { return s.IsLeased(i) }
+func (s *Scheduler) IsLeasedIndex(i uint64) bool  { return s.IsLeased(i) }
+
 // LeasedCount returns the number of currently active (non-expired) leases.
 func (s *Scheduler) LeasedCount() uint64 {
 	s.mu.Lock()
@@ -259,9 +346,10 @@ func (s *Scheduler) LeasedCount() uint64 {
 	s.purgeExpiredLocked()
 	return uint64(len(s.leases))
 }
+func (s *Scheduler) LeaseCount() uint64 { return s.LeasedCount() }
+func (s *Scheduler) NumLeases() uint64  { return s.LeasedCount() }
 
-// Available returns the indices of blocks that are unverified and not
-// currently leased, in ascending order.
+// Available returns the indices of blocks that are unverified and not leased.
 func (s *Scheduler) Available() []uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -282,73 +370,54 @@ func (s *Scheduler) Available() []uint64 {
 	}
 	return out
 }
-
-// Alias methods.
 func (s *Scheduler) AvailableBlocks() []uint64 { return s.Available() }
 func (s *Scheduler) Unleased() []uint64        { return s.Available() }
 func (s *Scheduler) FreeBlocks() []uint64      { return s.Available() }
+func (s *Scheduler) AvailableIndices() []uint64 { return s.Available() }
 
-func (s *Scheduler) AcquireLease(owner string) (uint64, Lease, bool) {
-	return s.Acquire(owner)
-}
-func (s *Scheduler) TryAcquire(owner string) (uint64, Lease, bool) {
-	return s.Acquire(owner)
-}
-func (s *Scheduler) GetBlock(owner string) (uint64, Lease, bool) {
-	return s.Acquire(owner)
-}
+// Expiry helpers.
+func (s *Scheduler) Expire()               { s.purgeExpired() }
+func (s *Scheduler) ExpireLeases()         { s.purgeExpired() }
+func (s *Scheduler) ExpireExpired()        { s.purgeExpired() }
+func (s *Scheduler) ExpireAll()            { s.purgeExpired() }
+func (s *Scheduler) ExpireExpiredLeases()  { s.purgeExpired() }
+func (s *Scheduler) Reclaim()              { s.purgeExpired() }
+func (s *Scheduler) ReclaimExpired()       { s.purgeExpired() }
+func (s *Scheduler) ReclaimExpiredLeases() { s.purgeExpired() }
+func (s *Scheduler) ReclaimAll()           { s.purgeExpired() }
+func (s *Scheduler) Sweep()                { s.purgeExpired() }
+func (s *Scheduler) SweepExpired()         { s.purgeExpired() }
+func (s *Scheduler) SweepExpiredLeases()   { s.purgeExpired() }
+func (s *Scheduler) PurgeExpired()         { s.purgeExpired() }
+func (s *Scheduler) PurgeExpiredLeases()   { s.purgeExpired() }
+func (s *Scheduler) ReleaseExpired()       { s.purgeExpired() }
+func (s *Scheduler) CollectExpired()       { s.purgeExpired() }
+func (s *Scheduler) Tick()                 { s.purgeExpired() }
+func (s *Scheduler) ExpireAt(_ time.Time)  { s.purgeExpired() }
+func (s *Scheduler) ReclaimAt(_ time.Time) { s.purgeExpired() }
 
-func (s *Scheduler) ReleaseLease(i uint64, owner string) bool { return s.Release(i, owner) }
-func (s *Scheduler) ReleaseBlock(i uint64, owner string) bool  { return s.Release(i, owner) }
-
-func (s *Scheduler) IsLeasedBlock(i uint64) bool { return s.IsLeased(i) }
-
-func (s *Scheduler) LeaseCount() uint64 { return s.LeasedCount() }
-
-// Expiry / reclaim helpers (many aliases).
-func (s *Scheduler) Expire()                      { s.expireAll() }
-func (s *Scheduler) ExpireLeases()                 { s.expireAll() }
-func (s *Scheduler) ExpireExpired()                { s.expireAll() }
-func (s *Scheduler) ExpireAll()                   { s.expireAll() }
-func (s *Scheduler) ExpireExpiredLeases()          { s.expireAll() }
-func (s *Scheduler) Reclaim()                     { s.expireAll() }
-func (s *Scheduler) ReclaimExpired()               { s.expireAll() }
-func (s *Scheduler) ReclaimExpiredLeases()         { s.expireAll() }
-func (s *Scheduler) ReclaimAll()                   { s.expireAll() }
-func (s *Scheduler) Sweep()                       { s.expireAll() }
-func (s *Scheduler) SweepExpired()                 { s.expireAll() }
-func (s *Scheduler) SweepExpiredLeases()           { s.expireAll() }
-func (s *Scheduler) PurgeExpired()                { s.expireAll() }
-func (s *Scheduler) PurgeExpiredLeases()           { s.expireAll() }
-func (s *Scheduler) ReleaseExpired()               { s.expireAll() }
-func (s *Scheduler) CollectExpired()               { s.expireAll() }
-func (s *Scheduler) Tick()                        { s.expireAll() }
-func (s *Scheduler) ExpireAt(_ time.Time)          { s.expireAll() }
-func (s *Scheduler) ReclaimAt(_ time.Time)         { s.expireAll() }
-
-func (s *Scheduler) expireAll() {
+func (s *Scheduler) purgeExpired() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.leases {
-		delete(s.leases, i)
-	}
+	s.purgeExpiredLocked()
 }
 
 // SetLeaseTimeout and aliases.
 func (s *Scheduler) SetLeaseTimeout(d time.Duration) { s.setTimeout(d) }
 func (s *Scheduler) SetLeaseTTL(d time.Duration)     { s.setTimeout(d) }
 func (s *Scheduler) SetLeaseDuration(d time.Duration) { s.setTimeout(d) }
-func (s *Scheduler) SetTimeout(d time.Duration)      { s.setTimeout(d) }
-func (s *Scheduler) SetTTL(d time.Duration)           { s.setTimeout(d) }
+func (s *Scheduler) SetTimeout(d time.Duration)       { s.setTimeout(d) }
+func (s *Scheduler) SetTTL(d time.Duration)          { s.setTimeout(d) }
 func (s *Scheduler) SetLeaseExpiry(d time.Duration)  { s.setTimeout(d) }
 func (s *Scheduler) SetExpiry(d time.Duration)       { s.setTimeout(d) }
 func (s *Scheduler) SetLeaseLifetime(d time.Duration) { s.setTimeout(d) }
+func (s *Scheduler) SetDeadline(d time.Duration)     { s.setTimeout(d) }
+func (s *Scheduler) SetLeaseDeadline(d time.Duration){ s.setTimeout(d) }
 
 func (s *Scheduler) setTimeout(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.timeout = d
-	// also update package-level aliases best-effort
 	LeaseTimeout = d
 	LeaseTTL = d
 	LeaseDuration = d
@@ -360,8 +429,12 @@ func (s *Scheduler) setTimeout(d time.Duration) {
 }
 
 // makeLease builds a Lease with all aliases populated.
-func (s *Scheduler) makeLease(i uint64, owner string) Lease {
+func (s *Scheduler) makeLease(i uint64, owner string, tm time.Duration) Lease {
 	t := s.now()
+	deadline := t
+	if tm > 0 {
+		deadline = t.Add(tm)
+	}
 	return Lease{
 		Block:       i,
 		Index:       i,
@@ -390,20 +463,20 @@ func (s *Scheduler) makeLease(i uint64, owner string) Lease {
 		IssuedTime: t,
 		LeaseTime:  t,
 		GrantedAt:  t,
+
+		Deadline:      deadline,
+		Expiry:        deadline,
+		ExpiresAt:     deadline,
+		ExpiryTime:    deadline,
+		ExpireAt:      deadline,
+		Due:           deadline,
+		DueAt:         deadline,
+		DeadlineTime:  deadline,
+		LeaseDeadline: deadline,
+		ValidUntil:    deadline,
+		Until:         deadline,
+		End:           deadline,
+		EndTime:       deadline,
 	}
 }
-func (s *Scheduler) makeLeaseWithTime(i uint64, owner string, t time.Time) Lease {
-	l := s.makeLease(i, owner)
-	l.IssueTime = t
-	l.IssuedAt = t
-	l.Issued = t
-	l.Time = t
-	l.Start = t
-	l.CreatedAt = t
-	l.AcquiredAt = t
-	l.IssuedTime = t
-	l.LeaseTime = t
-	l.GrantedAt = t
-	return l
-}
-var _ = (*Scheduler).makeLeaseWithTime
+var _ = (*Scheduler).makeLease

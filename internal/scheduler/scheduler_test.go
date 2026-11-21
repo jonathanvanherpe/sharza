@@ -10,118 +10,54 @@ import (
 	"github.com/jonathanvanherpe/sharza/internal/blockmap"
 )
 
-const twoMiB = 2 << 20
-
 func newSched(blocks uint64) *Scheduler {
 	bm := blockmap.New(blocks*blockmap.DefaultBlockSize, 0)
 	return New(bm)
 }
 
-func TestAcquireBasic(t *testing.T) {
+func TestLeaseBasic(t *testing.T) {
 	s := newSched(3)
-	idx, lease, ok := s.Acquire("a")
-	if !ok {
-		t.Fatal("Acquire failed")
+	bs := s.Lease("a", 2)
+	if len(bs) != 2 {
+		t.Fatalf("lease len = %d, want 2", len(bs))
 	}
-	if lease.Block != idx || lease.Owner != "a" {
-		t.Fatalf("lease mismatch: %+v idx=%d", lease, idx)
+	for _, b := range bs {
+		if !s.IsLeased(b) {
+			t.Fatalf("block %d not leased", b)
+		}
 	}
-	if s.IsLeased(idx) == false {
-		t.Fatal("not leased")
-	}
-	if s.LeasedCount() != 1 {
+	if s.LeasedCount() != 2 {
 		t.Fatalf("leased count = %d", s.LeasedCount())
 	}
-	// same block not handed again
-	idx2, _, ok2 := s.Acquire("b")
-	if !ok2 {
-		t.Fatal("second acquire failed")
+	bs2 := s.Lease("b", 5)
+	if len(bs2) != 1 {
+		t.Fatalf("second lease len = %d, want 1", len(bs2))
 	}
-	if idx2 == idx {
+	if bs2[0] == bs[0] || bs2[0] == bs[1] {
 		t.Fatal("duplicate block handed out")
 	}
 }
 
-func TestReleaseReavailable(t *testing.T) {
+func TestLeaseNoneAvailable(t *testing.T) {
 	s := newSched(1)
-	idx, _, ok := s.Acquire("a")
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-	if !s.Release(idx, "a") {
-		t.Fatal("release failed")
-	}
-	if s.IsLeased(idx) {
-		t.Fatal("still leased after release")
-	}
-	if s.LeasedCount() != 0 {
-		t.Fatalf("leased count = %d", s.LeasedCount())
-	}
-	// available again
-	av := s.Available()
-	if len(av) != 1 || av[0] != idx {
-		t.Fatalf("available = %v", av)
-	}
-	// reacquire
-	idx2, _, ok2 := s.Acquire("b")
-	if !ok2 || idx2 != idx {
-		t.Fatalf("reacquire got %d %v, want %d", idx2, ok2, idx)
+	s.Lease("a", 1)
+	bs := s.Lease("b", 1)
+	if len(bs) != 0 {
+		t.Fatalf("expected no blocks, got %v", bs)
 	}
 }
 
-func TestReleaseWrongOwner(t *testing.T) {
-	s := newSched(1)
-	idx, _, _ := s.Acquire("a")
-	if s.Release(idx, "b") {
-		t.Fatal("release by wrong owner succeeded")
-	}
-	if !s.IsLeased(idx) {
-		t.Fatal("lease dropped by wrong owner")
-	}
-}
-
-func TestAcquireBlock(t *testing.T) {
-	s := newSched(2)
-	if !s.AcquireBlock(1, "a") {
-		t.Fatal("AcquireBlock failed")
-	}
-	if s.AcquireBlock(1, "b") {
-		t.Fatal("double AcquireBlock succeeded")
-	}
-	// verified block cannot be leased
-	bm := s.bm
-	bm.SetVerified(0)
-	if s.AcquireBlock(0, "c") {
-		t.Fatal("leased verified block")
-	}
-}
-
-func TestExpiredReclaimable(t *testing.T) {
-	// shorten timeout
-	s := newSched(1)
-	s.SetLeaseTimeout(10 * time.Millisecond)
-	defer s.SetLeaseTimeout(100 * time.Millisecond)
-	idx, _, ok := s.Acquire("a")
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-	time.Sleep(50 * time.Millisecond)
-	// expired, should be reclaimable
-	if s.IsLeased(idx) {
-		t.Fatal("expired lease still reported leased")
-	}
-	idx2, _, ok2 := s.Acquire("b")
-	if !ok2 || idx2 != idx {
-		t.Fatalf("reclaim got %d %v, want %d", idx2, ok2, idx)
-	}
-}
-
-func TestAvailableExcludesLeased(t *testing.T) {
+func TestLeaseVerifiedExcluded(t *testing.T) {
 	s := newSched(3)
-	s.Acquire("a")
-	av := s.Available()
-	if len(av) != 2 {
-		t.Fatalf("available len = %d, want 2", len(av))
+	s.bm.SetVerified(1)
+	bs := s.Lease("a", 5)
+	for _, b := range bs {
+		if b == 1 {
+			t.Fatal("verified block leased")
+		}
+	}
+	if len(bs) != 2 {
+		t.Fatalf("len = %d, want 2", len(bs))
 	}
 }
 
@@ -133,42 +69,152 @@ func TestNoDuplicateConcurrent(t *testing.T) {
 	dups := 0
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
-		go func(n int) {
+		go func() {
 			defer wg.Done()
-			idx, _, ok := s.Acquire("o")
-			if !ok {
+			bs := s.Lease("o", 1)
+			if len(bs) == 0 {
 				return
 			}
+			idx := bs[0]
 			mu.Lock()
 			if seen[idx] {
 				dups++
 			}
 			seen[idx] = true
 			mu.Unlock()
-		}(i)
+		}()
 	}
 	wg.Wait()
 	if dups != 0 {
-		t.Fatalf("duplicate acquisitions: %d", dups)
+		t.Fatalf("duplicate leases: %d", dups)
+	}
+}
+
+func TestExpiredReclaimable(t *testing.T) {
+	s := newSched(1)
+	s.SetLeaseTimeout(10 * time.Millisecond)
+	defer s.SetLeaseTimeout(100 * time.Millisecond)
+	bs := s.Lease("a", 1)
+	if len(bs) != 1 {
+		t.Fatal("lease failed")
+	}
+	idx := bs[0]
+	time.Sleep(50 * time.Millisecond)
+	if s.IsLeased(idx) {
+		t.Fatal("expired lease still reported leased")
+	}
+	bs2 := s.Lease("b", 1)
+	if len(bs2) != 1 || bs2[0] != idx {
+		t.Fatalf("reclaim got %v, want [%d]", bs2, idx)
+	}
+}
+
+func TestReleaseSemantics(t *testing.T) {
+	s := newSched(1)
+	bs := s.Lease("a", 1)
+	if len(bs) != 1 {
+		t.Fatal("lease failed")
+	}
+	idx := bs[0]
+	if !s.Release("a", []uint64{idx}) {
+		t.Fatal("release failed")
+	}
+	if s.IsLeased(idx) {
+		t.Fatal("still leased after release")
+	}
+	if s.LeasedCount() != 0 {
+		t.Fatalf("leased count = %d", s.LeasedCount())
+	}
+	av := s.Available()
+	if len(av) != 1 || av[0] != idx {
+		t.Fatalf("available = %v", av)
+	}
+	bs2 := s.Lease("b", 1)
+	if len(bs2) != 1 || bs2[0] != idx {
+		t.Fatalf("re-lease got %v", bs2)
+	}
+}
+
+func TestReleaseWrongOwner(t *testing.T) {
+	s := newSched(1)
+	bs := s.Lease("a", 1)
+	idx := bs[0]
+	if s.Release("b", []uint64{idx}) {
+		t.Fatal("release by wrong owner succeeded")
+	}
+	if !s.IsLeased(idx) {
+		t.Fatal("lease dropped by wrong owner")
+	}
+}
+
+func TestCompleteSemantics(t *testing.T) {
+	s := newSched(2)
+	bs := s.Lease("a", 1)
+	idx := bs[0]
+	s.Complete(idx)
+	if !s.bm.IsVerified(idx) {
+		t.Fatal("block not verified after Complete")
+	}
+	if s.IsLeased(idx) {
+		t.Fatal("lease not cleared after Complete")
+	}
+	bs2 := s.Lease("b", 5)
+	for _, b := range bs2 {
+		if b == idx {
+			t.Fatal("completed block re-leased")
+		}
+	}
+}
+
+func TestCompleteClearsLease(t *testing.T) {
+	s := newSched(1)
+	bs := s.Lease("a", 1)
+	idx := bs[0]
+	s.Complete(idx)
+	if s.LeasedCount() != 0 {
+		t.Fatalf("leased count = %d", s.LeasedCount())
+	}
+}
+
+func TestAvailableExcludesLeased(t *testing.T) {
+	s := newSched(3)
+	s.Lease("a", 1)
+	av := s.Available()
+	if len(av) != 2 {
+		t.Fatalf("available len = %d, want 2", len(av))
+	}
+}
+
+func TestReleasePartialOwnership(t *testing.T) {
+	s := newSched(2)
+	b0 := s.Lease("a", 1)
+	b1 := s.Lease("b", 1)
+	if !s.Release("a", []uint64{b0[0], b1[0]}) {
+		t.Fatal("release failed")
+	}
+	if !s.IsLeased(b1[0]) {
+		t.Fatal("b's lease wrongly cleared")
 	}
 }
 
 func FuzzScheduler(f *testing.F) {
-	f.Add(uint8(0), uint64(0), "a")
-	f.Add(uint8(1), uint64(1), "b")
-	f.Fuzz(func(t *testing.T, op uint8, idx uint64, owner string) {
+	f.Add(uint8(0), uint64(0))
+	f.Add(uint8(1), uint64(1))
+	f.Fuzz(func(t *testing.T, op uint8, idx uint64) {
 		s := newSched(4)
-		switch op % 5 {
+		switch op % 6 {
 		case 0:
-			s.Acquire(owner)
+			s.Lease("o", 1)
 		case 1:
-			s.AcquireBlock(idx%4, owner)
+			s.AcquireBlock(idx%4, "o")
 		case 2:
-			s.Release(idx%4, owner)
+			s.Release("o", []uint64{idx % 4})
 		case 3:
 			s.IsLeased(idx % 4)
 		case 4:
 			s.Available()
+		case 5:
+			s.Complete(idx % 4)
 		}
 		_ = s.LeasedCount()
 	})
