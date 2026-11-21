@@ -111,6 +111,15 @@ func New(bm *blockmap.BlockMap) *Scheduler {
 // NewScheduler is an alias for New.
 func NewScheduler(bm *blockmap.BlockMap) *Scheduler { return New(bm) }
 
+// BlockMap returns the wrapped canonical block map.
+func (s *Scheduler) BlockMap() *blockmap.BlockMap {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bm
+}
 func effectiveTimeout() time.Duration {
 	v := LeaseTimeout
 	for _, c := range []time.Duration{LeaseTTL, LeaseDuration, DefaultLeaseTimeout, DefaultLeaseTTL, DefaultLeaseDuration, LeaseExpiry, LeaseLifetime} {
