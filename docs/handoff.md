@@ -6,6 +6,33 @@ blocker.
 
 ## Resolved in this cycle
 
+### The harness no longer opens PRs for documentation-only cycles
+
+PR #75 changed only `docs/handoff.md` and said so in the handoff itself; the
+old `git status --porcelain` check saw any file change as a landing, committed
+it, pushed it and opened a PR. That is a review request for a cycle that did
+nothing. The harness now computes changed paths from `git diff --name-only HEAD`
+plus `git ls-files --others --exclude-standard` and opens a PR only when at
+least one changed path is code. Markdown files and anything under `docs/` are
+documentation; everything else counts as code. A docs-only cycle records the
+reason in state, notifies, and returns before committing.
+
+PR #67 was the opposite failure: it contained real ed2k code, but its title was
+the literal "Task Brief /next-task" line because the harness used the first
+line of the selector's brief. The builder is now asked to finish with `HARNESS_TITLE`,
+`HARNESS_SUMMARY` and `HARNESS_FILES` markers. The harness uses those for the
+PR title and "What changed" section, falling back to the brief's named item
+and then to the changed code paths. The brief stays in the body as context, and
+the verification section is still built only from the harness's own gates.
+
+The pure helpers live in `harness/pr.mjs` with tests in `harness/pr.test.mjs`;
+the docs-only rule was mutation-tested by dropping `.md` from the documentation
+extension set and watching the test go red. While touching the failure path,
+two latent crashes were also fixed: `streamSessionID(stdout)` referenced an
+undefined variable in `main()`, and `why` was read before its block-scoped
+declaration. Failure notification is now a single path with one session deep
+link.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -481,3 +508,18 @@ Added `internal/engine/ed2k/download.go` with `Downloader`, `Engine.DialDownload
 Added `internal/engine/ed2k/partmetverify.go` with `PartMetVerify(data []byte, pm PartMet) (bool, []int)` plus aliases (`VerifyPartMet`, `PartMetCheck`, `CheckPartMet`) and `PartMetPartHash`. Resolves `PartMet` alias fields via `normalized()`; checks non-zero file size against `len(data)`; MD4 (golang.org/x/crypto/md4) per part (final short part, no padding); collects corrupt/missing part indices; non-zero root/file MD4 mismatch marks every part corrupt. Returns `true, nil` on full match. No file I/O, networking, AICH wiring, obfuscation, or daemon/RPC/store/config changes.
 
 To avoid Go redeclaration (same package) with the prior `partverify.go` helpers, the colliding top-level names `VerifyPartMet(pm,...)`, `CheckPartMet(pm,...)`, `PartMetVerify(pm,...)` (and lowercase `verifyPartMet`/`partMetVerify`) were removed from `partverify.go`; their behaviour remains reachable via the non-colliding `PartVerify`/`ValidatePartMet`/etc. aliases, and `partverify_test.go` was updated to call `PartVerify`. The new API keeps the existing `PartVerifyResult`-based helper intact for callers that want the richer result.
+
+- This cycle (brief "Waiting for the harness dry-run to finish"): the selection produced a non-actionable brief with no concrete scope/files. The pending manual dry-run proposed an ed2k C2C peer-connection slice, but that work is already landed (`internal/engine/ed2k/peerconn.go`, `DialPeer`). No code changes were made; all verify gates (build, vet, test -race, CGO_ENABLED=0 build, SPDX, module path, canary) pass on the unchanged tree. Out of scope: implementing any new slice from the stale dry-run proposal.
+
+### P4 ed2k in-process exchange slice (exchange_test.go)
+
+Added `internal/engine/ed2k/exchange_test.go` with `TestExchangeDataVerifies` and
+`TestExchangeDataNotFound`, pairing `ServeTransferConn` (listener) with
+`DialDownload` (dialer) over real TCP. To make the two composable,
+`serveTransferConn` gained minimal, additive handling: it now answers
+`OP_QUEUEREQUEST` with `OP_STARTUPLOAD`, clamps a request's `bis` to the
+available source length, returns an empty terminal `OP_SENDINGPART` when the
+requested offset is at/past end-of-data, and only returns after the final
+chunk (continuing to serve subsequent requests otherwise). No opcode/layout,
+block-map, or PartMet semantics changed. Serving-side queue *scheduling*
+remains out of scope; only the grant needed for the exchange is emitted.

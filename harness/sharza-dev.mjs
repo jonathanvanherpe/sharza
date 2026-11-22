@@ -7,7 +7,7 @@
 //   2. Branch agent/<task-id> from main.
 //   3. Run an agent on it in a fresh opencode session.
 //   4. Verify with /verify.
-//   5. Commit, push, open a merge request.
+//   5. Commit, push, open a pull request only if code changed.
 //
 // It never merges to main. That is the maintainer's call, and the only thing
 // separating this from an agent with commit access to a branch you care about.
@@ -35,6 +35,13 @@ import {
   RESOURCE_PAUSE_MS,
 } from "./router.mjs";
 import { createPullRequest, parseRemote, compareUrl, resolveGitHubToken, pullRequestState, assignPullRequest } from "./github.mjs";
+import {
+  changedPaths,
+  codeFilesFromPaths,
+  parseImplementationReport,
+  humanReadableTitle,
+  buildPrBody,
+} from "./pr.mjs";
 
 const exec = promisify(execFile);
 
@@ -363,20 +370,6 @@ async function verifyGate() {
   return results;
 }
 
-/** The pull request body: the brief, plus the checks the harness itself ran. */
-function buildPrBody({ task, verify }) {
-  const checks = verify.map((v) => `- ${v.ok ? "pass" : "FAIL"}  ${v.label}`).join("\n");
-  return (
-    `Automated cycle from the Sharza harness.\n\n` +
-    `## Task\n\n${task}\n\n` +
-    `## Verification\n\n` +
-    `Run by the harness after the agent stopped, not taken from the agent's\n` +
-    `own report:\n\n${checks}\n\n` +
-    `Read the diff, and \`docs/handoff.md\` on this branch for what the cycle\n` +
-    `did and did not exercise, before merging.\n`
-  );
-}
-
 async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith("--")));
   const valueOf = (name) => {
@@ -486,7 +479,9 @@ async function main(argv) {
   // If a PR is pending, tell the selector to only proceed when the next
   // item is independent of it; otherwise have it say WAIT so we can sleep
   // instead of re-deriving the same task.
-  const pendingSummary = pendingPRs.map((pr) => `- #${pr.number}: ${pr.task}`).join("\n");
+  const pendingSummary = pendingPRs
+    .map((pr) => `- #${pr.number}: ${pr.title ?? pr.task}`)
+    .join("\n");
   const selectionPrompt = pendingPRs.length > 0 && !forcedTask
     ? "There are pending pull requests:\n" + pendingSummary +
       "\n\nRun the /next-task command. If the selected item is independent of " +
@@ -618,7 +613,12 @@ async function main(argv) {
       `starting it.\n` +
       `- When done, run the /verify command and report honestly which checks ` +
       `passed, which failed, and which you could not run. Do not claim a check ` +
-      `passed if you did not run it.\n`,
+      `passed if you did not run it.\n` +
+      `- End with these exact lines, which the harness uses for the pull request ` +
+      `title and description:\n` +
+      `  HARNESS_TITLE: one short sentence, max 90 chars, describing what you implemented\n` +
+      `  HARNESS_SUMMARY: one to three plain sentences describing the change and why\n` +
+      `  HARNESS_FILES: comma-separated list of the main code files you changed\n`,
     sessionTitle: `sharza: ${branch}`,
     timeoutMs: 7_200_000,
   });
@@ -631,8 +631,19 @@ async function main(argv) {
       verify.map((v) => `  ${v.ok ? "pass" : "FAIL"}  ${v.label}`).join("\n"),
   );
 
-  const changed = git(["status", "--porcelain"]);
-  const haveChanges = Boolean(changed);
+  // A docs-only cycle is not a code change. The agent is told to record
+  // decisions in docs/handoff.md, so that file alone is the most common
+  // leftover from a cycle that did nothing; it must not become a PR.
+  const allChangedFiles = changedPaths(
+    git(["diff", "--name-only", "HEAD"]),
+    git(["ls-files", "--others", "--exclude-standard"]),
+  );
+  const codeFiles = codeFilesFromPaths(allChangedFiles);
+  const haveChanges = allChangedFiles.length > 0;
+  const haveCodeChanges = codeFiles.length > 0;
+
+  const report = parseImplementationReport(lastAssistantText(run.stdout));
+  const title = humanReadableTitle({ report, task, codeFiles, id });
 
   // A crashed agent is not a successful cycle even if its leftover changes
   // happen to compile. A quota failure or a timeout partway through leaves a
@@ -668,69 +679,40 @@ async function main(argv) {
       silent: !lastAssistantText(run.stdout).trim(),
     });
     if (exhausted) reasons.push(`quota exhausted: ${exhausted}`);
-
-    // Send a notification that includes the session deep-link, so a click
-    // can open the run that just died. The streamSessionID helper reads it
-    // from the JSON event stream that opencode already emitted.
-    const sid = run.sessionID ?? streamSessionID(stdout);
-    if (exhausted && sid) {
-      console.log(`sessionID=${sid} from stream; attaching OpenCode deep link`);
-      await pauseForQuota({
-        reason: `cycle ${id} could not run: ${exhausted}`,
-        model: chosen.model,
-        task,
-        branch,
-        sessionID: sid,
-      });
-    } else if (!exhausted && sid) {
-      console.log(`sessionID=${sid} from stream; attaching OpenCode deep link`);
-      await notify(
-        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}\n`,
-        { title: "Sharza harness", priority: "high", tags: ["x"], url: appDeepLink(sid) },
-      );
-    } else {
-      // Fallback: no id in the stream, fall back to plain notify.
-      await notify(
-        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
-        {
-          title: "Sharza harness",
-          priority: "high",
-          tags: ["x"],
-        },
-      );
-    }
   }
   if (failed.length > 0) {
     reasons.push(`verify failed: ${failed.map((f) => f.label).join(", ")}`);
   }
   if (!haveChanges) {
     reasons.push("no file changes were produced");
+  } else if (!haveCodeChanges) {
+    reasons.push("documentation-only changes; no code changed, so no pull request");
   }
 
   if (reasons.length > 0) {
     const why = reasons.join("; ");
     console.log(`\nnot committing: ${why}`);
 
+    // One notification path, whether the agent died, verification failed, or
+    // the cycle changed no code. A session deep link is attached when the
+    // event stream reported one, so a tap opens the exact run.
+    const sid = run.sessionID ?? streamSessionID(run.stdout);
+    if (sid) console.log(`sessionID=${sid} from stream; attaching OpenCode deep link`);
     if (exhausted) {
-      // One notification, not two: the pause message is the useful one, and
-      // it already says which cycle and branch did not land.
       await pauseForQuota({
         reason: `cycle ${id} could not run: ${exhausted}`,
         model: chosen.model,
         task,
         branch,
+        sessionID: sid ?? undefined,
       });
     } else {
-      const sid = run.sessionID ?? streamSessionID(stdout);
-      await notify(
-        `Cycle ${id} did not land.\n${why}\nBranch: ${branch}`,
-        {
-          title: "Sharza harness",
-          priority: "high",
-          tags: ["x"],
-          url: sid ? appDeepLink(sid) : undefined,
-        },
-      );
+      await notify(`Cycle ${id} did not land.\n${why}\nBranch: ${branch}`, {
+        title: "Sharza harness",
+        priority: "high",
+        tags: ["x"],
+        url: sid ? appDeepLink(sid) : undefined,
+      });
     }
 
     // Reload rather than reusing the state read at the top of main: a pause
@@ -746,7 +728,7 @@ async function main(argv) {
       waitDelayMs,
       history: [
         ...(fresh.history ?? []),
-        { at: new Date().toISOString(), branch, task: task.split("\n")[0], result: why },
+        { at: new Date().toISOString(), branch, title, result: why },
       ].slice(-50),
     });
     return 1;
@@ -758,9 +740,10 @@ async function main(argv) {
     "commit",
     "-q",
     "-m",
-    `${id}: ${task.split("\n")[0]}`,
+    `${id}: ${title}`,
     "-m",
     `Automated cycle from the Sharza harness.\n\n` +
+      `${report.summary || `Implemented ${title}.`}\n\n` +
       `Verification: ${verify.map((v) => v.label).join(", ")} passed.\n\n` +
       `See docs/handoff.md for what was and was not exercised.`,
   ]);
@@ -792,8 +775,8 @@ async function main(argv) {
         repo: remote.repo,
         head: branch,
         base: "main",
-        title: `${id}: ${task.split("\n")[0]}`,
-        body: buildPrBody({ task, verify }) + "\n\n@" + notifyUser,
+        title,
+        body: buildPrBody({ task, verify, report, codeFiles, title }) + "\n\n@" + notifyUser,
         token,
       });
       if (pr.ok && pr.number) {
@@ -817,7 +800,7 @@ async function main(argv) {
   }
 
   if (pushed && prCreated && prNumber) {
-    pendingPRs.push({ number: prNumber, url: prUrl, task: task.split("\n")[0], at: new Date().toISOString() });
+    pendingPRs.push({ number: prNumber, url: prUrl, title, at: new Date().toISOString() });
     waitDelayMs = 60_000;
   }
 
@@ -839,14 +822,14 @@ async function main(argv) {
       {
         at: new Date().toISOString(),
         branch,
-        task: task.split("\n")[0],
+        title,
         result: prUrl ? `${landed} - ${prUrl}` : landed,
       },
     ].slice(-50),
   });
 
   await notify(
-    `Cycle ${id} ready for review.\nBranch: ${branch}\nTask: ${task.split("\n")[0]}\n\n` +
+    `Cycle ${id} ready for review.\nBranch: ${branch}\nImplemented: ${title}\n\n` +
       (pushed
         ? prCreated
           ? `Pull request: ${prUrl}\nReview it, then merge.`
