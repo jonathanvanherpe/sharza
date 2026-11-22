@@ -246,6 +246,24 @@ readRequest:
 		switch op {
 		case OP_REJECT:
 			return peer, fr, rp, fmt.Errorf("ed2k: peer rejected connection")
+		case OP_QUEUEREQUEST:
+			// Grant an upload slot so queue-aware download clients (DialDownload)
+			// can proceed. Serving-side queue scheduling is otherwise out of
+			// scope; this is the minimal grant needed for the in-process
+			// exchange slice.
+			qframe := Frame{
+				Protocol: ProtocolEDonkey,
+				Opcode:   OP_STARTUPLOAD,
+				Payload:  StartUpload{}.Marshal(),
+			}
+			wl := dialDeadline(ctx)
+			if err := conn.SetWriteDeadline(wl); err != nil {
+				return peer, fr, rp, err
+			}
+			if _, err := conn.Write(qframe.Marshal()); err != nil {
+				return peer, fr, rp, err
+			}
+			continue
 		case OP_REQUESTPARTS:
 			decoded, err := DecodeRequestParts(payload)
 			if err != nil {
@@ -285,9 +303,39 @@ readRequest:
 			v := von[0]
 			b := bis[0]
 
+			// End-of-data: nothing more to serve.
+			if source != nil && int(v) >= len(source) {
+				sp := SendingPart{
+					Hash: h,
+					Von:  v,
+					Bis:  v,
+					Data: nil,
+				}
+				sp.FileHash = h
+				sp.MD4 = h
+				frame := Frame{
+					Protocol: ProtocolEDonkey,
+					Opcode:   OP_SENDINGPART,
+					Payload:  sp.Marshal(),
+				}
+				wl := dialDeadline(ctx)
+				if err := conn.SetWriteDeadline(wl); err != nil {
+					return peer, fr, rp, err
+				}
+				if _, err := conn.Write(frame.Marshal()); err != nil {
+					return peer, fr, rp, err
+				}
+				return peer, fr, rp, nil
+			}
+
+			// Clamp the requested end to the available source length.
+			if source != nil && int(b) > len(source) {
+				b = uint32(len(source))
+			}
+
 			// Size/range refusal: out of bounds of supplied source.
 			if source != nil {
-				if int(v) > len(source) || int(b) > len(source) || v > b {
+				if int(v) > len(source) || v > b {
 					frame := Frame{
 						Protocol: ProtocolEDonkey,
 						Opcode:   OP_FILENOTFOUND,
@@ -330,7 +378,12 @@ readRequest:
 			if _, err := conn.Write(frame.Marshal()); err != nil {
 				return peer, fr, rp, err
 			}
-			return peer, fr, rp, nil
+			// Return when this chunk reached the end of the source; otherwise
+			// keep serving subsequent requests on the same connection.
+			if source == nil || int(b) >= len(source) {
+				return peer, fr, rp, nil
+			}
+			continue
 		default:
 			// Tolerate leading/unexpected frames.
 			continue

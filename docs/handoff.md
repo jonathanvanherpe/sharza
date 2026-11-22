@@ -508,3 +508,16 @@ Added `internal/engine/ed2k/partmetverify.go` with `PartMetVerify(data []byte, p
 To avoid Go redeclaration (same package) with the prior `partverify.go` helpers, the colliding top-level names `VerifyPartMet(pm,...)`, `CheckPartMet(pm,...)`, `PartMetVerify(pm,...)` (and lowercase `verifyPartMet`/`partMetVerify`) were removed from `partverify.go`; their behaviour remains reachable via the non-colliding `PartVerify`/`ValidatePartMet`/etc. aliases, and `partverify_test.go` was updated to call `PartVerify`. The new API keeps the existing `PartVerifyResult`-based helper intact for callers that want the richer result.
 
 - This cycle (brief "Waiting for the harness dry-run to finish"): the selection produced a non-actionable brief with no concrete scope/files. The pending manual dry-run proposed an ed2k C2C peer-connection slice, but that work is already landed (`internal/engine/ed2k/peerconn.go`, `DialPeer`). No code changes were made; all verify gates (build, vet, test -race, CGO_ENABLED=0 build, SPDX, module path, canary) pass on the unchanged tree. Out of scope: implementing any new slice from the stale dry-run proposal.
+
+### P4 ed2k in-process exchange slice (exchange_test.go)
+
+Added `internal/engine/ed2k/exchange_test.go` with `TestExchangeDataVerifies` and
+`TestExchangeDataNotFound`, pairing `ServeTransferConn` (listener) with
+`DialDownload` (dialer) over real TCP. To make the two composable,
+`serveTransferConn` gained minimal, additive handling: it now answers
+`OP_QUEUEREQUEST` with `OP_STARTUPLOAD`, clamps a request's `bis` to the
+available source length, returns an empty terminal `OP_SENDINGPART` when the
+requested offset is at/past end-of-data, and only returns after the final
+chunk (continuing to serve subsequent requests otherwise). No opcode/layout,
+block-map, or PartMet semantics changed. Serving-side queue *scheduling*
+remains out of scope; only the grant needed for the exchange is emitted.
