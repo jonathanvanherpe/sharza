@@ -6,6 +6,33 @@ blocker.
 
 ## Resolved in this cycle
 
+### The harness no longer opens PRs for documentation-only cycles
+
+PR #75 changed only `docs/handoff.md` and said so in the handoff itself; the
+old `git status --porcelain` check saw any file change as a landing, committed
+it, pushed it and opened a PR. That is a review request for a cycle that did
+nothing. The harness now computes changed paths from `git diff --name-only HEAD`
+plus `git ls-files --others --exclude-standard` and opens a PR only when at
+least one changed path is code. Markdown files and anything under `docs/` are
+documentation; everything else counts as code. A docs-only cycle records the
+reason in state, notifies, and returns before committing.
+
+PR #67 was the opposite failure: it contained real ed2k code, but its title was
+the literal "Task Brief /next-task" line because the harness used the first
+line of the selector's brief. The builder is now asked to finish with `HARNESS_TITLE`,
+`HARNESS_SUMMARY` and `HARNESS_FILES` markers. The harness uses those for the
+PR title and "What changed" section, falling back to the brief's named item
+and then to the changed code paths. The brief stays in the body as context, and
+the verification section is still built only from the harness's own gates.
+
+The pure helpers live in `harness/pr.mjs` with tests in `harness/pr.test.mjs`;
+the docs-only rule was mutation-tested by dropping `.md` from the documentation
+extension set and watching the test go red. While touching the failure path,
+two latent crashes were also fixed: `streamSessionID(stdout)` referenced an
+undefined variable in `main()`, and `why` was read before its block-scoped
+declaration. Failure notification is now a single path with one session deep
+link.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
@@ -456,6 +483,10 @@ differential test later:
 
 ## Open questions (this cycle)
 
+- P5 canonical block map: `internal/blockmap` added (`DefaultBlockSize = 1<<20`, `BlockMap`, `New`, `BlockCount`, `BlockByteRange`, `SetVerified`, `IsVerified`, `VerifiedCount`, `AllVerified`, `Unverified`, plus aliases). No engine/daemon/RPC/store/config wiring. Empty file is vacuously AllVerified. Out of scope per brief: scheduler/leases, verified store, BT range mapping, source matching, persistence, `.part.met`/AICH integration.
+
+- P5 block scheduler with lease accounting: `internal/scheduler` added (`Scheduler`, `New`, `Acquire`, `AcquireBlock`, `Release`, `IsLeased`, `LeasedCount`, `Available`, `Lease`, plus aliases and `FuzzScheduler`). Thread-safe, wraps `*blockmap.BlockMap`, expiry/timeout handling with reclaimable expired leases, stdlib only, no engine/daemon/RPC/store/config wiring. Lease timeout defaults to 100ms and is overridable via exported vars/methods for testability. Out of scope per brief: verified block store and per-network verification, BT piece range mapping, sample-based source matching, persistence/leases in store, engine or daemon wiring, `.part.met`/AICH integration. Open: lease duration default and expiry trigger convention for production callers; clock injection naming.
+
 - P4 ed2k server-side (incoming) transfer: `internal/engine/ed2k/servertransfer.go` adds `serveTransferConn` mirroring `serverfilerequest.go` + `transferconn.go`: OP_HELLO/OP_HELLOANSWER, OP_FILEREQUEST → OP_FILEREQANSWER/OP_FILENOTFOUND, OP_REQUESTPARTS → OP_SENDINGPART with caller-supplied source bytes sliced by von/bis. Out of scope: queue handling, file I/O, `.part.met`, AICH, obfuscation, daemon/RPC/store/config wiring, range mapping to canonical blocks.
 
 - eDonkey C2C Hello handshake: `OP_HELLO` (0x01) collides with `OP_LOGINREQUEST` (0x01); `OpcodeName` now reports `OP_HELLO` for 0x01. `HelloAnswer` follows Shareaza's published layout and has no leading 0x10 byte (only `Hello` does), per the wire format rather than a literal reading of the brief's "same fields".
@@ -475,6 +506,8 @@ Added `internal/engine/ed2k/download.go` with `Downloader`, `Engine.DialDownload
 Added `internal/engine/ed2k/partmetverify.go` with `PartMetVerify(data []byte, pm PartMet) (bool, []int)` plus aliases (`VerifyPartMet`, `PartMetCheck`, `CheckPartMet`) and `PartMetPartHash`. Resolves `PartMet` alias fields via `normalized()`; checks non-zero file size against `len(data)`; MD4 (golang.org/x/crypto/md4) per part (final short part, no padding); collects corrupt/missing part indices; non-zero root/file MD4 mismatch marks every part corrupt. Returns `true, nil` on full match. No file I/O, networking, AICH wiring, obfuscation, or daemon/RPC/store/config changes.
 
 To avoid Go redeclaration (same package) with the prior `partverify.go` helpers, the colliding top-level names `VerifyPartMet(pm,...)`, `CheckPartMet(pm,...)`, `PartMetVerify(pm,...)` (and lowercase `verifyPartMet`/`partMetVerify`) were removed from `partverify.go`; their behaviour remains reachable via the non-colliding `PartVerify`/`ValidatePartMet`/etc. aliases, and `partverify_test.go` was updated to call `PartVerify`. The new API keeps the existing `PartVerifyResult`-based helper intact for callers that want the richer result.
+
+- This cycle (brief "Waiting for the harness dry-run to finish"): the selection produced a non-actionable brief with no concrete scope/files. The pending manual dry-run proposed an ed2k C2C peer-connection slice, but that work is already landed (`internal/engine/ed2k/peerconn.go`, `DialPeer`). No code changes were made; all verify gates (build, vet, test -race, CGO_ENABLED=0 build, SPDX, module path, canary) pass on the unchanged tree. Out of scope: implementing any new slice from the stale dry-run proposal.
 
 ### P4 ed2k in-process exchange slice (exchange_test.go)
 
