@@ -36,11 +36,13 @@ agent every five minutes; see *Model routing* below.
    taken from the agent's report. An agent that says it verified something is
    a claim, not evidence.
 5. **Commit, push, and open a pull request** only if verification passed and
-   something changed. The pull request targets `main`, for the maintainer to
-   review and merge.
+   code changed. The pull request targets `main`, for the maintainer to review
+   and merge.
 
 A cycle that fails verification does not commit. It pushes nothing, leaves the
-branch for inspection, and notifies.
+branch for inspection, and notifies. A cycle that changes only documentation
+(`.md`, `.mdx`, `.rst`, or anything under `docs/`) is treated the same way:
+writing the handoff is not an implementation, so it does not become a PR.
 
 ## Pull requests
 
@@ -51,6 +53,14 @@ pull request cannot be created; the cycle still pushes its branch and the
 notification falls back to a compare URL a human can open. The token is read
 from the environment, which the `sharza-dev.service` unit supplies via
 `~/.config/opencode/github.env` (`GITHUB_TOKEN=...`).
+
+The title and description describe what was implemented, not the raw selector
+brief. The builder ends with `HARNESS_TITLE`, `HARNESS_SUMMARY` and
+`HARNESS_FILES` lines; `pr.mjs` uses them for the PR title and "What changed"
+section, falling back to the brief's named item and then to the changed code
+paths. The brief remains in the body as context. Verification stays in the
+harness's own hands: no agent-written claim about passing checks appears in
+the PR description.
 
 ## Model routing
 
@@ -153,5 +163,7 @@ the dependency is approved.
 
 - `sharza-dev.mjs` — the cycle
 - `router.mjs` — model discovery and routing
+- `pr.mjs` — code-change detection and human-readable PR titles/bodies
+- `pr.test.mjs` — guards the docs-only rule and the title fallback
 - `ntfy.mjs` — notifications, IPv4-pinned
 - `github.mjs` — opens the pull request, IPv4-pinned

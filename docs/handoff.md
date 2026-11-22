@@ -6,6 +6,33 @@ blocker.
 
 ## Resolved in this cycle
 
+### The harness no longer opens PRs for documentation-only cycles
+
+PR #75 changed only `docs/handoff.md` and said so in the handoff itself; the
+old `git status --porcelain` check saw any file change as a landing, committed
+it, pushed it and opened a PR. That is a review request for a cycle that did
+nothing. The harness now computes changed paths from `git diff --name-only HEAD`
+plus `git ls-files --others --exclude-standard` and opens a PR only when at
+least one changed path is code. Markdown files and anything under `docs/` are
+documentation; everything else counts as code. A docs-only cycle records the
+reason in state, notifies, and returns before committing.
+
+PR #67 was the opposite failure: it contained real ed2k code, but its title was
+the literal "Task Brief /next-task" line because the harness used the first
+line of the selector's brief. The builder is now asked to finish with `HARNESS_TITLE`,
+`HARNESS_SUMMARY` and `HARNESS_FILES` markers. The harness uses those for the
+PR title and "What changed" section, falling back to the brief's named item
+and then to the changed code paths. The brief stays in the body as context, and
+the verification section is still built only from the harness's own gates.
+
+The pure helpers live in `harness/pr.mjs` with tests in `harness/pr.test.mjs`;
+the docs-only rule was mutation-tested by dropping `.md` from the documentation
+extension set and watching the test go red. While touching the failure path,
+two latent crashes were also fixed: `streamSessionID(stdout)` referenced an
+undefined variable in `main()`, and `why` was read before its block-scoped
+declaration. Failure notification is now a single path with one session deep
+link.
+
 ### `go list -deps` reported `runtime/cgo` for a daemon with no cgo
 
 The cgo check was `go list -deps ./cmd/sharzad | grep -E '^(C|runtime/cgo)$'`.
