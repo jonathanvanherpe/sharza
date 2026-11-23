@@ -509,6 +509,12 @@ To avoid Go redeclaration (same package) with the prior `partverify.go` helpers,
 
 - This cycle (brief "Waiting for the harness dry-run to finish"): the selection produced a non-actionable brief with no concrete scope/files. The pending manual dry-run proposed an ed2k C2C peer-connection slice, but that work is already landed (`internal/engine/ed2k/peerconn.go`, `DialPeer`). No code changes were made; all verify gates (build, vet, test -race, CGO_ENABLED=0 build, SPDX, module path, canary) pass on the unchanged tree. Out of scope: implementing any new slice from the stale dry-run proposal.
 
+### P4 ed2k server-side incoming connection dispatch (serveraccept.go)
+
+Added `internal/engine/ed2k/serveraccept.go` exposing `ServeAcceptConn`/`HandleAcceptConn`/`AcceptConn` (plus `ServeAccept`/`HandleAccept`/`Accept`, lowercase aliases and IO variants) and `serveAcceptConn`. It performs the OP_HELLO/OP_HELLOANSWER handshake, then dispatches OP_FILEREQUEST to file-request handling (OP_FILEREQANSWER/OP_FILENOTFOUND) and OP_REQUESTPARTS to transfer handling (OP_SENDINGPART with caller-supplied source bytes), granting OP_QUEUEREQUEST with OP_STARTUPLOAD. The listener loop in `internal/engine/ed2k/engine.go` now hands each accepted `net.Conn` to `ServeAcceptConn` in a per-connection goroutine instead of closing it. In-process round trip covered by `serveraccept_test.go`.
+
+Out of scope per brief: obfuscation wiring into the inbound path, file I/O / `.part.met` writing, queue scheduling beyond the existing grant, AICH verification, daemon/RPC/store/config wiring, canonical-block integration, and any P5/swarm changes.
+
 ### P4 netns-gated amuled oracle test (oracle_amuled_netns_test.go)
 
 Added `internal/engine/ed2k/oracle_amuled_netns_test.go` with `TestAmuledNetnsOracle`, env-gated on `AMULED_BIN` plus root/CAP_SYS_ADMIN and a working `ip netns` (functional probe). It stages the binary, builds an isolated namespace with loopback + veth pair, seeds a file in amuled, runs amuled inside the namespace, and runs a Sharza Engine against it over the veth link, verifying downloaded bytes. No production code changes. End-to-end could not be exercised on this host (no privilege/user namespaces); skip path verified.

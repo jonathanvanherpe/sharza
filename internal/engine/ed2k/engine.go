@@ -254,7 +254,10 @@ func (e *Engine) Run(ctx context.Context, opts Options) error {
 					logf("accept: %v", err)
 					return
 				}
-				conn.Close()
+				go func(c net.Conn) {
+					defer c.Close()
+					_, _, _, _ = e.ServeAcceptConn(ctx, c)
+				}(conn)
 			}
 		}()
 	}
