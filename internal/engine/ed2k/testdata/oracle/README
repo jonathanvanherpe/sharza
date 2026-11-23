@@ -1,0 +1,5 @@
+Oracle test assets for the eDonkey/amuled differential test.
+
+TestAmuledOracle is opt-in: set AMULED_BIN to an executable amuled
+binary (honouring LD_LIBRARY_PATH for libcrypto++.so.8). With AMULED_BIN
+unset the test skips loudly.
