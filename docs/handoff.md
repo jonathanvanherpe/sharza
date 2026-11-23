@@ -509,6 +509,10 @@ To avoid Go redeclaration (same package) with the prior `partverify.go` helpers,
 
 - This cycle (brief "Waiting for the harness dry-run to finish"): the selection produced a non-actionable brief with no concrete scope/files. The pending manual dry-run proposed an ed2k C2C peer-connection slice, but that work is already landed (`internal/engine/ed2k/peerconn.go`, `DialPeer`). No code changes were made; all verify gates (build, vet, test -race, CGO_ENABLED=0 build, SPDX, module path, canary) pass on the unchanged tree. Out of scope: implementing any new slice from the stale dry-run proposal.
 
+### P4 netns-gated amuled oracle test (oracle_amuled_netns_test.go)
+
+Added `internal/engine/ed2k/oracle_amuled_netns_test.go` with `TestAmuledNetnsOracle`, env-gated on `AMULED_BIN` plus root/CAP_SYS_ADMIN and a working `ip netns` (functional probe). It stages the binary, builds an isolated namespace with loopback + veth pair, seeds a file in amuled, runs amuled inside the namespace, and runs a Sharza Engine against it over the veth link, verifying downloaded bytes. No production code changes. End-to-end could not be exercised on this host (no privilege/user namespaces); skip path verified.
+
 ### P4 ed2k in-process exchange slice (exchange_test.go)
 
 Added `internal/engine/ed2k/exchange_test.go` with `TestExchangeDataVerifies` and
