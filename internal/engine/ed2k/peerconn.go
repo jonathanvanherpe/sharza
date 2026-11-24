@@ -133,6 +133,23 @@ func (e *Engine) dialPeerConn(ctx context.Context, conn net.Conn) (PeerInfo, err
 		e = New()
 	}
 
+	// Opt-in protocol obfuscation: wrap the dialed connection before the
+	// OP_HELLO handshake when requested via Options. Defaults to off.
+	// Skip if already wrapped (e.g. by an enclosing dial helper).
+	if _, ok := conn.(*ObfuscatedConn); !ok {
+		obfuscated := false
+		e.mu.Lock()
+		obfuscated = e.opts.Obfuscation || e.opts.Obfuscated
+		e.mu.Unlock()
+		if obfuscated {
+			wrapped, err := ObfuscateConn(conn, nil)
+			if err != nil {
+				return PeerInfo{}, err
+			}
+			conn = wrapped
+		}
+	}
+
 	// Write our HELLO.
 	hello := e.buildPeerHello()
 	frame := Frame{
@@ -351,6 +368,21 @@ func (e *Engine) dialPeerFileConn(ctx context.Context, conn net.Conn, hash [16]b
 	}
 	if e == nil {
 		e = New()
+	}
+
+	// Opt-in protocol obfuscation.
+	if _, ok := conn.(*ObfuscatedConn); !ok {
+		obfuscated := false
+		e.mu.Lock()
+		obfuscated = e.opts.Obfuscation || e.opts.Obfuscated
+		e.mu.Unlock()
+		if obfuscated {
+			wrapped, err := ObfuscateConn(conn, nil)
+			if err != nil {
+				return PeerInfo{}, FileReqAnswer{}, err
+			}
+			conn = wrapped
+		}
 	}
 
 	// Handshake first.

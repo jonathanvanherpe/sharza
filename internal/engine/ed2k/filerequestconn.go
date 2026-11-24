@@ -24,6 +24,21 @@ func (e *Engine) dialFileRequestConn(ctx context.Context, conn net.Conn, hash [1
 		e = New()
 	}
 
+	// Opt-in protocol obfuscation.
+	if _, ok := conn.(*ObfuscatedConn); !ok {
+		obfuscated := false
+		e.mu.Lock()
+		obfuscated = e.opts.Obfuscation || e.opts.Obfuscated
+		e.mu.Unlock()
+		if obfuscated {
+			wrapped, err := ObfuscateConn(conn, nil)
+			if err != nil {
+				return PeerInfo{}, FileReqAnswer{}, err
+			}
+			conn = wrapped
+		}
+	}
+
 	// Handshake first.
 	pi, err := e.dialPeerConn(ctx, conn)
 	if err != nil {
