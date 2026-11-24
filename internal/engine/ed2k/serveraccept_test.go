@@ -220,6 +220,122 @@ func TestServerAcceptConnIO(t *testing.T) {
 	}
 }
 
+func TestServerAcceptConnObfuscatedRoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	wantHash := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	availName := "obf.bin"
+
+	go func() {
+		defer c1.Close()
+		e := New()
+		e.mu.Lock()
+		e.clientID = 777
+		e.laddr = &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4662}
+		e.mu.Unlock()
+		e.kadMu.Lock()
+		e.kadSelf = wantHash
+		e.kadSelfID = wantHash
+		e.kadID = wantHash
+		e.kadMu.Unlock()
+		e.opts.Obfuscation = true
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, _, _, err := e.ServeAcceptConn(ctx, c1, wantHash, availName); err != nil {
+			t.Errorf("ServeAcceptConn: %v", err)
+		}
+	}()
+
+	// Client side: obfuscate our end of the pipe manually (outbound wiring is
+	// out of scope for this slice).
+	var wc net.Conn
+	var oerr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wc, oerr = ObfuscateConn(c2, nil)
+	}()
+	<-done
+	if oerr != nil {
+		t.Fatalf("client ObfuscateConn: %v", oerr)
+	}
+	defer wc.Close()
+
+	e := New()
+	e.kadMu.Lock()
+	e.kadSelf = wantHash
+	e.kadSelfID = wantHash
+	e.kadID = wantHash
+	e.mu.Lock()
+	e.clientID = 12345
+	e.mu.Unlock()
+	e.kadMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	buf := &bytes.Buffer{}
+	pi, ans, _, n, err := e.DialDownloadConn(ctx, wc, wantHash, buf)
+	if err != nil {
+		t.Fatalf("DialDownloadConn: %v", err)
+	}
+	if pi.ClientID != 777 {
+		t.Fatalf("peer ClientID = %d, want 777", pi.ClientID)
+	}
+	if ans.Name != availName {
+		t.Fatalf("answer Name = %q, want %q", ans.Name, availName)
+	}
+	_ = n
+	_ = buf
+}
+
+func TestServerAcceptConnPlainPipe(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	wantHash := [16]byte{9, 9, 9, 9}
+	availName := "plain.bin"
+
+	go func() {
+		defer c1.Close()
+		e := New()
+		e.mu.Lock()
+		e.clientID = 777
+		e.mu.Unlock()
+		e.kadMu.Lock()
+		e.kadSelf = wantHash
+		e.kadSelfID = wantHash
+		e.kadID = wantHash
+		e.kadMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, _, _, err := e.ServeAcceptConn(ctx, c1, wantHash, availName); err != nil {
+			t.Errorf("ServeAcceptConn: %v", err)
+		}
+	}()
+
+	e := New()
+	e.kadMu.Lock()
+	e.kadSelf = wantHash
+	e.kadSelfID = wantHash
+	e.kadID = wantHash
+	e.mu.Lock()
+	e.clientID = 12345
+	e.mu.Unlock()
+	e.kadMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	buf := &bytes.Buffer{}
+	_, ans, _, _, err := e.DialDownloadConn(ctx, c2, wantHash, buf)
+	if err != nil {
+		t.Fatalf("DialDownloadConn: %v", err)
+	}
+	if ans.Name != availName {
+		t.Fatalf("answer Name = %q, want %q", ans.Name, availName)
+	}
+}
+
 var _ = time.Second
 var _ = net.Listen
 var _ = context.Background
