@@ -25,6 +25,11 @@ type Downloader struct {
 	Hash any
 	// Dst is the destination: an io.Writer, a []byte buffer, or *[]byte.
 	Dst any
+	// PartMet, when set, is used by the verified download helpers to check the
+	// transferred bytes (byte count, per-part MD4, file hash).
+	PartMet PartMet
+	// PM is an alias for PartMet.
+	PM PartMet
 	// Engine supplies identity for the handshake. Nil selects New().
 	Engine *Engine
 }
@@ -67,6 +72,49 @@ func (d *Downloader) Run(ctx context.Context, dst ...any) (PeerInfo, FileReqAnsw
 // Do is an alias for Download.
 func (d *Downloader) Do(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, error) {
 	return d.Download(ctx, dst...)
+}
+
+// partMet returns the configured PartMet (PartMet or PM alias).
+func (d *Downloader) partMet() PartMet {
+	pm := d.PartMet
+	if partMetIsEmpty(pm) {
+		pm = d.PM
+	}
+	return pm
+}
+
+// DownloadVerified fetches the file into Dst and verifies it against d.PartMet,
+// returning corrupt indices.
+func (d *Downloader) DownloadVerified(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, []int, error) {
+	if len(dst) > 0 && dst[0] != nil {
+		d.Dst = dst[0]
+	}
+	return d.FetchVerified(ctx)
+}
+
+// FetchVerified is an alias for DownloadVerified.
+func (d *Downloader) FetchVerified(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, []int, error) {
+	if len(dst) > 0 && dst[0] != nil {
+		d.Dst = dst[0]
+	}
+	eng := d.Engine
+	if eng == nil {
+		eng = New()
+	}
+	if partMetIsEmpty(d.PartMet) {
+		d.PartMet = d.PM
+	}
+	return eng.DialDownloadVerified(ctx, d.Target, fileRequestHash(d.Hash), d.PartMet, d.Dst)
+}
+
+// RunVerified is an alias for DownloadVerified.
+func (d *Downloader) RunVerified(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, []int, error) {
+	return d.DownloadVerified(ctx, dst...)
+}
+
+// DoVerified is an alias for DownloadVerified.
+func (d *Downloader) DoVerified(ctx context.Context, dst ...any) (PeerInfo, FileReqAnswer, QueueResult, int, []int, error) {
+	return d.DownloadVerified(ctx, dst...)
 }
 
 // dialDownloadConn performs the C2C handshake over an already-open
@@ -542,6 +590,18 @@ func downloadConn(ctx context.Context, conn net.Conn, args ...any) (PeerInfo, Fi
 func (e *Engine) Downloader(target any, hash any) *Downloader {
 	d := NewDownloader(target, hash)
 	d.Engine = e
+	if d.Engine == nil {
+		d.Engine = e
+	}
+	return d
+}
+
+// Engine.DownloaderVerified convenience.
+func (e *Engine) DownloaderVerified(target any, hash any, pm PartMet) *Downloader {
+	d := NewDownloader(target, hash)
+	d.Engine = e
+	d.PartMet = pm
+	d.PM = pm
 	if d.Engine == nil {
 		d.Engine = e
 	}
