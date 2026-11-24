@@ -27,6 +27,20 @@ func (e *Engine) serveAcceptConn(ctx context.Context, conn net.Conn, args ...any
 		e = New()
 	}
 
+	// Opt-in protocol obfuscation: wrap the accepted connection before the
+	// OP_HELLO handshake when requested via Options. Defaults to off.
+	obfuscated := false
+	e.mu.Lock()
+	obfuscated = e.opts.Obfuscation || e.opts.Obfuscated
+	e.mu.Unlock()
+	if obfuscated {
+		wrapped, err := ObfuscateConn(conn, nil)
+		if err != nil {
+			return PeerInfo{}, FileRequest{}, RequestParts{}, err
+		}
+		conn = wrapped
+	}
+
 	availHash, availName, source, hasAvailable := parseTransferAvailable(args)
 
 	var peer PeerInfo

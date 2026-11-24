@@ -16,6 +16,12 @@ type Options struct {
 	Listen  string
 	Logf    func(format string, args ...any)
 
+	// Obfuscation enables protocol obfuscation on accepted (inbound)
+	// connections: the accepted net.Conn is wrapped with ObfuscateConn before
+	// the OP_HELLO handshake. Defaults to off. Obfuscated is an alias spelling.
+	Obfuscation bool
+	Obfuscated  bool
+
 	// Kad bootstrap node endpoints (UDP host:port). The fields below are
 	// alias spellings resolved by kadBootstrapNodes.
 	KadBootstrapNodes     []string
