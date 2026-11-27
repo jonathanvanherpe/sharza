@@ -517,6 +517,9 @@ Added `internal/engine/ed2k/serveraccept.go` exposing `ServeAcceptConn`/`HandleA
 
 Out of scope per brief: obfuscation wiring into the inbound path, file I/O / `.part.met` writing, queue scheduling beyond the existing grant, AICH verification, daemon/RPC/store/config wiring, canonical-block integration, and any P5/swarm changes.
 
+### P5 eDonkey2000 engine adapter (first slice)
+Added `internal/engine/ed2k/swarmadapter.go` with `Adapter`/`SwarmAdapter` (plus aliases) wrapping `*ed2k.RangeMap` plus `*swarm.Swarm`/`*scheduler.Scheduler`, translating parts↔canonical blocks, thread-safe verified-part tracking, and `Lease`/`Complete`/`IsComplete` hooks. Default part size 9728000 bytes. Tests in `swarmadapter_test.go`. Out of scope: daemon/RPC/store/config wiring, persistence, real transfers, Level 2 scheduling, `.part.met`/AICH wiring.
+
 ### P4 netns-gated amuled oracle test (oracle_amuled_netns_test.go)
 
 Added `internal/engine/ed2k/oracle_amuled_netns_test.go` with `TestAmuledNetnsOracle`, env-gated on `AMULED_BIN` plus root/CAP_SYS_ADMIN and a working `ip netns` (functional probe). It stages the binary, builds an isolated namespace with loopback + veth pair, seeds a file in amuled, runs amuled inside the namespace, and runs a Sharza Engine against it over the veth link, verifying downloaded bytes. No production code changes. End-to-end could not be exercised on this host (no privilege/user namespaces); skip path verified.
