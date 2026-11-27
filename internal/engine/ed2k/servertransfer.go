@@ -325,6 +325,7 @@ readRequest:
 				if _, err := conn.Write(frame.Marshal()); err != nil {
 					return peer, fr, rp, err
 				}
+				drainConn(conn)
 				return peer, fr, rp, nil
 			}
 
@@ -381,12 +382,30 @@ readRequest:
 			// Return when this chunk reached the end of the source; otherwise
 			// keep serving subsequent requests on the same connection.
 			if source == nil || int(b) >= len(source) {
+				drainConn(conn)
 				return peer, fr, rp, nil
 			}
 			continue
 		default:
 			// Tolerate leading/unexpected frames.
 			continue
+		}
+	}
+}
+
+
+// drainConn waits briefly for the peer to finish reading the final frame
+// before the server closes its end, avoiding a connection reset that would
+// otherwise discard unread data in the kernel buffer.
+func drainConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 256)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			return
 		}
 	}
 }
