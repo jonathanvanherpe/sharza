@@ -182,3 +182,104 @@ func TestDialPeerTimeout(t *testing.T) {
 		t.Fatal("expected timeout error")
 	}
 }
+func TestPeerDialObfuscatedRoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	wantHash := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	availName := "obf-peer.bin"
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer c1.Close()
+		e := New()
+		e.mu.Lock()
+		e.clientID = 777
+		e.laddr = &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4662}
+		e.opts.Obfuscation = true
+		e.mu.Unlock()
+		e.kadMu.Lock()
+		e.kadSelf = wantHash
+		e.kadSelfID = wantHash
+		e.kadID = wantHash
+		e.kadMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _, _, _ = e.ServeAcceptConn(ctx, c1, wantHash, availName)
+	}()
+
+	e := New()
+	e.kadMu.Lock()
+	e.kadSelf = wantHash
+	e.kadSelfID = wantHash
+	e.kadID = wantHash
+	e.kadMu.Unlock()
+	e.mu.Lock()
+	e.clientID = 12345
+	e.opts.Obfuscation = true
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pi, ans, err := e.DialFileRequestConn(ctx, c2, wantHash)
+	if err != nil {
+		t.Fatalf("DialFileRequestConn (obfuscated): %v", err)
+	}
+	if pi.ClientID != 777 {
+		t.Fatalf("peer ClientID = %d, want 777", pi.ClientID)
+	}
+	if ans.Name != availName {
+		t.Fatalf("answer Name = %q, want %q", ans.Name, availName)
+	}
+	_ = c2.Close()
+	<-serverDone
+}
+
+func TestPeerDialPlainRoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	wantHash := [16]byte{9, 9, 9, 9}
+	availName := "plain-peer.bin"
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer c1.Close()
+		e := New()
+		e.mu.Lock()
+		e.clientID = 777
+		e.mu.Unlock()
+		e.kadMu.Lock()
+		e.kadSelf = wantHash
+		e.kadSelfID = wantHash
+		e.kadID = wantHash
+		e.kadMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _, _, _ = e.ServeAcceptConn(ctx, c1, wantHash, availName)
+	}()
+
+	e := New()
+	e.kadMu.Lock()
+	e.kadSelf = wantHash
+	e.kadSelfID = wantHash
+	e.kadID = wantHash
+	e.kadMu.Unlock()
+	e.mu.Lock()
+	e.clientID = 12345
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, ans, err := e.DialFileRequestConn(ctx, c2, wantHash)
+	if err != nil {
+		t.Fatalf("DialFileRequestConn (plain): %v", err)
+	}
+	if ans.Name != availName {
+		t.Fatalf("answer Name = %q, want %q", ans.Name, availName)
+	}
+	_ = c2.Close()
+	<-serverDone
+}
