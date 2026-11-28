@@ -125,7 +125,18 @@ func (qh QueryHit) Source() string {
 // X-Gnutella-Content-Length) and the actual body length are verified
 // against it. A transfer that is longer or shorter than declared is
 // refused and the destination is restored to the offset it started at.
+// Fetch downloads the hit into dir, as documented on Fetch. It is a
+// convenience over FetchWithClient with a nil client.
 func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, error) {
+	return d.FetchWithClient(ctx, dir, nil)
+}
+
+// FetchWithClient is Fetch with a caller-supplied HTTP client. A nil
+// client selects the default. It exists so the push-assisted path can
+// run the same GET/resume/size-check logic over an already-accepted
+// connection by supplying a client whose transport dials that
+// connection.
+func (d *Downloader) FetchWithClient(ctx context.Context, dir string, client *http.Client) (DownloadResult, error) {
 	if dir == "" {
 		return DownloadResult{}, errors.New("gnutella: download: no destination directory")
 	}
@@ -185,7 +196,9 @@ func (d *Downloader) Fetch(ctx context.Context, dir string) (DownloadResult, err
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	client := d.Client
+	if client == nil {
+		client = d.Client
+	}
 	if client == nil {
 		client = defaultDownloadClient
 	}

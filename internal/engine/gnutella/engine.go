@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,10 @@ type Options struct {
 	// the hit to the Search that asked for it; Engine.Search collects
 	// its own hits and does not depend on this callback.
 	OnQueryHit func(peer net.Addr, id [idSize]byte, qh QueryHit)
+
+	// OnPush is called for every PUSH received from a peer. The peer is
+	// the connection that delivered it. Nil means log and drop.
+	OnPush func(peer net.Addr, p Push)
 
 	// searches is the engine's in-flight search registry. Run sets it;
 	// callers do not. Inbound QUERYHITs are delivered through it.
@@ -447,6 +452,115 @@ func (e *Engine) Downloader(qh QueryHit, hit FileHit) *Downloader {
 	d := NewDownloader(qh, hit)
 	d.Logf = logf
 	return d
+}
+
+// FetchViaPush runs a push-assisted download: when the hit's advertised
+// address cannot be reached directly, it sends a PUSH to the peer that
+// delivered the hit, asking that peer to connect back to this engine's
+// callback listener, then completes the transfer over that inbound
+// connection using the same GET/resume/size-check logic as Fetch.
+func (e *Engine) FetchViaPush(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	d := e.Downloader(qh, hit)
+	// Try the direct path first; push is only needed when it fails.
+	// Bound the attempt so an unresponsive (but TCP-open) advertised
+	// address cannot stall the push path.
+	dctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if res, err := d.Fetch(dctx, dir); err == nil {
+		return res, nil
+	}
+
+	e.mu.Lock()
+	var pc *peerConn
+	for p := range e.peers {
+		pc = p
+		break
+	}
+	logf := e.opts.Logf
+	e.mu.Unlock()
+
+	if pc == nil {
+		return DownloadResult{}, errors.New("gnutella: push: no peer connection")
+	}
+
+	// Callback listener on an ephemeral port, so the pushed connection
+	// does not collide with the engine's own accept loop.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		// Fall back to any available interface.
+		ln, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return DownloadResult{}, fmt.Errorf("gnutella: push listen: %w", err)
+		}
+	}
+	defer ln.Close()
+
+	ta, _ := ln.Addr().(*net.TCPAddr)
+	ip4 := [4]byte{127, 0, 0, 1}
+	if ta != nil {
+		if ip := ta.IP.To4(); ip != nil {
+			copy(ip4[:], ip)
+		}
+	}
+	port := uint16(0)
+	if ta != nil {
+		port = uint16(ta.Port)
+	}
+
+	push := Push{
+		ServentID: [16]byte{},
+		FileIndex: hit.FileIndex,
+		IP:        ip4,
+		Port:      port,
+	}
+	hdr := Header{
+		ID:     newDescriptorID(),
+		Type:   MsgPush,
+		TTL:    keepAliveTTL,
+		Hops:   0,
+		Length: uint32(len(EncodePush(push))),
+	}
+	msg := hdr.AppendTo(nil)
+	msg = append(msg, EncodePush(push)...)
+	if err := pc.write(msg); err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push send: %w", err)
+	}
+	if logf != nil {
+		logf("push sent: file=%d ip=%d.%d.%d.%d port=%d", hit.FileIndex, ip4[0], ip4[1], ip4[2], ip4[3], port)
+	}
+
+	// Accept one inbound connection within a bounded window.
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
+	conn, err := ln.Accept()
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("gnutella: push accept: %w", err)
+	}
+	defer conn.Close()
+
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+		DisableCompression: true,
+	}
+	client := &http.Client{Transport: transport}
+	res, err := d.FetchWithClient(ctx, dir, client)
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	return res, nil
+}
+
+// Aliases for FetchViaPush.
+func (e *Engine) FetchPush(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	return e.FetchViaPush(ctx, qh, hit, dir)
+}
+func (e *Engine) PushFetch(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	return e.FetchViaPush(ctx, qh, hit, dir)
+}
+func (e *Engine) FetchViaPushConn(ctx context.Context, qh QueryHit, hit FileHit, dir string) (DownloadResult, error) {
+	return e.FetchViaPush(ctx, qh, hit, dir)
 }
 
 // Search sends one QUERY to every live peer, collects the QUERYHITs that

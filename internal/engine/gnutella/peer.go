@@ -299,6 +299,11 @@ func (p *peer) handle(hdr Header, payload []byte) error {
 			p.logf("push from %s: servent=%x file=%d ip=%d.%d.%d.%d port=%d",
 				p.conn.RemoteAddr(), push.ServentID, push.FileIndex,
 				push.IP[0], push.IP[1], push.IP[2], push.IP[3], push.Port)
+			if p.opts.OnPush != nil {
+				p.opts.OnPush(p.conn.RemoteAddr(), push)
+			} else {
+				p.logf("OnPush is nil, dropping push")
+			}
 		}
 		return nil
 	default:

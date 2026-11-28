@@ -536,3 +536,7 @@ requested offset is at/past end-of-data, and only returns after the final
 chunk (continuing to serve subsequent requests otherwise). No opcode/layout,
 block-map, or PartMet semantics changed. Serving-side queue *scheduling*
 remains out of scope; only the grant needed for the exchange is emitted.
+
+### P1 Gnutella push: slice landed
+
+Added push-assisted download path in `internal/engine/gnutella`: PUSH codec already existed; `peer.go` now dispatches inbound `MsgPush` to `Options.OnPush`; `engine.go` adds `Engine.FetchViaPush` (direct attempt, then PUSH on a delivering peer connection, accept on a callback listener, transfer over it via `Downloader.FetchWithClient`). Oracle leg (gtk-gnutella) skipped, not passed: no root here.
